@@ -105,7 +105,84 @@ _To be written (build steps 4 and 7)._
 
 ## Screening and metrics
 
-_To be written (build step 5)._
+Engine, classical filters and metric functions: `src/orbit_correction/screening.py`, tested
+on synthetic encounters with known answers (`tests/test_screening.py`). The screening
+comparison itself (truth vs SGP4 vs corrected vs classical filters) has not been run yet.
+
+**Event.** A local minimum of the range between two objects, with miss distance within the
+threshold at its TCA and TCA inside the window. A pair can have several events; a pair
+inside the threshold at the window edge with its range still falling has none there. This
+is the Aerospace / Department of Commerce test-set definition. Pairs are unordered.
+
+**Threshold.** Truth screens use the truth threshold (5 km headline; 1 and 10 km
+sensitivity). Cheap screens use truth threshold + pad(tau), with tau the time from the
+screening epoch to TCA. The engine takes the threshold as a function of tau, through a
+two-method volume interface that an RTN volume could implement later without changing the
+event table. The pad rule is open.
+
+**Engine.** Cubic Hermite interpolation of each trajectory's 60 s states. k-d tree candidate
+search at two sub-samples per interval, with search radius = local threshold + V h/4 + 1 m,
+where V = 2 x (largest sampled speed + mu / r_min^2 x h/2), about 16 km/s in LEO. Any
+minimum is within h/4 of a sub-sample and a pair closes at most V h/4 in that time, so no
+between-sample minimum under the threshold is skipped at any relative speed up to V. Each
+candidate interval gets a convex-hull lower bound on its range; survivors have their range
+minima located from sign changes of the degree-5 range-rate polynomial (16-point bracket,
+bisection). Accuracy at 60 s sampling: straight-line encounters exact; 40 random LEO
+encounters (e <= 0.05) within 7 us in TCA and 2.6 cm in miss distance of a dense
+minimisation of the closed-form range. Limit: a range minimum within 3.75 s of a range
+maximum (near-zero relative speed) can be missed.
+
+**Classical filters** (Hoots, Crawford and Roehrich 1984, as described by Woodburn,
+Coppola and Stoner 2009 and Alfano and Finkleman 2013; the 1984 paper itself was not
+read). All work from orbital elements, with a distance pad each:
+
+- Apogee/perigee: prune when the radial shells are further apart than threshold + pad.
+  Perigee and apogee from elements (one or more epochs) or from the sampled radius of each
+  trajectory.
+- Orbit path: prune when the minimum distance between the orbit ellipses exceeds
+  threshold + pad at every sample time (Newton iteration from the two relative-node
+  points); near-coplanar pairs are kept.
+- Time filter: prune when the times each object spends within threshold + pad of the
+  other's orbit plane, near the same relative node, never overlap. Windows come from
+  Kepler's equation with J2 secular rates, geometry is recomputed every hour, and a time
+  pad widens them.
+
+With elements that describe the motion exactly, none of the three loses an encounter at
+zero pad (test). Their misses come from what the elements leave out; the tests document
+one per filter (drag decay for apogee/perigee and orbit path, drag-driven timing drift for
+the time filter). Pads are an open decision.
+
+**Metrics.** Event recall (reference events matched one to one by a candidate event of the
+same pair with |dTCA| <= a tolerance) and pair recall (reference pairs with at least one
+matched event); false alarms per event and per pair; recall for reference events with
+TCA within 1, 3 and 7 days; for filters, event and pair recall (an event survives if its
+pair does) and the fraction of pairs pruned; wall-clock cost of each run. The headline
+counting rule and the TCA tolerance are open decisions.
+
+**Scaling** (synthetic LEO catalog, two-body plus J2 secular motion, 7 days at 60 s, one
+process, Intel Core Ultra 9 275HX; other jobs were running, 1-minute load 5-13 on 24
+logical CPUs):
+
+| Objects | Threshold | Engine wall time | Peak memory | Events |
+|---|---|---|---|---|
+| 500 | 5 km | 4-5 s | 0.66 GB | 103 |
+| 500 | 5 km + (1 + 6 km/day x tau) | 5 s | 0.66 GB | 3,722 |
+| 2,000 | 5 km | 31-47 s | 1.5 GB (1.1 GB of it the trajectories) | 1,702 |
+| 2,000 | 5 km + (1 + 6 km/day x tau) | 41-49 s | 1.5 GB | 57,938 |
+
+At 2,000 objects the classical filters as implemented (numpy) took 0.1-0.4 s (apogee/
+perigee), 42-71 s (orbit path, on the pairs apogee/perigee kept) and 123-150 s (time filter,
+on the pairs orbit path kept), longer than the engine itself. Their compute cost reflects
+this implementation, not an optimised one. Engine cost grows roughly as n^2 at this size;
+trajectory memory is 0.54 MB per object per 7-day set.
+
+Triangulation against the public Aerospace / Department of Commerce screening test set
+(Auman, Murphy and George, 2026; CC0) is pending: the files are on Google Drive behind an
+access request, and the ephemerides are a 20.7 GB archive of OCM files.
+
+Implemented here vs library: the k-d tree is `scipy.spatial.cKDTree` and tables are
+pyarrow. Interpolation, search bound, minimum finding, element conversions, filters and
+metrics are this project's code, written with AI assistance and checked by the tests above.
 
 ## Limitations
 
