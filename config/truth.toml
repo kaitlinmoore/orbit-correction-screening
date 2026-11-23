@@ -1,0 +1,95 @@
+# Truth propagator configuration (read by orbit_correction.truth_prop.load_truth_config).
+# Every value here is an instrument: "truth" in this study is whatever this file says,
+# so log each change in docs/changelog.md with its reason.
+#
+# Force model and integrator approved as decision 1 (2026-11-23): Orekit numerical
+# propagator, EIGEN-6S zonal harmonics (order 0), NRLMSISE-00 drag fed by the
+# project's space-weather copy, Cd 2.2 with area-to-mass from B*, DOP853 at about 1 m
+# position tolerance and a 300 s maximum step. Values marked PROPOSED are worker
+# choices waiting for Kaitlin's decision.
+
+[truth]
+status = "exploratory 2026-11-23"
+
+[truth.data]
+# orekit-data bundle (EOP, leap seconds, EIGEN-6S, DE-440). Must match the commit
+# pinned in pyproject.toml / uv.lock; truth_prop checks the installed package's
+# version string against it at JVM start.
+orekit_data_commit = "2d6edc9118983d95c51303df05db16ada90b7ee2"
+
+[truth.gravity]
+# ICGEM file name inside the bundle. Its time-variable low-degree terms (gfct, trnd,
+# acos, asin) are evaluated by Orekit at each date.
+field_file = "eigen-6s.gfc"
+# Zonal degree from the convergence check (scripts/zonal_convergence.py, changelog
+# 2026-11-23). PROPOSED, waiting for Kaitlin's decision: 36 is the smallest degree
+# whose 7-day difference from a degree-90 reference (converged integrator) stays
+# below the truth integrator's own 7-day error (1 m, 300 s vs converged: 8 m at
+# 1200 km, 17-22 m at 800 km, 53 m at 500 km, 92-195 m at 300 km) for every sample
+# object; the 300 km band sets it. With the originally specified threshold (1 m vs 1 cm
+# at a 300 s maximum step, which measures step phase rather than error) it is 48.
+zonal_degree = 36
+# Order 0: zonal terms only, by design (tesserals are a stated limitation).
+zonal_order = 0
+
+[truth.drag]
+# "NRLMSISE-00" or "none" (none exists for tests that isolate gravity).
+atmosphere = "NRLMSISE-00"
+cd = 2.2
+# Standard SGP4 B* relation, B* = (Cd * A/m) * rho0 / 2, so A/m = 2 B* / (Cd rho0).
+# rho0 = 2.461e-8 kg/m^3 (the SGP4 reference density, about the density at its
+# q0 = 120 km reference altitude) times 6378.135 km per Earth radius
+# = 0.15696615 kg / (m^2 * Earth radius), so that B* comes out in 1/ER.
+# Value as given by Vallado, Fundamentals of Astrodynamics and Applications (4th ed.,
+# 2013), B* discussion, and used by Vallado, Crawford, Hujsak and Kelso (2006),
+# "Revisiting Spacetrack Report #3", AIAA 2006-6753. B* is a fitted SGP4 parameter,
+# so this gives a model-world A/m, not a measured one.
+bstar_reference_density_kg_per_m2_er = 0.15696615
+# Mass cancels (drag acceleration depends on A/m only); it exists because Orekit's
+# drag model takes an area and the state carries a mass.
+mass_kg = 100.0
+# NRLMSISE-00 settings. PROPOSED (not in decision 1):
+# local solar time "MEAN" (UT + longitude/15), the convention of the NRLMSISE-00
+# reference code and of pymsis; Orekit 13.1.9's public constructors default to
+# "APPARENT" (true Sun hour angle), which its own documentation calls inconsistent
+# with the model's calibration.
+msis_local_solar_time = "MEAN"
+# Switch 9: 1 = daily Ap only (Orekit and pymsis default), -1 = full ap array with
+# 3-hourly values (storm-time mode). PROPOSED: -1, so 3-hour geomagnetic activity
+# reaches the truth density.
+msis_ap_switch = -1
+
+[truth.earth]
+# Earth orientation and the Earth-fixed frame for gravity, drag and altitude.
+iers_conventions = "IERS_2010"
+# simpleEOP = true skips the tidal corrections to EOP interpolation (Orekit's usual
+# speed setting; sub-metre at LEO).
+simple_eop = true
+body_shape = "WGS84"
+
+[truth.integrator]
+method = "DOP853"
+# Position tolerance passed to Orekit's default tolerance provider (Cartesian state).
+position_tolerance_m = 1.0
+min_step_s = 0.001
+max_step_s = 300.0
+
+[truth.output]
+# Default output spacing for callers that build a regular grid (truth_prop.output_grid).
+# Output is sampled from Orekit's ephemeris generator (dense output of one
+# integration), never by repeated propagate() calls.
+step_s = 60.0
+
+[truth.reentry]
+# PROPOSED: stop and report status "reentry" if the geodetic altitude (WGS84) drops
+# below this inside the window. 120 km is the conventional entry interface; below
+# it an object completes at most a few more revolutions.
+altitude_km = 120.0
+# Interval between altitude checks during integration (s).
+max_check_s = 60.0
+
+[truth.jvm]
+# Each JVM is capped at this many processors (-XX:ActiveProcessorCount). Without a
+# cap every JVM sizes its GC and JIT thread pools for all 24 CPUs and parallel
+# workers oversubscribe the machine (project research, 2026-11-23).
+active_processor_count = 2
