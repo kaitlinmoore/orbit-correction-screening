@@ -113,10 +113,28 @@ def test_config_file_matches_code_defaults():
     default = C.CatalogFilterConfig()
     for name in ("perigee_min_km", "apogee_max_km", "bstar_min_exclusive", "bstar_max",
                  "ephemeris_types", "object_types", "exclude_ops_status",
-                 "sma_increase_max_km", "status"):
+                 "sma_increase_max_km", "sma_drop_drag_multiple", "sma_drop_floor_km",
+                 "inclination_jump_max_deg"):
         assert getattr(cfg, name) == getattr(default, name), name
-    assert cfg.status == "pending approval"
-    assert "STARLINK" in cfg.exclude_name_patterns
+    assert cfg.status == "approved 2026-11-23"
+    assert {"STARLINK", "FLOCK", "LEMUR"} <= set(cfg.exclude_name_patterns)
+
+
+def test_approved_values():
+    cfg = C.load_filter_config(REPO / "config" / "catalog_filters.toml")
+    assert (cfg.perigee_min_km, cfg.apogee_max_km) == (250.0, 2000.0)
+    assert (cfg.bstar_min_exclusive, cfg.bstar_max) == (0.0, 0.01)
+    assert cfg.object_types == ("PAY", "R/B", "DEB") and cfg.ephemeris_types == (0,)
+
+
+def test_name_rule_catches_flock_and_lemur(gp_sat):
+    cfg = C.load_filter_config(REPO / "config" / "catalog_filters.toml")
+    names = ["FLOCK 4P-1", "LEMUR-2-JOHANLORAN", "Lemur-2-x", "SYNTH FLOCKISH"]
+    t = gp_sat.slice(0, 4)
+    i = t.column_names.index("object_name")
+    t = t.set_column(i, "object_name", pa.array(names))
+    rule = next(r for r in C.DEFAULT_RULES if r.name == "not_maneuvering_constellation")
+    assert rule.keep(t, cfg).tolist() == [False, False, False, True]
 
 
 def test_default_filters_on_fixture(gp_sat):
@@ -184,3 +202,106 @@ def test_unknown_config_key_rejected(tmp_path):
     p.write_text("[catalog_filters]\nperigee_min_km = 200.0\nperige_max = 3\n")
     with pytest.raises(ValueError, match="perige_max"):
         C.load_filter_config(p)
+
+
+# ---------------------------------------------------------------- element-history maneuver rules
+
+
+def _synthetic_history(
+    nid=91001, days=20, a0_km=6778.0, decay_km_per_day=0.3, events=(), noise_km=0.0, seed=0
+):
+    """One object's daily element sets under drag, with optional maneuvers.
+
+    The mean motion follows ``a(t) = a0 - decay * t`` and MEAN_MOTION_DOT is the
+    value consistent with that decay, as an element-set fit would report it.
+    ``events`` are ``(day, kind, size)``: ``("sma", -3.0)`` lowers the orbit by
+    3 km from that day on, ``("inc", 0.1)`` changes the inclination by 0.1 deg,
+    ``("rate", 3.0)`` multiplies the decay rate from that day on (a storm).
+    """
+    rng = np.random.default_rng(seed)
+    recs = []
+    a, inc, rate = a0_km, 51.6, decay_km_per_day
+    for d in range(days):
+        for day, kind, size in events:
+            if day == d:
+                if kind == "sma":
+                    a += size
+                elif kind == "inc":
+                    inc += size
+                elif kind == "rate":
+                    rate *= size
+        a_fit = a + noise_km * rng.standard_normal()
+        n = np.sqrt(C.MU_WGS72_KM3_S2 / a_fit**3) * 86400 / (2 * np.pi)
+        # da/dt = -(2/3)(a/n) dn/dt  ->  MEAN_MOTION_DOT = dn/dt / 2
+        ndot_half = rate * 1.5 * n / a_fit / 2
+        recs.append({
+            "NORAD_CAT_ID": nid, "OBJECT_NAME": "SYNTH", "OBJECT_ID": "2000-000Z",
+            "EPOCH": f"2024-03-{d + 1:02d}T00:00:00", "MEAN_MOTION": n, "ECCENTRICITY": 0.001,
+            "INCLINATION": inc, "RA_OF_ASC_NODE": 10.0, "ARG_OF_PERICENTER": 20.0,
+            "MEAN_ANOMALY": 30.0, "BSTAR": 1e-4, "MEAN_MOTION_DOT": ndot_half,
+            "MEAN_MOTION_DDOT": 0.0, "EPHEMERIS_TYPE": 0,
+        })
+        a -= rate
+    return C._records_to_table(recs, "synthetic")
+
+
+def _history_flags(table):
+    cfg = C.load_filter_config(REPO / "config" / "catalog_filters.toml")
+    rules = [r for r in C.DEFAULT_RULES if r.name in
+             ("no_sma_increase", "no_sma_unexplained_drop", "no_inclination_jump")]
+    return C.apply_filters(table, cfg, rules=rules).rejected_by_rule
+
+
+def test_drag_decay_rate_inverts_mean_motion_dot():
+    t = _synthetic_history(decay_km_per_day=0.3)
+    rate = C.drag_decay_rate_km_per_day(
+        C._col(t, "semimajor_axis_km"), C._col(t, "mean_motion_rev_per_day"),
+        C._col(t, "mean_motion_dot"),
+    )
+    np.testing.assert_allclose(rate, 0.3, rtol=1e-6)
+    assert C.drag_decay_rate_km_per_day(
+        np.array([6778.0]), np.array([15.5]), np.array([np.nan])
+    ).tolist() == [0.0]
+
+
+@pytest.mark.parametrize("decay", [0.0, 0.3, 2.0])
+def test_pure_drag_decay_is_not_flagged(decay):
+    flags = _history_flags(_synthetic_history(decay_km_per_day=decay, noise_km=0.1))
+    assert flags == {"no_sma_increase": 0, "no_sma_unexplained_drop": 0,
+                     "no_inclination_jump": 0}
+
+
+def test_storm_speeding_up_decay_is_not_flagged():
+    t = _synthetic_history(decay_km_per_day=0.5, events=[(10, "rate", 3.0)])
+    assert _history_flags(t)["no_sma_unexplained_drop"] == 0
+
+
+def test_lowering_burn_is_flagged():
+    t = _synthetic_history(decay_km_per_day=0.3, events=[(10, "sma", -3.0)])
+    flags = _history_flags(t)
+    assert flags["no_sma_unexplained_drop"] == t.num_rows  # the whole object goes
+    assert flags["no_sma_increase"] == 0 and flags["no_inclination_jump"] == 0
+    assert C.sma_drop_flagged_ids(t, 3.0, 1.0) == {91001}
+    # below the floor plus the drag allowance it is missed, as documented
+    small = _synthetic_history(decay_km_per_day=0.3, events=[(10, "sma", -0.5)])
+    assert C.sma_drop_flagged_ids(small, 3.0, 1.0) == set()
+
+
+def test_plane_change_is_flagged():
+    t = _synthetic_history(events=[(7, "inc", 0.1)])
+    flags = _history_flags(t)
+    assert flags["no_inclination_jump"] == t.num_rows
+    assert flags["no_sma_increase"] == 0 and flags["no_sma_unexplained_drop"] == 0
+    assert C.inclination_jump_flagged_ids(t, 0.05) == {91001}
+    assert C.inclination_jump_flagged_ids(t, 0.2) == set()
+
+
+def test_history_rules_keep_objects_apart_and_ignore_order():
+    clean = _synthetic_history(nid=91001)
+    burn = _synthetic_history(nid=91002, events=[(5, "sma", -4.0)])
+    both = pa.concat_tables([clean, burn])
+    shuffled = both.take(pa.array(np.random.default_rng(3).permutation(both.num_rows)))
+    assert C.sma_drop_flagged_ids(shuffled, 3.0, 1.0) == {91002}
+    # the jump between the last set of one object and the first of the next is not a pair
+    lowered = _synthetic_history(nid=91003, a0_km=6700.0)
+    assert C.sma_drop_flagged_ids(pa.concat_tables([clean, lowered]), 3.0, 1.0) == set()

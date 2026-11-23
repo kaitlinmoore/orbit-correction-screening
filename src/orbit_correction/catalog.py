@@ -305,7 +305,15 @@ class CatalogFilterConfig:
         sma_increase_max_km: across an object's element history, a rise in mean
             semimajor axis larger than this between consecutive element sets
             flags a maneuver (drag only lowers it); the whole object is dropped.
-        status: ``"pending approval"`` until the values are approved.
+        sma_drop_drag_multiple, sma_drop_floor_km: a fall in mean semimajor axis
+            between consecutive element sets is flagged as a maneuver when it
+            exceeds ``sma_drop_drag_multiple`` times the drag decay implied by the
+            element sets' mean-motion derivative over the gap, plus
+            ``sma_drop_floor_km`` (see :func:`sma_drop_flagged_ids`).
+        inclination_jump_max_deg: a change in mean inclination larger than this
+            between consecutive element sets flags a plane change.
+        status: ``"pending approval"`` until the values are approved, then
+            ``"approved <date>"``.
     """
 
     perigee_min_km: float = 250.0
@@ -317,6 +325,9 @@ class CatalogFilterConfig:
     exclude_ops_status: tuple[str, ...] = ("+", "P", "B", "S", "X")
     exclude_name_patterns: tuple[str, ...] = ()
     sma_increase_max_km: float = 1.0
+    sma_drop_drag_multiple: float = 3.0
+    sma_drop_floor_km: float = 1.0
+    inclination_jump_max_deg: float = 0.05
     status: str = "pending approval"
 
 
@@ -369,30 +380,123 @@ def _keep_not_operational_payload(table: pa.Table, cfg: CatalogFilterConfig) -> 
     return np.array([not (t == "PAY" and s in excluded) for t, s in pairs], dtype=bool)
 
 
+def _consecutive_pairs(table: pa.Table, *columns: str) -> tuple[np.ndarray, ...]:
+    """Per-object consecutive element-set pairs, ordered by epoch.
+
+    Returns ``(ids, same, dt_days, *pairs)``: ``ids`` of the later set of each
+    pair, a mask ``same`` that is True where both sets belong to one object, the
+    gap in days, and for each requested column an ``(earlier, later)`` tuple.
+    Nulls in a requested column come back as NaN.
+    """
+    ids = _col(table, "norad_id")
+    t = _col(table, "epoch_tt_s")
+    order = np.lexsort((t, ids))
+    ids, t = ids[order], t[order]
+    same = ids[1:] == ids[:-1]
+    out: list[object] = [ids[1:], same, (t[1:] - t[:-1]) / 86400.0]
+    for name in columns:
+        v = table.column(name).to_numpy(zero_copy_only=False).astype(np.float64)[order]
+        out.append((v[:-1], v[1:]))
+    return tuple(out)
+
+
 def maneuver_flagged_ids(table: pa.Table, sma_increase_max_km: float) -> set[int]:
     """NORAD IDs whose mean semimajor axis rises by more than the threshold.
 
     Element sets are ordered by epoch per object; a rise between consecutive
     sets larger than ``sma_increase_max_km`` is taken as a maneuver (drag only
-    lowers the semimajor axis). This is a simple detector: it misses maneuvers
-    that lower the orbit or change only the plane, and fit noise can trip it at
-    a small threshold.
+    lowers the semimajor axis). Orbit-lowering burns are caught by
+    :func:`sma_drop_flagged_ids` and plane changes by
+    :func:`inclination_jump_flagged_ids`. Fit noise can trip any of the three
+    at small thresholds; small maneuvers slip under all of them.
     """
     if table.num_rows == 0:
         return set()
-    ids = _col(table, "norad_id")
-    t = _col(table, "epoch_tt_s")
-    a = _col(table, "semimajor_axis_km")
-    order = np.lexsort((t, ids))
-    ids, a = ids[order], a[order]
-    same = ids[1:] == ids[:-1]
-    jump = (a[1:] - a[:-1]) > sma_increase_max_km
-    return {int(x) for x in ids[1:][same & jump]}
+    ids, same, _, (a0, a1) = _consecutive_pairs(table, "semimajor_axis_km")
+    jump = (a1 - a0) > sma_increase_max_km
+    return {int(x) for x in ids[same & jump]}
+
+
+def drag_decay_rate_km_per_day(
+    semimajor_axis_km: np.ndarray,
+    mean_motion_rev_per_day: np.ndarray,
+    mean_motion_dot: np.ndarray,
+) -> np.ndarray:
+    """Semimajor-axis decay rate implied by an element set's mean-motion derivative.
+
+    The element set's ``MEAN_MOTION_DOT`` field is half the rate of change of
+    mean motion (rev/day^2). From Kepler's third law, ``a ~ n^(-2/3)``, so
+    ``da/dt = -(2/3) (a/n) dn/dt``. Returned as a positive decay rate in km/day
+    (``(2/3) (a/n) * 2 * MEAN_MOTION_DOT``), clipped at 0; a missing derivative
+    gives 0 (no drag allowance).
+    """
+    a = np.asarray(semimajor_axis_km, dtype=np.float64)
+    n = np.asarray(mean_motion_rev_per_day, dtype=np.float64)
+    ndot_half = np.nan_to_num(np.asarray(mean_motion_dot, dtype=np.float64), nan=0.0)
+    return np.clip((2.0 / 3.0) * (a / n) * 2.0 * ndot_half, 0.0, None)
+
+
+def sma_drop_flagged_ids(
+    table: pa.Table, drag_multiple: float, floor_km: float
+) -> set[int]:
+    """NORAD IDs whose mean semimajor axis falls faster than drag can explain.
+
+    For each pair of consecutive element sets of one object, the drag
+    allowance is the larger of the two sets' implied decay rates
+    (:func:`drag_decay_rate_km_per_day`) times the gap. Taking the larger rate
+    lets a storm that speeds decay up between the sets pass, since the later
+    set's mean-motion derivative already reflects it. A drop larger than
+    ``drag_multiple * allowance + floor_km`` is taken as an orbit-lowering
+    maneuver. The floor absorbs fit noise between element sets; the multiple
+    absorbs drag that changes faster than the derivative suggests.
+
+    Limits: a lowering burn smaller than the floor plus the drag allowance is
+    missed, and so is any maneuver hidden inside a long gap between sets.
+    """
+    if table.num_rows == 0:
+        return set()
+    ids, same, dt, (a0, a1), (n0, n1), (nd0, nd1) = _consecutive_pairs(
+        table, "semimajor_axis_km", "mean_motion_rev_per_day", "mean_motion_dot"
+    )
+    rate = np.maximum(
+        drag_decay_rate_km_per_day(a0, n0, nd0), drag_decay_rate_km_per_day(a1, n1, nd1)
+    )
+    drop = a0 - a1
+    flagged = drop > drag_multiple * rate * dt + floor_km
+    return {int(x) for x in ids[same & flagged]}
+
+
+def inclination_jump_flagged_ids(table: pa.Table, max_deg: float) -> set[int]:
+    """NORAD IDs whose mean inclination changes by more than ``max_deg`` between sets.
+
+    Drag barely changes inclination, and natural changes in SGP4 mean
+    inclination over days to weeks are small, so a step is taken as a plane
+    change. Over very long gaps slow natural drift adds up; the threshold is
+    applied per pair regardless of the gap.
+    """
+    if table.num_rows == 0:
+        return set()
+    ids, same, _, (i0, i1) = _consecutive_pairs(table, "inclination_deg")
+    jump = np.abs(i1 - i0) > max_deg
+    return {int(x) for x in ids[same & jump]}
+
+
+def _keep_not_flagged(flagged: set[int], table: pa.Table) -> np.ndarray:
+    return ~np.isin(_col(table, "norad_id"), list(flagged))
 
 
 def _keep_no_sma_increase(table: pa.Table, cfg: CatalogFilterConfig) -> np.ndarray:
-    flagged = maneuver_flagged_ids(table, cfg.sma_increase_max_km)
-    return ~np.isin(_col(table, "norad_id"), list(flagged))
+    return _keep_not_flagged(maneuver_flagged_ids(table, cfg.sma_increase_max_km), table)
+
+
+def _keep_no_sma_drop(table: pa.Table, cfg: CatalogFilterConfig) -> np.ndarray:
+    flagged = sma_drop_flagged_ids(table, cfg.sma_drop_drag_multiple, cfg.sma_drop_floor_km)
+    return _keep_not_flagged(flagged, table)
+
+
+def _keep_no_inclination_jump(table: pa.Table, cfg: CatalogFilterConfig) -> np.ndarray:
+    flagged = inclination_jump_flagged_ids(table, cfg.inclination_jump_max_deg)
+    return _keep_not_flagged(flagged, table)
 
 
 #: The default rules, applied in this order.
@@ -439,6 +543,19 @@ DEFAULT_RULES: tuple[FilterRule, ...] = (
         "no_sma_increase",
         "object's element history has no mean-SMA rise > sma_increase_max_km",
         _keep_no_sma_increase, ("norad_id", "epoch_tt_s", "semimajor_axis_km"),
+    ),
+    FilterRule(
+        "no_sma_unexplained_drop",
+        "object's element history has no mean-SMA drop > sma_drop_drag_multiple x the "
+        "drag decay implied by mean_motion_dot over the gap + sma_drop_floor_km",
+        _keep_no_sma_drop,
+        ("norad_id", "epoch_tt_s", "semimajor_axis_km", "mean_motion_rev_per_day",
+         "mean_motion_dot"),
+    ),
+    FilterRule(
+        "no_inclination_jump",
+        "object's element history has no mean-inclination change > inclination_jump_max_deg",
+        _keep_no_inclination_jump, ("norad_id", "epoch_tt_s", "inclination_deg"),
     ),
 )
 
