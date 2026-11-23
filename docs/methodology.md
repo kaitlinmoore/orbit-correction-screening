@@ -62,6 +62,35 @@ unexamined until a confirmatory run), `reserved_object`, `reserved_time` and `ex
 on only one axis, so training on them would leak held-out objects or epochs, and evaluating on
 them would mix partly seen data into the held-out result.
 
+## Cheap propagator (SGP4)
+
+`src/orbit_correction/cheap_prop.py`, a wrapper of the `sgp4` package (Vallado's C++ SGP4/SDP4
+through its Python bindings; the theory and the propagation code are the library's).
+
+- Constants and mode: WGS-72 and operation mode `'i'`, the constants element sets are fitted
+  with and the mode of Vallado et al. (2006)'s verification output. The wrapper reproduces
+  that output (`tcppver.out`, 33 cases, 2e-7 km and km/s, the package's own tolerance) and the
+  error codes of its seven failing cases.
+- Initialisation: the element-set fields are converted to SGP4's units exactly as the
+  library's TLE reader converts them and passed to `Satrec.sgp4init`, so an OMM element set
+  and the same TLE give the same propagation.
+- Time: SGP4's time since epoch is `(t_TT - epoch_TT) / 60` minutes, with the epoch converted
+  from its UTC string by astropy, so elapsed time is physical across leap seconds. Output
+  trajectories are on a TT grid: one shared absolute grid (screening) or offsets from each
+  element set's epoch (data generation).
+- Errors: a trajectory keeps the states before SGP4's first error flag (1-4 invalid or
+  out-of-range elements, 6 decayed: radius under one Earth radius) and nothing after; each
+  object carries a status. Truncated and empty propagations are counted, not dropped
+  silently. SGP4's decay flag only fires at one Earth radius, so states just before it can be
+  far below any physical altitude.
+- Frames: TEME -> GCRF with the exact astropy chain or an interpolated rotation
+  (`frames.teme_to_gcrf_fast`, the default in the wrapper): exact rotations at nodes every
+  6 h in TT, degree-5 Lagrange interpolation. Against the exact path over 7 days at 60 s it
+  agrees to under a micrometre and a micrometre per second.
+- Truth initial state: the SGP4 state at the element-set epoch, rotated to GCRF exactly
+  (`sgp4_epoch_states`). Treating that SGP4 state as an osculating state is the project's
+  deliberate conversion from mean elements.
+
 ## Truth propagation
 
 _To be written (build step 2)._
