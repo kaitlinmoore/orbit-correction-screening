@@ -223,3 +223,158 @@ def test_use_eop_file_switches_and_restores():
     finally:
         F.configure_offline_eop()
     assert F.eop_provenance()["kind"].startswith("astropy-iers-data")
+
+
+# ---------------------------------------------------------------- fast TEME -> GCRF
+#
+# teme_to_gcrf_fast interpolates the exact rotation between nodes 6 h apart on a fixed
+# TT lattice. Tolerance: 10 micrometres and 10 micrometres/s against the exact path,
+# 100 times under the 1 mm target (observed: about 0.7 micrometres and 0.7
+# micrometres/s; the velocity floor is consistent with astropy's own finite-difference
+# velocity in the exact path).
+
+FAST_TOL_KM = 1e-8
+FAST_TOL_KM_S = 1e-8
+
+
+def _random_states(n, seed=0):
+    rng = np.random.default_rng(seed)
+    r = rng.normal(size=(n, 3))
+    r = 7000.0 * r / np.linalg.norm(r, axis=1, keepdims=True)
+    v = rng.normal(size=(n, 3))
+    v = 7.5 * v / np.linalg.norm(v, axis=1, keepdims=True)
+    return r, v
+
+
+@pytest.mark.parametrize(
+    "start_utc",
+    [
+        "2005-06-10T00:00:00",
+        "2016-12-28T00:00:00",  # the window contains the 2016-12-31T23:59:60 leap second
+        "2024-03-01T00:00:00",
+    ],
+)
+def test_fast_matches_exact_over_7_days_at_60s(start_utc):
+    t = F.utc_to_tt_seconds(start_utc) + 60.0 * np.arange(7 * 1440 + 1)
+    r, v = _random_states(t.size)
+    re, ve = F.teme_to_gcrf(r, v, t)
+    rf, vf = F.teme_to_gcrf_fast(r, v, t)
+    assert np.linalg.norm(rf - re, axis=1).max() < FAST_TOL_KM
+    assert np.linalg.norm(vf - ve, axis=1).max() < FAST_TOL_KM_S
+
+
+def test_fast_across_the_leap_second_instants():
+    labels = [
+        "2016-12-31T23:59:58.5", "2016-12-31T23:59:59", "2016-12-31T23:59:59.5",
+        "2016-12-31T23:59:60", "2016-12-31T23:59:60.5", "2017-01-01T00:00:00",
+        "2017-01-01T00:00:00.5",
+    ]
+    t = F.utc_to_tt_seconds(labels)
+    np.testing.assert_allclose(np.diff(t), 0.5, atol=1e-6)
+    r, v = _random_states(t.size, seed=3)
+    re, ve = F.teme_to_gcrf(r, v, t)
+    rf, vf = F.teme_to_gcrf_fast(r, v, t)
+    step = 5  # 2017-01-01T00:00:00, the instant TAI - UTC steps from 36 s to 37 s
+    others = np.arange(t.size) != step
+    np.testing.assert_allclose(rf[others], re[others], rtol=0, atol=FAST_TOL_KM)
+    np.testing.assert_allclose(vf[others], ve[others], rtol=0, atol=FAST_TOL_KM_S)
+    # At exactly that instant astropy (8.0.3) takes UT1 one second late
+    # (00:00:01.591 instead of 00:00:00.591), so the exact path is off there by tens of
+    # micrometres in GCRF (UT1 mostly cancels in this chain). One microsecond either
+    # side it is fine. The fast path's nodes never sit on a leap second (they are at
+    # whole multiples of 6 h in TT, while UTC midnight is TT 00:01:09.184), so it is
+    # smooth through it; check it against the exact path a microsecond either side.
+    rm, _ = F.teme_to_gcrf(r[step], v[step], t[step] - 1e-6)
+    rp, _ = F.teme_to_gcrf(r[step], v[step], t[step] + 1e-6)
+    np.testing.assert_allclose(rf[step], 0.5 * (rm + rp), rtol=0, atol=FAST_TOL_KM)
+    assert np.linalg.norm(rf[step] - re[step]) < 1e-7  # 100 micrometres, whichever is right
+    # the interpolated rotation is smooth through the leap second: equal TT steps give
+    # equal changes of M (second differences at the level of rounding)
+    m, _ = F.teme_to_gcrf_rotation_fast(t)
+    assert np.abs(np.diff(m, n=2, axis=0)).max() < 1e-14
+
+
+def test_fast_shapes_and_blocks():
+    t0 = F.utc_to_tt_seconds("2024-02-28T06:34:00")
+    t = t0 + 60.0 * np.arange(5)
+    r, v = _random_states(5, seed=1)
+    r1, v1 = F.teme_to_gcrf_fast(R_TEME_2004, V_TEME_2004, t0)
+    assert r1.shape == v1.shape == (3,)
+    rn, vn = F.teme_to_gcrf_fast(r, v, t)
+    assert rn.shape == (5, 3)
+    # (K, N, 3): K objects on one grid give the same rows as one object at a time
+    block_r = np.stack([r, 2.0 * r])
+    block_v = np.stack([v, -v])
+    rk, vk = F.teme_to_gcrf_fast(block_r, block_v, t)
+    assert rk.shape == (2, 5, 3)
+    np.testing.assert_array_equal(rk[0], rn)
+    np.testing.assert_array_equal(vk[0], vn)
+    np.testing.assert_array_equal(rk[1], F.teme_to_gcrf_fast(2.0 * r, -v, t)[0])
+    # a scalar time broadcasts
+    rs, _ = F.teme_to_gcrf_fast(r, v, t0)
+    np.testing.assert_array_equal(rs[0], F.teme_to_gcrf_fast(r[0], v[0], t0)[0])
+    with pytest.raises(ValueError):
+        F.teme_to_gcrf_fast(np.zeros((2, 3)), np.zeros((2, 3)), np.zeros(3))
+    with pytest.raises(ValueError):
+        F.teme_to_gcrf_fast(np.zeros((2, 3)), np.zeros((3, 3)), np.zeros(2))
+
+
+def test_fast_result_depends_only_on_each_states_time():
+    """Fixed lattice, local stencil: a state's result is the same in any batch."""
+    t = F.utc_to_tt_seconds("2010-05-05T00:00:00") + 977.0 * np.arange(400)
+    r, v = _random_states(t.size, seed=2)
+    rf, vf = F.teme_to_gcrf_fast(r, v, t)
+    F.clear_fast_rotation_cache()
+    for idx in (slice(0, 1), slice(199, 201), slice(399, 400), np.array([5, 300, 17])):
+        ri, vi = F.teme_to_gcrf_fast(r[idx], v[idx], t[idx])
+        np.testing.assert_array_equal(ri, rf[idx])
+        np.testing.assert_array_equal(vi, vf[idx])
+
+
+def test_fast_rotation_is_orthonormal_and_derivative_consistent():
+    t = F.utc_to_tt_seconds("2020-07-01T00:00:00") + 3600.0 * np.arange(48)
+    m, m_dot = F.teme_to_gcrf_rotation_fast(t)
+    eye = np.einsum("nij,nkj->nik", m, m)
+    np.testing.assert_allclose(eye, np.broadcast_to(np.eye(3), eye.shape), atol=1e-13)
+    # M_dot against a central difference of M
+    h = 10.0
+    mp, _ = F.teme_to_gcrf_rotation_fast(t + h)
+    mm, _ = F.teme_to_gcrf_rotation_fast(t - h)
+    np.testing.assert_allclose(m_dot, (mp - mm) / (2 * h), rtol=0, atol=1e-16)
+
+
+@pytest.mark.filterwarnings("ignore::erfa.ErfaWarning")
+def test_fast_eop_coverage_same_as_exact():
+    r, v = np.array([7000.0, 0, 0]), np.array([0, 7.5, 0])
+    for when in ("2045-01-01T00:00:00", "1965-01-01T00:00:00"):
+        t = F.utc_to_tt_seconds(when)
+        with pytest.raises(F.EOPCoverageError):
+            F.teme_to_gcrf(r, v, t)
+        with pytest.raises(F.EOPCoverageError):
+            F.teme_to_gcrf_fast(r, v, t)
+    # Inside the table but within a stencil of its last day: the exact path answers
+    # these, so the fast path must too (it falls back to the exact path there).
+    last_mjd = float(F.eop_provenance()["last_mjd"])
+    t_end = Time(last_mjd - 0.2, format="mjd", scale="utc")
+    t = F.time_to_tt_seconds(t_end) - 600.0 * np.arange(3)[::-1]
+    rr, vv = np.tile(r, (3, 1)), np.tile(v, (3, 1))
+    re, ve = F.teme_to_gcrf(rr, vv, t)
+    rf, vf = F.teme_to_gcrf_fast(rr, vv, t)
+    np.testing.assert_array_equal(rf, re)
+    np.testing.assert_array_equal(vf, ve)
+
+
+def test_fast_cache_follows_the_eop_table():
+    t = F.utc_to_tt_seconds(EPOCH_2004) + 60.0 * np.arange(10)
+    r, v = _random_states(10, seed=4)
+    before = F.teme_to_gcrf_fast(r, v, t)[0]
+    try:
+        F.use_eop_file(iers.IERS_A_FILE)  # a different table object, same data
+        after = F.teme_to_gcrf_fast(r, v, t)[0]
+        # the cache was rebuilt for the new table (one entry per node actually used)
+        assert F._NODE_CACHE_TABLE[0] is iers.earth_orientation_table.get()
+        np.testing.assert_allclose(after, before, rtol=0, atol=1e-9)
+    finally:
+        F.configure_offline_eop()
+    again = F.teme_to_gcrf_fast(r, v, t)[0]
+    np.testing.assert_allclose(again, before, rtol=0, atol=1e-12)

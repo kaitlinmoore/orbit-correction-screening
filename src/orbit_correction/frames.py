@@ -298,3 +298,258 @@ def gcrf_to_teme(
 ) -> tuple[np.ndarray, np.ndarray]:
     """Inverse of :func:`teme_to_gcrf` (same arguments and shapes, GCRF in, TEME out)."""
     return _transform(r_gcrf_km, v_gcrf_km_s, t_tt_s, GCRS, TEME)
+
+
+# --------------------------------------------------------------------------------------
+# Fast TEME -> GCRF (interpolated rotation)
+# --------------------------------------------------------------------------------------
+#
+# Why: the exact path above costs about 0.3-0.7 ms per state (astropy builds the full
+# precession-nutation and Earth-rotation chain for every instant), which would dominate
+# catalog-scale SGP4 generation. TEME -> GCRF is a pure rotation, r_gcrf = M(t) r_teme,
+# and M(t) varies slowly: Earth rotation enters TEME -> ITRS and leaves again in
+# ITRS -> GCRS, so what is left is precession, nutation and the small GMST/ERA
+# difference, with no term faster than a few days. So:
+#
+# * M is computed with the exact path (astropy) at nodes on a fixed lattice in TT,
+#   t_k = k * FAST_NODE_STEP_S (k an integer, TT seconds since J2000.0), by rotating
+#   the three TEME basis vectors;
+# * between nodes, each element of M is interpolated with the degree-5 Lagrange
+#   polynomial through the FAST_STENCIL nearest nodes (three on each side of the
+#   6-hour interval holding the time). Each interval's polynomial is turned into
+#   monomial coefficients once per call and evaluated per state with Horner's rule;
+# * velocity is v_gcrf = M v_teme + dM/dt r_teme, with dM/dt the derivative of the
+#   same polynomial. The exact path gets its dM/dt term from astropy's finite
+#   differences; the two agree to about 1 micrometre/s.
+#
+# The lattice is fixed (it doesn't depend on the times asked for) and the interpolant is
+# local (it uses only nearby nodes), so a state's result depends only on its own time:
+# batched and single-object calls agree bit for bit, and node rotations can be cached
+# and shared across calls. Measured against the exact path over 7 days at 60 s
+# (``tests/test_frames.py``): under 1 micrometre in position and 1 micrometre/s in
+# velocity at 2005, 2016 (across the leap second) and 2024 epochs.
+#
+# Behaviour kept identical to the exact path: times are TT, so leap seconds need no
+# special handling (nodes are computed by the exact path, which handles UTC
+# internally); a time outside the EOP table raises EOPCoverageError just as
+# teme_to_gcrf does; a state whose stencil would reach a node outside the table (within
+# about 18 hours of either end of the table) is converted with the exact path instead.
+# Changing the EOP table (use_eop_file, configure_offline_eop) empties the node cache.
+
+#: Spacing of the interpolation nodes, seconds (TT). 6 hours.
+FAST_NODE_STEP_S = 21600.0
+#: Number of nodes in each interpolation stencil (degree-5 Lagrange polynomial).
+FAST_STENCIL = 6
+# States per evaluation chunk (bounds the temporary arrays to tens of MB).
+_FAST_CHUNK = 1 << 18
+
+# Node cache: lattice index k -> 3x3 rotation M(k * FAST_NODE_STEP_S), flattened to 9
+# values (row-major). Valid only for the EOP table object it was computed with (kept in
+# _NODE_CACHE_TABLE, compared by identity, so the cache is dropped as soon as a
+# different table is set). Mutating a table in place is not detected.
+_NODE_CACHE: dict[int, np.ndarray] = {}
+_NODE_CACHE_TABLE: list[object] = []
+
+
+def _lagrange_monomials(p: int) -> np.ndarray:
+    """Monomial coefficients of the Lagrange basis on centred nodes.
+
+    Nodes sit at ``y_j = j - (p - 1) / 2`` (for p = 6: -2.5, -1.5, ..., 2.5, in units of
+    the node step, measured from the middle of the interval being interpolated).
+    Returns ``L`` with shape (p, p): basis polynomial j is ``sum_d L[d, j] * y**d``.
+    Centring keeps the coefficients well conditioned on the interval ``|y| <= 0.5``.
+    """
+    y = np.arange(p) - (p - 1) / 2.0
+    out = np.empty((p, p))
+    for j in range(p):
+        others = np.delete(y, j)
+        out[:, j] = np.polynomial.polynomial.polyfromroots(others) / np.prod(y[j] - others)
+    return out
+
+
+_LAGRANGE = _lagrange_monomials(FAST_STENCIL)
+
+
+def clear_fast_rotation_cache() -> None:
+    """Forget all cached node rotations used by :func:`teme_to_gcrf_fast`."""
+    _NODE_CACHE.clear()
+    _NODE_CACHE_TABLE.clear()
+
+
+def _eop_tt_bounds() -> tuple[float, float]:
+    """First and last instant of the EOP table in use, as TT seconds since J2000.0."""
+    table = iers.earth_orientation_table.get()
+    mjd = np.asarray(table["MJD"].to_value(u.d))
+    lo, hi = time_to_tt_seconds(Time([mjd.min(), mjd.max()], format="mjd", scale="utc"))
+    return float(lo), float(hi)
+
+
+def _node_rotations(k: np.ndarray) -> np.ndarray:
+    """Exact TEME -> GCRF rotations at lattice nodes ``k``, shape (len(k), 9), row-major.
+
+    Uses (and fills) the node cache. Column j of each matrix is the GCRF image of the
+    TEME basis vector e_j, computed with :func:`teme_to_gcrf`.
+    """
+    table = iers.earth_orientation_table.get()
+    if not _NODE_CACHE_TABLE or _NODE_CACHE_TABLE[0] is not table:
+        _NODE_CACHE.clear()
+        _NODE_CACHE_TABLE[:] = [table]
+    missing = [int(x) for x in k if int(x) not in _NODE_CACHE]
+    if missing:
+        n = len(missing)
+        basis = np.tile(np.eye(3), (n, 1))  # rows e_x, e_y, e_z for each node
+        t_nodes = np.repeat(np.asarray(missing, dtype=np.float64) * FAST_NODE_STEP_S, 3)
+        r, _ = teme_to_gcrf(basis, np.zeros_like(basis), t_nodes)
+        mats = r.reshape(n, 3, 3).transpose(0, 2, 1)  # image of e_j becomes column j
+        for kk, m in zip(missing, mats, strict=True):
+            _NODE_CACHE[kk] = np.ascontiguousarray(m).reshape(9)
+    return np.stack([_NODE_CACHE[int(x)] for x in k])
+
+
+class _IntervalPolynomials:
+    """Monomial coefficients of the interpolating polynomial for each needed interval.
+
+    Interval ``k0`` is ``[k0 h, (k0 + 1) h)``; its stencil is nodes ``k0 - 2 ... k0 + 3``.
+    ``coef[i, d]`` (9 values) multiplies ``y**d``, with ``y = t / h - k0 - 0.5``.
+    """
+
+    def __init__(self, k0: np.ndarray):
+        p, half = FAST_STENCIL, FAST_STENCIL // 2
+        self.k_lo = int(k0.min())
+        span = int(k0.max()) - self.k_lo + 1
+        present = np.zeros(span, dtype=bool)
+        present[k0 - self.k_lo] = True
+        intervals = np.flatnonzero(present) + self.k_lo
+        self.slot = np.full(span, -1, dtype=np.int64)
+        self.slot[intervals - self.k_lo] = np.arange(intervals.size)
+
+        stencils = intervals[:, None] + np.arange(1 - half, half + 1)  # (n_int, p)
+        nodes_k, inverse = np.unique(stencils, return_inverse=True)
+        nodes = _node_rotations(nodes_k)[inverse.reshape(stencils.shape)]  # (n_int, p, 9)
+        coef = np.zeros((intervals.size, p, 9))
+        for d in range(p):  # explicit sums: identical arithmetic in every call
+            for j in range(p):
+                coef[:, d] += _LAGRANGE[d, j] * nodes[:, j]
+        self.coef = coef
+
+    def evaluate(self, t: np.ndarray, k0: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """(M, dM/dt) at times ``t`` in intervals ``k0``, each shape (len(t), 9)."""
+        h, p = FAST_NODE_STEP_S, FAST_STENCIL
+        idx = self.slot[k0 - self.k_lo]
+        y = (t / h - k0 - 0.5)[:, None]
+        m = self.coef[idx, p - 1].copy()
+        dm = (p - 1) * self.coef[idx, p - 1]
+        for d in range(p - 2, -1, -1):
+            m = m * y + self.coef[idx, d]
+            if d >= 1:
+                dm = dm * y + d * self.coef[idx, d]
+        return m, dm / h
+
+
+def teme_to_gcrf_rotation_fast(t_tt_s: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Interpolated TEME -> GCRF rotation and its time derivative at each time.
+
+    Args:
+        t_tt_s: shape (N,), TT seconds since J2000.0. Every stencil node must lie
+            inside the EOP table; :func:`teme_to_gcrf_fast` handles the table's edges.
+
+    Returns:
+        (M, M_dot): shapes (N, 3, 3), with ``r_gcrf = M @ r_teme`` and
+        ``v_gcrf = M @ v_teme + M_dot @ r_teme`` (M_dot in 1/s).
+    """
+    t = np.asarray(t_tt_s, dtype=np.float64)
+    k0 = np.floor(t / FAST_NODE_STEP_S).astype(np.int64)
+    m, m_dot = _IntervalPolynomials(k0).evaluate(t, k0)
+    return m.reshape(-1, 3, 3), m_dot.reshape(-1, 3, 3)
+
+
+def _apply_rotation(m: np.ndarray, x: np.ndarray) -> np.ndarray:
+    """``M[n] @ x[k, n]`` for every k and n, with M given row-major as shape (N, 9).
+
+    Written out rather than with einsum or matmul so the arithmetic for one state is
+    the same whatever the array sizes (BLAS and einsum may reorder the sums).
+    """
+    out = np.empty(x.shape)
+    for i in range(3):
+        out[..., i] = (
+            m[:, 3 * i] * x[..., 0] + m[:, 3 * i + 1] * x[..., 1] + m[:, 3 * i + 2] * x[..., 2]
+        )
+    return out
+
+
+def teme_to_gcrf_fast(
+    r_teme_km: np.ndarray, v_teme_km_s: np.ndarray, t_tt_s: float | np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """Rotate SGP4 TEME states into GCRF with an interpolated rotation.
+
+    Same conventions and results as :func:`teme_to_gcrf` to well under a millimetre
+    (method and measured accuracy in the comment block above), at a small fraction of
+    the cost. Accepts the same shapes, plus a block of states for many objects that
+    share one time grid.
+
+    Args:
+        r_teme_km: shape (3,), (N, 3), or (K, N, 3) for K objects on the same N times.
+        v_teme_km_s: same shape, km/s.
+        t_tt_s: TT seconds since J2000.0; a scalar, or shape (N,).
+
+    Returns:
+        (r_gcrf_km, v_gcrf_km_s) with the input's shape.
+
+    Raises:
+        EOPCoverageError: if any time is outside the EOP table (as the exact path).
+        ValueError: on inconsistent shapes or non-finite times.
+    """
+    r = np.asarray(r_teme_km, dtype=np.float64)
+    v = np.asarray(v_teme_km_s, dtype=np.float64)
+    if r.shape != v.shape or r.ndim not in (1, 2, 3) or r.shape[-1] != 3:
+        raise ValueError(
+            f"r and v must both have shape (3,), (N, 3) or (K, N, 3); got {r.shape}, {v.shape}"
+        )
+    single = r.ndim == 1
+    r3 = r.reshape(1, 1, 3) if single else (r[None] if r.ndim == 2 else r)
+    v3 = v.reshape(1, 1, 3) if single else (v[None] if v.ndim == 2 else v)
+    n = r3.shape[1]
+    t = np.asarray(t_tt_s, dtype=np.float64)
+    if t.ndim == 0:
+        t = np.full(n, float(t))
+    if t.ndim != 1 or t.shape[0] != n:
+        raise ValueError(f"t_tt_s must be a scalar or have shape ({n},), got {t.shape}")
+    if n == 0:
+        return r.copy(), v.copy()
+    if not np.all(np.isfinite(t)):
+        raise ValueError("t_tt_s contains NaN or inf")
+
+    # Same coverage check, and the same error, as the exact path. Coverage is an
+    # interval, so checking the earliest and latest time is the same check.
+    _check_eop_coverage(tt_seconds_to_time(np.array([t.min(), t.max()])))
+
+    # States whose stencil reaches outside the EOP table go through the exact path.
+    h, half = FAST_NODE_STEP_S, FAST_STENCIL // 2
+    k0 = np.floor(t / h).astype(np.int64)
+    lo, hi = _eop_tt_bounds()
+    interp = ((k0 + 1 - half) * h >= lo) & ((k0 + half) * h <= hi)
+
+    r_out = np.empty_like(r3)
+    v_out = np.empty_like(v3)
+    where = np.flatnonzero(interp)
+    if where.size:
+        poly = _IntervalPolynomials(k0[where])
+        for start in range(0, where.size, _FAST_CHUNK):
+            sel = where[start : start + _FAST_CHUNK]
+            m, m_dot = poly.evaluate(t[sel], k0[sel])
+            ri, vi = r3[:, sel], v3[:, sel]
+            r_out[:, sel] = _apply_rotation(m, ri)
+            v_out[:, sel] = _apply_rotation(m, vi) + _apply_rotation(m_dot, ri)
+    if where.size < n:
+        sel = np.flatnonzero(~interp)
+        k_obj = r3.shape[0]
+        tt = np.tile(t[sel], k_obj)
+        re, ve = teme_to_gcrf(r3[:, sel].reshape(-1, 3), v3[:, sel].reshape(-1, 3), tt)
+        r_out[:, sel] = re.reshape(k_obj, -1, 3)
+        v_out[:, sel] = ve.reshape(k_obj, -1, 3)
+
+    if single:
+        return r_out[0, 0], v_out[0, 0]
+    if r.ndim == 2:
+        return r_out[0], v_out[0]
+    return r_out, v_out
