@@ -35,6 +35,25 @@ How it works
    A training or dev row is ``excluded`` if its window reaches past the cutoff
    (so no training target lies at or after the cutoff), or if its window
    overlaps a validation event's exclusion window.
+3. **Data end.** A row of *any* role is ``excluded`` if its window ends after
+   the last fully observed space-weather day (the end of that UTC day). Past
+   it the space-weather file holds only forecasts, so truth propagated there
+   would be driven by predictions rather than measurements. The day comes
+   from :meth:`orbit_correction.spaceweather.SpaceWeather.last_fully_observed_date`
+   at labeling time and should be recorded with any split that is generated.
+
+What the labels allow
+---------------------
+* ``train`` rows are the only rows a model is fitted on.
+* ``dev`` rows are for development evaluation (tuning, model choice).
+* ``test`` rows are the held-out evaluation set, left unexamined until a
+  confirmatory run.
+* ``reserved_object`` and ``reserved_time`` rows enter **neither training nor
+  evaluation**. They are held out on one axis only (a held-out object before
+  the cutoff, or a training object after it), so using them for training would
+  leak held-out objects or epochs, and using them for evaluation would mix
+  partly seen data into the held-out result.
+* ``excluded`` rows are not used at all.
 
 Nothing here reads data: it only labels IDs and epochs it is given.
 """
@@ -74,7 +93,7 @@ class SplitConfig:
     """Split parameters. Values are instruments; see ``config/splits.toml``.
 
     Attributes:
-        status: ``"pending approval"`` until Kaitlin approves the values.
+        status: ``"approved <date>"`` once Kaitlin approves the values.
         seed: seed for the object draws.
         heldout_object_fraction: share of (non-forced) objects held out.
         dev_object_fraction: share of the remaining objects used for development
@@ -166,8 +185,18 @@ def object_roles(norad_ids: Iterable[int], cfg: SplitConfig) -> dict[int, str]:
 # --------------------------------------------------------------------------------------
 
 
+def data_end_tt_s(last_observed_date_utc: str) -> float:
+    """End of the last fully observed space-weather day (next 00:00 UTC), in TT seconds."""
+    day = np.datetime64(last_observed_date_utc, "D") + np.timedelta64(1, "D")
+    return float(utc_to_tt_seconds(f"{day}T00:00:00"))
+
+
 def assign_split_labels(
-    norad_ids: np.ndarray, start_epoch_tt_s: np.ndarray, cfg: SplitConfig
+    norad_ids: np.ndarray,
+    start_epoch_tt_s: np.ndarray,
+    cfg: SplitConfig,
+    *,
+    last_observed_date_utc: str,
 ) -> np.ndarray:
     """Label each (object, start epoch) row with one of :data:`SPLIT_LABELS`.
 
@@ -175,6 +204,10 @@ def assign_split_labels(
         norad_ids: shape (N,), integer NORAD IDs.
         start_epoch_tt_s: shape (N,), prediction starts, TT seconds since J2000.0.
         cfg: the split configuration.
+        last_observed_date_utc: last fully observed space-weather day
+            (``YYYY-MM-DD``), normally ``SpaceWeather.last_fully_observed_date()``.
+            Windows of any role ending after the end of this day are ``excluded``.
+            Required, so the rule cannot be skipped by omission.
 
     Returns:
         Shape (N,) array of label strings (object dtype).
@@ -205,6 +238,7 @@ def assign_split_labels(
     trainable = ~held & ~after
     labels[trainable] = role[trainable]
     labels[trainable & (crosses | near_event)] = "excluded"
+    labels[end > data_end_tt_s(last_observed_date_utc)] = "excluded"
     assert set(labels.tolist()) <= set(SPLIT_LABELS)
     return labels
 

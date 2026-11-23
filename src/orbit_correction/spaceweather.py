@@ -173,6 +173,27 @@ class SpaceWeather:
         idx = self.rows_in("OBSERVED")
         return self.dates[idx], idx
 
+    def last_fully_observed_date(self) -> str:
+        """Latest UTC date (``YYYY-MM-DD``) with a complete OBSERVED row.
+
+        Complete means every numeric field of the row is present (the 3-hour
+        Kp and ap values, daily Ap, F10.7 observed and adjusted, their 81-day
+        means, the quality flag...). Later dates exist only as forecasts, so
+        ``splits.assign_split_labels`` excludes prediction windows ending
+        after this day.
+
+        Note: the centred 81-day means of the last ~40 observed days average
+        over forecast days too; this method does not look into that.
+
+        Raises:
+            LookupError: if no OBSERVED row is complete.
+        """
+        numeric = [c.name for c in _COLUMNS[3:]]
+        for i in self.rows_in("OBSERVED")[::-1]:
+            if all(np.isfinite(self.value(n, int(i))) for n in numeric):
+                return str(self.dates[i])
+        raise LookupError("no complete OBSERVED row in the file")
+
     def _row_for_date(self, day: np.datetime64) -> int | None:
         """Row index whose values apply to ``day``: a daily row, else the month's row."""
         daily = (self.section == "OBSERVED") | (self.section == "DAILY_PREDICTED")
@@ -199,6 +220,12 @@ class SpaceWeather:
           * The 81-day F10.7 mean is *trailing*: the mean of observed F10.7 over
             the 81 known days ending on the last complete day. It is NaN unless
             all 81 values are present. The file's centred average is never used.
+
+        The model's four space-weather inputs (``types.SPACE_WEATHER_MODEL_INPUTS``,
+        approved 2026-11-23, with this rule and ``extra_lag_days = 0``) are
+        ``f107_obs_sfu``, ``f107_obs_trailing81_sfu``, ``ap_daily`` and
+        ``ap_3h_last`` of the result, stored as the ``asof_*`` residual columns.
+        ``f107_adj_sfu`` and ``kp_sum`` are returned for inspection only.
 
         The file is a snapshot of final, revised values; what an operator knew
         in real time at ``t0`` may have differed. That is a limitation of the

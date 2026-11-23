@@ -17,6 +17,7 @@ from orbit_correction.types import (
     OBSERVED_FEATURE_COLUMNS,
     RESIDUAL_COLUMNS,
     RESIDUAL_SCHEMA,
+    SPACE_WEATHER_MODEL_INPUTS,
     SPLIT_LABELS,
     TARGET_COLUMNS,
     TIME_SCALE,
@@ -147,6 +148,22 @@ def test_residual_schema_partitions_columns():
     assert not set(FEATURE_COLUMNS) & set(OBSERVED_FEATURE_COLUMNS)
     assert all(c.startswith("obs_") for c in OBSERVED_FEATURE_COLUMNS)
     assert all(c.startswith("asof_") for c in FEATURE_COLUMNS if "f107" in c or "ap_" in c)
+
+
+def test_space_weather_model_inputs_are_the_approved_four():
+    """The approved start-of-prediction inputs, exactly; observed-horizon columns are optional."""
+    assert SPACE_WEATHER_MODEL_INPUTS == (
+        "asof_f107_obs_sfu",
+        "asof_f107_obs_trailing81_sfu",
+        "asof_ap_daily",
+        "asof_ap_3h_last",
+    )
+    space_weather_features = [c for c in FEATURE_COLUMNS if "f107" in c or "ap_" in c]
+    assert tuple(space_weather_features) == SPACE_WEATHER_MODEL_INPUTS
+    by_name = {c.name: c for c in RESIDUAL_COLUMNS}
+    assert all(by_name[c].role == "feature" for c in SPACE_WEATHER_MODEL_INPUTS)
+    assert all(by_name[c].nullable for c in OBSERVED_FEATURE_COLUMNS)
+    assert all(by_name[c].role == "feature_observed" for c in OBSERVED_FEATURE_COLUMNS)
 
 
 def _replace(table: pa.Table, name: str, arr: pa.Array) -> pa.Table:

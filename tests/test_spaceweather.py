@@ -202,6 +202,22 @@ def test_as_of_before_data_is_all_missing(sw):
 # ---------------------------------------------------------------- observed lookup (truth)
 
 
+def test_last_fully_observed_date(sw):
+    assert sw.last_fully_observed_date() == "2024-04-29"  # last OBSERVED row of the fixture
+    # a blank in the last observed rows moves the date back to the last complete one
+    edited = copy.deepcopy(sw)
+    obs = edited.rows_in("OBSERVED")
+    edited.ap[obs[-1], 3] = np.nan
+    edited.scalars["f107_obs"][obs[-2]] = np.nan
+    assert edited.last_fully_observed_date() == "2024-04-27"
+    # predicted rows never count, even complete ones
+    assert np.datetime64(sw.last_fully_observed_date()) < sw.dates[sw.rows_in("DAILY_PREDICTED")[0]]
+    for v in edited.scalars.values():
+        v[obs] = np.nan
+    with pytest.raises(LookupError):
+        edited.last_fully_observed_date()
+
+
 def test_observed_includes_centred_average_and_previous_day(sw):
     o = sw.observed(utc_to_tt_seconds("2024-03-15T07:30:00"))
     i = int(np.flatnonzero(sw.dates == np.datetime64("2024-03-15"))[0])

@@ -12,6 +12,9 @@ builds against this file, not against another component's work in progress, and
 2. The residual dataset schema (:data:`RESIDUAL_SCHEMA`, :data:`RESIDUAL_COLUMNS`,
    :func:`validate_residual_table`): one row per (object, start epoch, time
    since start), holding the model's features and its curvilinear RTN targets.
+   The model's space-weather inputs are exactly the four start-of-prediction
+   values in :data:`SPACE_WEATHER_MODEL_INPUTS` (approved 2026-11-23); the
+   ``obs_*`` columns are optional and only for the labeled comparison.
 3. :class:`CorrectionModel`: the interface a trained correction exposes to
    screening: features in, curvilinear (R, T, N) corrections in km out.
 
@@ -224,11 +227,14 @@ class Trajectory:
 # --------------------------------------------------------------------------------------
 
 #: Split labels a residual row may carry. ``splits.py`` assigns them.
-#: train / dev: training objects, windows entirely before the time cutoff.
+#: train: training objects, windows entirely before the time cutoff (fitted on).
+#: dev: development objects, same time rule (development evaluation).
 #: test: held-out objects at or after the cutoff (the confirmatory set).
-#: reserved_object: held-out objects before the cutoff (never trained on).
-#: reserved_time: training objects at or after the cutoff (never trained on).
-#: excluded: rows removed by a rule (window crossing the cutoff, event window).
+#: reserved_object: held-out objects before the cutoff.
+#: reserved_time: training objects at or after the cutoff.
+#: reserved_* rows enter neither training nor evaluation.
+#: excluded: rows removed by a rule (window crossing the cutoff, validation-event
+#: window, window ending after the last fully observed space-weather day).
 SPLIT_LABELS = ("train", "dev", "test", "reserved_object", "reserved_time", "excluded")
 
 
@@ -287,7 +293,11 @@ RESIDUAL_COLUMNS: tuple[ResidualColumn, ...] = (
     ResidualColumn("bstar_per_earth_radii", _F64, "1/ER", "feature", False, "SGP4 drag term B*"),
     ResidualColumn("mean_motion_dot", _F64, "rev/day^2", "feature", True,
                    "first derivative of mean motion / 2, as in the element set"),
-    # features: space weather available at the start (as-of lookup; no centred averages)
+    # features: space weather available at the start. These four are the model's
+    # space-weather inputs (SPACE_WEATHER_MODEL_INPUTS), from SpaceWeather.as_of
+    # with the approved availability rule: a day counts once it is complete
+    # (from the next 00:00 UTC), a 3-hour ap value once its interval has ended,
+    # no extra lag, OBSERVED rows only, no centred averages.
     ResidualColumn("asof_f107_obs_sfu", _F64, "sfu", "feature", True,
                    "observed F10.7 of the last day complete at the start"),
     ResidualColumn("asof_f107_obs_trailing81_sfu", _F64, "sfu", "feature", True,
@@ -296,7 +306,8 @@ RESIDUAL_COLUMNS: tuple[ResidualColumn, ...] = (
                    "daily Ap of the last day complete at the start"),
     ResidualColumn("asof_ap_3h_last", _F64, "", "feature", True,
                    "last 3-hour ap interval complete at the start"),
-    # space weather observed over the horizon (labeled comparison only)
+    # space weather observed over the horizon: optional (null when the comparison
+    # is not computed) and for the labeled comparison only, never a headline input
     ResidualColumn("obs_f107_obs_sfu", _F64, "sfu", "feature_observed", True,
                    "observed F10.7 of the day containing start + dt"),
     ResidualColumn("obs_f107_obs_ctr81_sfu", _F64, "sfu", "feature_observed", True,
@@ -334,6 +345,16 @@ RESIDUAL_SCHEMA: pa.Schema = pa.schema(
         "time_scale": TIME_SCALE,
         "time_epoch": TIME_EPOCH,
     },
+)
+
+#: The model's space-weather inputs, all known at the prediction start (approved
+#: 2026-11-23): last complete day's observed F10.7, trailing 81-day mean of
+#: observed F10.7, last complete day's daily Ap, last completed 3-hour ap.
+SPACE_WEATHER_MODEL_INPUTS = (
+    "asof_f107_obs_sfu",
+    "asof_f107_obs_trailing81_sfu",
+    "asof_ap_daily",
+    "asof_ap_3h_last",
 )
 
 #: Column names by role, for convenience.
@@ -399,8 +420,10 @@ class CorrectionModel(Protocol):
     Attributes:
         feature_columns: the residual-schema columns the model reads. Each must
             be one of :data:`FEATURE_COLUMNS`, :data:`OBSERVED_FEATURE_COLUMNS`
-            or ``"dt_s"``. A model that reads observed-horizon space weather is the
-            labeled comparison variant, never the headline.
+            or ``"dt_s"``. The headline model's space-weather inputs are those
+            in :data:`SPACE_WEATHER_MODEL_INPUTS`. A model that reads
+            observed-horizon space weather is the labeled comparison variant,
+            never the headline.
     """
 
     feature_columns: tuple[str, ...]

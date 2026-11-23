@@ -1,20 +1,24 @@
 # Object and time split (read by orbit_correction.splits.load_split_config).
 # Every value here is an instrument: log changes in docs/changelog.md.
 #
-# STATUS: PENDING APPROVAL. These are proposed values. No split has been
-# generated from real data, and none should be until Kaitlin approves them.
+# Status: approved 2026-11-23. No split has been generated from real data yet.
+#
+# One rule lives outside this file: windows (any split) ending after the last
+# fully observed space-weather day are labeled excluded. That day comes from the
+# space-weather file at labeling time (SpaceWeather.last_fully_observed_date),
+# because the file grows daily; record it with any split that is generated.
 
 [splits]
-status = "pending approval"
+status = "approved 2026-11-23"
 seed = 20261123
 
-# Share of (non-forced) objects held out entirely. Proposed 0.2.
+# Share of (non-forced) objects held out entirely.
 heldout_object_fraction = 0.2
-# Share of the remaining objects kept for development evaluation. Proposed 0.15.
+# Share of the remaining objects kept for development evaluation.
 dev_object_fraction = 0.15
 
 # Training epochs (and whole prediction windows) end before this instant (UTC).
-# Proposed 2025-01-01: training spans the rise to solar maximum, test the
+# 2025-01-01: training spans the rise to solar maximum, test the
 # post-maximum period, so the test sits partly in a different solar regime
 # (reported by solar-activity bin).
 time_cutoff_utc = "2025-01-01T00:00:00"
@@ -31,7 +35,7 @@ forced_heldout_norad_ids = [
 
 # Training and dev windows overlapping [TCA - before, TCA + after] of any event
 # are excluded, so no training target shares a validation event's prediction
-# window. Proposed 7 days before (the event's own window) and 1 day after.
+# window: 7 days before (the event's own window) and 1 day after.
 event_exclusion_days_before = 7.0
 event_exclusion_days_after = 1.0
 
