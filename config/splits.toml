@@ -1,0 +1,65 @@
+# Object and time split (read by orbit_correction.splits.load_split_config).
+# Every value here is an instrument: log changes in docs/changelog.md.
+#
+# Status: approved 2026-11-23. No split has been generated from real data yet.
+#
+# One rule lives outside this file: windows (any split) ending after the last
+# fully observed space-weather day are labeled excluded. That day comes from the
+# space-weather file at labeling time (SpaceWeather.last_fully_observed_date),
+# because the file grows daily; record it with any split that is generated.
+
+[splits]
+status = "approved 2026-11-23"
+seed = 20261123
+
+# Share of (non-forced) objects held out entirely.
+heldout_object_fraction = 0.2
+# Share of the remaining objects kept for development evaluation.
+dev_object_fraction = 0.15
+
+# Training epochs (and whole prediction windows) end before this instant (UTC).
+# 2025-01-01: training spans the rise to solar maximum, test the
+# post-maximum period, so the test sits partly in a different solar regime
+# (reported by solar-activity bin).
+time_cutoff_utc = "2025-01-01T00:00:00"
+max_horizon_days = 7.0
+
+# Validation-case objects: always held out, never trained on.
+forced_heldout_norad_ids = [
+    24946, 22675,  # Iridium 33, Cosmos 2251 (2009 collision; Iridium 33 maneuvered)
+    26998, 22236,  # TIMED, Cosmos 2221 (2024 near miss)
+    13777, 2828,   # IRAS, GGSE-4 (2020 near miss)
+    19826, 36123,  # Cosmos 2004, CZ-4C R/B (2020 near miss)
+    7219, 26207,   # Thor Burner 2A R/B, CZ-4 fragment (2005 collision; only if debris is in)
+]
+
+# Training and dev windows overlapping [TCA - before, TCA + after] of any event
+# are excluded, so no training target shares a validation event's prediction
+# window: 7 days before (the event's own window) and 1 day after.
+event_exclusion_days_before = 7.0
+event_exclusion_days_after = 1.0
+
+[[splits.validation_events]]
+name = "Iridium 33 / Cosmos 2251"
+tca_utc = "2009-02-10T16:56:00"
+norad_ids = [24946, 22675]
+
+[[splits.validation_events]]
+name = "TIMED / Cosmos 2221"
+tca_utc = "2024-02-28T06:34:00"
+norad_ids = [26998, 22236]
+
+[[splits.validation_events]]
+name = "IRAS / GGSE-4"
+tca_utc = "2020-01-29T23:39:35.707"
+norad_ids = [13777, 2828]
+
+[[splits.validation_events]]
+name = "Cosmos 2004 / CZ-4C R/B"
+tca_utc = "2020-10-16T00:56:40"
+norad_ids = [19826, 36123]
+
+[[splits.validation_events]]
+name = "Thor Burner 2A R/B / CZ-4 fragment"
+tca_utc = "2005-01-17T02:14:00"
+norad_ids = [7219, 26207]

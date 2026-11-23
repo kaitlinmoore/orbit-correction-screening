@@ -1,0 +1,56 @@
+# Catalog filters (read by orbit_correction.catalog.load_filter_config).
+# Every value here is an instrument: log changes in docs/changelog.md.
+#
+# Status: approved 2026-11-23 (LEO bounds, B* range, object types including
+# debris, ephemeris type, non-maneuvering rule). The element-history thresholds
+# in part 3 were chosen when the rule was approved; see docs/changelog.md.
+
+[catalog_filters]
+status = "approved 2026-11-23"
+
+# LEO: perigee and apogee altitude above the WGS-72 equatorial radius.
+perigee_min_km = 250.0
+apogee_max_km = 2000.0
+
+# B* (1/Earth radii). Drops negative and zero B* (no area-to-mass for drag)
+# and values above 0.01 (about 0.058 m^2/kg at Cd 2.2).
+bstar_min_exclusive = 0.0
+bstar_max = 0.01
+
+# Only SGP4 element sets (OMM EPHEMERIS_TYPE 0).
+ephemeris_types = [0]
+
+# Object types kept. Including DEB keeps the Thor / CZ-4 validation case alive.
+object_types = ["PAY", "R/B", "DEB"]
+
+# Non-maneuvering rule, part 1: payloads whose current SATCAT status says they
+# work (+ operational, P partial, B backup, S spare, X extended) are dropped.
+exclude_ops_status = ["+", "P", "B", "S", "X"]
+
+# Part 2: constellations known to maneuver, by name prefix (case-insensitive).
+# The name rule also catches decayed members, whose SATCAT status (D) no longer
+# says they were operational at historical epochs.
+# FLOCK: Planet's Flock satellites phase themselves with differential drag
+#   ("Orbit Determination and Differential-drag Control of
+#   Planet Labs Cubesat Constellations", arXiv:1509.03270).
+# LEMUR: Spire's Lemur satellites carry ThrustMe I2T5 iodine propulsion "for
+#   satellite phasing, collision avoidance maneuvers, and end-of-life
+#   deorbiting" from the Q4 2022 launch on (SatNews, 2022-09-02,
+#   https://satnews.com/2022/09/02/seven-propulsion-systems-from-thrustme-delivered-to-spire-global-for-their-lemur-satellites/).
+#   Earlier Lemurs are dropped too: names don't separate the generations.
+exclude_name_patterns = [
+    "STARLINK", "ONEWEB", "KUIPER", "IRIDIUM", "GLOBALSTAR", "ORBCOMM",
+    "QIANFAN", "GUOWANG", "FLOCK", "LEMUR",
+]
+
+# Part 3 (element histories). Consecutive element sets of one object, by epoch;
+# any flag drops the whole object.
+# (a) Orbit raising: a mean semimajor-axis rise above this (drag only lowers it).
+sma_increase_max_km = 1.0
+# (b) Orbit lowering: a mean semimajor-axis drop larger than
+#     sma_drop_drag_multiple x (drag decay implied by MEAN_MOTION_DOT over the
+#     gap, the larger of the two sets' rates) + sma_drop_floor_km.
+sma_drop_drag_multiple = 3.0
+sma_drop_floor_km = 1.0
+# (c) Plane change: a mean-inclination change above this.
+inclination_jump_max_deg = 0.05

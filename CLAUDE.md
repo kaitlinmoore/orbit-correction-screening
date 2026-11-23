@@ -21,7 +21,7 @@ A PhysicsNeMo model that learns the error of SGP4 against a high-fidelity numeri
 ## Environment
 WSL2 (Ubuntu), because PhysicsNeMo supports Windows only through WSL. Claude Code runs inside WSL. The repo lives at C:\dev\GitHub\orbit-correction-screening (/mnt/c/dev/GitHub/orbit-correction-screening from WSL); the uv environment lives at $HOME/.venvs/orbit-correction-screening, set by UV_PROJECT_ENVIRONMENT in .envrc.
 uv, Python 3.12 (matches lunar-thermal-surrogate; numpy 2.5 and scipy 1.18 need it). PyTorch must be built for CUDA 12.8 or newer (RTX 5080, Blackwell). Pinned versions: pending, taken from lunar-thermal-surrogate's recorded environment.
-Key deps: nvidia-physicsnemo, torch, sgp4, numpy, numba, scipy. Truth propagator: Orekit through orekit-jpype (jdk4py extra) with the orekit-data bundle pinned by git commit, in a data-generation dependency group; the training process never starts the JVM. brahe for the cross-check.
+Key deps: nvidia-physicsnemo, torch, sgp4, astropy, numpy, numba, scipy. Truth propagator: Orekit through orekit-jpype (jdk4py extra) with the orekit-data bundle pinned by git commit, in a data-generation dependency group; the training process never starts the JVM. brahe for the cross-check.
 
 ## Project-specific
 - Design document: orbit_correction_screening_planning_package.md at the repo root (gitignored). Its locked decisions (section 2) stay locked unless I reopen them.

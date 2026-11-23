@@ -1,0 +1,46 @@
+[project]
+name = "orbit-correction-screening"
+version = "0.1.0"
+description = "A PhysicsNeMo model that learns SGP4's error against a numerical propagator, tested on LEO conjunction screening."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "astropy>=8.0.3",
+    "astropy-iers-data>=0.2026.11.23.0.35.53",
+    "numpy>=2.5.5",
+    "pyarrow>=26.0.1",
+    "pyerfa>=2.0.1.5",
+    "python-dotenv>=1.2.4",
+    "requests>=2.34.2",
+    "scipy>=1.18.1",
+    "sgp4>=2.27",
+]
+
+[build-system]
+requires = ["uv_build>=0.13.8,<0.14"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "orbit_correction"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "network: fetches from the internet; skipped unless ORBIT_NETWORK_TESTS=1",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "NPY"]
+
+[dependency-groups]
+dev = [
+    "ipykernel>=7.4.0",
+    "pytest>=9.2.0",
+    "ruff>=0.17.6",
+]
