@@ -15,7 +15,23 @@ not tracked positions.
 - Element sets: CelesTrak GP (development, tests) and Space-Track `gp_history` (training and
   test epochs; validation cases). Loading and filtering: `src/orbit_correction/catalog.py`.
 - Space weather: CelesTrak `SW-All.txt`, read by `src/orbit_correction/spaceweather.py`.
-- Filters and their values: `config/catalog_filters.toml` (pending approval).
+- Filters and their values: `config/catalog_filters.toml` (approved 2026-11-23). LEO
+  (perigee >= 250 km, apogee <= 2000 km), 0 < B* <= 0.01 /ER, SGP4 element sets only,
+  payloads, rocket bodies and debris. Non-maneuvering: operational payloads (current SATCAT
+  status) and maneuvering constellations by name are dropped, and so is any object whose
+  element history shows a mean semimajor-axis rise, a drop larger than drag explains, or an
+  inclination step. Each rule's rejections are reported by name.
+
+## Model inputs
+
+The headline model sees the SGP4 element set (mean elements, B*, mean-motion derivative), the
+time since the start, and exactly four space-weather values known at the start (approved
+2026-11-23): the last complete day's observed F10.7, the trailing 81-day mean of observed
+F10.7, the last complete day's daily Ap, and the last completed 3-hour ap. A day counts as
+known from 00:00 UTC the next day and a 3-hour ap value from the end of its interval, with no
+extra lag; only observed rows are read. Space weather observed over the prediction horizon
+(`obs_*` columns) is optional and used only for a labeled comparison of how much perfect
+space-weather foresight would add.
 
 ## Conventions
 
@@ -27,8 +43,24 @@ not tracked positions.
 
 ## Splits
 
-By object and by time (`src/orbit_correction/splits.py`, `config/splits.toml`, pending
-approval). Validation-case objects are always held out.
+By object and by time (`src/orbit_correction/splits.py`, `config/splits.toml`, approved
+2026-11-23):
+
+- Objects: a seeded hash per NORAD ID (seed 20261123) holds out 20% of objects; 15% of the
+  rest form a development set. The ten validation-case objects are always held out.
+- Time: training and development windows (start plus 7 days) end before 2025-01-01T00:00:00
+  UTC; test rows start at or after it.
+- Training and development windows overlapping [TCA - 7 d, TCA + 1 d] of a validation event
+  are excluded.
+- Windows of any split that end after the last fully observed space-weather day are excluded:
+  beyond it the space-weather file holds only forecasts.
+
+Row labels: `train` (fitted on), `dev` (development evaluation), `test` (held-out evaluation,
+unexamined until a confirmatory run), `reserved_object`, `reserved_time` and `excluded`.
+`reserved_object` rows (held-out objects before the cutoff) and `reserved_time` rows
+(training objects after the cutoff) enter neither training nor evaluation: each is held out
+on only one axis, so training on them would leak held-out objects or epochs, and evaluating on
+them would mix partly seen data into the held-out result.
 
 ## Truth propagation
 

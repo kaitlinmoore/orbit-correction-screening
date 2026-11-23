@@ -66,7 +66,7 @@ None yet.
 - [`docs/methodology.md`](docs/methodology.md): approach, conventions, data, splits.
 - [`docs/changelog.md`](docs/changelog.md): every instrument and design change with its reason.
 - Contracts between components: [`src/orbit_correction/types.py`](src/orbit_correction/types.py), checked by `tests/test_contracts.py`.
-- Proposed catalog filters and split values (pending approval): [`config/`](config/).
+- Catalog filters and split values (approved 2026-11-23): [`config/`](config/).
 
 What is implemented here and what is library behaviour:
 - SGP4 is the `sgp4` package (Vallado's implementation). TEME to GCRF rotations and time-scale arithmetic are astropy and ERFA. This project adds the conventions and wrappers, EOP pinning and range checks, and tests against the Vallado et al. (2006) reference examples.
@@ -75,9 +75,14 @@ What is implemented here and what is library behaviour:
 ## Limitations and scope
 
 - Truth is a numerical model (Orekit), not tracked positions.
-- v1 covers LEO, non-maneuvering objects only. The non-maneuvering rule uses each object's *current* SATCAT status, constellation names and element-history jumps; none of these is a historical maneuver record.
+- v1 covers LEO, non-maneuvering objects only, and the non-maneuvering rule is approximate. None of its parts is a historical maneuver record:
+  - The status part uses each object's *current* SATCAT status, not its status at each epoch.
+  - It misclassifies non-propulsive operational satellites as maneuverable. TIMED is one example (held out anyway as a validation object).
+  - The constellation name list covers only the constellations named in `config/catalog_filters.toml`.
+  - The element-history detector misses small maneuvers: semimajor-axis changes under about 1 km plus the drag allowance, inclination changes under 0.05 deg, and anything hidden in a long gap between element sets.
+- Prediction windows ending after the last fully observed space-weather day are excluded, so the most recent epochs are never used.
 - The space-weather file is a snapshot of final, revised values. The as-of lookup prevents reading values after the prediction start, but cannot reproduce what an operator knew in real time.
-- Catalog filter values and split parameters are proposals pending approval; no split has been generated from real data.
+- Catalog filter values and split parameters are approved (2026-11-23); no split has been generated from real data yet.
 
 ## AI assistance
 
