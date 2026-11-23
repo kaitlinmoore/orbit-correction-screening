@@ -1,0 +1,37 @@
+# Catalog filters (read by orbit_correction.catalog.load_filter_config).
+# Every value here is an instrument: log changes in docs/changelog.md.
+#
+# STATUS: PENDING APPROVAL. Proposed defaults; the LEO bounds, B* thresholds,
+# non-maneuvering rule and debris inclusion are open decisions.
+
+[catalog_filters]
+status = "pending approval"
+
+# LEO: perigee and apogee altitude above the WGS-72 equatorial radius.
+perigee_min_km = 250.0
+apogee_max_km = 2000.0
+
+# B* (1/Earth radii). Drops negative and zero B* (no area-to-mass for drag)
+# and values above 0.01 (about 0.058 m^2/kg at Cd 2.2).
+bstar_min_exclusive = 0.0
+bstar_max = 0.01
+
+# Only SGP4 element sets (OMM EPHEMERIS_TYPE 0).
+ephemeris_types = [0]
+
+# Object types kept. Including DEB keeps the Thor / CZ-4 validation case alive.
+object_types = ["PAY", "R/B", "DEB"]
+
+# Non-maneuvering rule, part 1: payloads whose current SATCAT status says they
+# work (+ operational, P partial, B backup, S spare, X extended) are dropped.
+exclude_ops_status = ["+", "P", "B", "S", "X"]
+
+# Part 2: constellations known to maneuver, by name prefix (case-insensitive).
+exclude_name_patterns = [
+    "STARLINK", "ONEWEB", "KUIPER", "IRIDIUM", "GLOBALSTAR", "ORBCOMM",
+    "QIANFAN", "GUOWANG",
+]
+
+# Part 3 (element histories): a mean semimajor-axis rise above this between
+# consecutive element sets flags a maneuver; the object is dropped.
+sma_increase_max_km = 1.0
