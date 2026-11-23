@@ -52,8 +52,9 @@ By object and by time (`src/orbit_correction/splits.py`, `config/splits.toml`, a
   UTC; test rows start at or after it.
 - Training and development windows overlapping [TCA - 7 d, TCA + 1 d] of a validation event
   are excluded.
-- Windows of any split that end after the last fully observed space-weather day are excluded:
-  beyond it the space-weather file holds only forecasts.
+- Windows of any split that end later than 41 days before the end of the last fully observed
+  space-weather day are excluded: beyond that day the file holds only forecasts, and the truth
+  propagator's centred 81-day F10.7 mean reaches 40 days ahead (`truth_data_end_margin_days`).
 
 Row labels: `train` (fitted on), `dev` (development evaluation), `test` (held-out evaluation,
 unexamined until a confirmatory run), `reserved_object`, `reserved_time` and `excluded`.
@@ -93,7 +94,47 @@ through its Python bindings; the theory and the propagation code are the library
 
 ## Truth propagation
 
-_To be written (build step 2)._
+Truth is a numerical model, not tracked positions (`src/orbit_correction/truth_prop.py`,
+configuration in `config/truth.toml`).
+
+- **Library behaviour:** Orekit 13.1.9 (through orekit-jpype) does the integration (DOP853),
+  gravity (Holmes-Featherstone with EIGEN-6S from the pinned orekit-data bundle), the
+  NRLMSISE-00 atmosphere and drag force, Earth orientation (IERS 2010, bundle EOP), the Sun
+  (DE-440), the ephemeris output and the altitude event.
+- **Project code:** the configuration and its checks; the B* to area-to-mass relation
+  (A/m = 2 B* / (Cd rho0), Cd 2.2, rho0 = 0.15696615 kg/(m^2 ER)); the GCRF/TT/km boundary;
+  reading space weather only from the copy `spaceweather.write_orekit_cssi` writes; the
+  re-entry status; the JVM rules and the spawned worker pool.
+- **Force model:** central body plus EIGEN-6S zonal harmonics (order 0) to the degree set by a
+  convergence check (proposed: 36); NRLMSISE-00 drag with mean local solar time and the
+  3-hourly ap array (proposed); a cannonball with Cd 2.2. No tesserals, Sun or Moon gravity,
+  radiation pressure, tides or relativity; truth is "zonal plus drag" by design.
+- **Initial state:** the SGP4 state at the element-set epoch, rotated TEME to GCRF by
+  `frames.teme_to_gcrf`, used as an osculating state. A start fitted to SGP4 is a later,
+  labeled sensitivity variant.
+- **Integrator:** DOP853, 1 m position tolerance, 300 s maximum step. At this maximum step the
+  integrator runs at the step cap, so its 7-day integration error is set by the step:
+  8 m at 1,200 km, 17-22 m at 800 km, about 53 m at 500 km and 92-195 m at 300 km (against a
+  converged 1 mm / 30 s run, degree 36). This is part of the truth definition and is
+  reported as a limit.
+- **Space weather:** Orekit's NRLMSISE-00 input is the previous day's observed F10.7, the
+  centred 81-day observed mean for the day containing each instant, and the Ap history
+  (Orekit source, `CssiSpaceWeatherData`). Windows therefore end at least 41 days before
+  the end of the last fully observed space-weather day (see Splits).
+- **Re-entry:** a window in which the geodetic altitude falls below 120 km (proposed) is
+  returned as status `reentry` with no trajectory.
+- **Checks** (`tests/test_truth_prop.py`): two-body energy and angular momentum over 7 days;
+  J2 node, perigee and mean-anomaly rates against first-order theory over 12 days; zonal
+  truncation (no tesseral terms; degree 4 equal to closed-form J2-J4 to 1e-13); drag work
+  equal to the energy lost; circular decay under an exponential atmosphere against the
+  analytic rate; NRLMSISE-00 against pymsis (msis00) to 1.1e-5; Orekit's space-weather values
+  against `spaceweather.observed`; Orekit's TEME to GCRF against `frames.teme_to_gcrf`
+  (0.5-1.1 m); Orekit's TLEPropagator against the sgp4 package (9 micrometres); determinism
+  across worker processes.
+- **Independent check:** brahe 1.9.0 with a shared static zonal set (`scripts/crosscheck_brahe.py`).
+  Without drag the two agree to millimetres at 7 days; with drag they agree once both use the
+  same NRLMSISE-00 conventions (see the cross-check results in the changelog and the
+  deliverable report).
 
 ## Residual dataset
 
