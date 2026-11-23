@@ -1,0 +1,26 @@
+# Orchestration files: local only, never committed
+handoffs/
+
+# Planning package: kept out of git for now
+orbit_correction_screening_planning_package.md
+
+# Learning write-ups (Research Project Standard v2)
+learning/
+
+# Data and model artifacts. Space-Track data is never committed (user agreement).
+data/
+*.mdlus
+*.pt
+*.ckpt
+*.pth
+
+# Python and environments (the uv environment lives in $HOME/.venvs, see .envrc)
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Secrets
+.env
