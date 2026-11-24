@@ -2,7 +2,9 @@
 
 Two kinds of test live here:
 
-* **Always run** (default ``uv sync``): JVM isolation, configuration, the B* relation.
+* **Always run** (default ``uv sync``): JVM isolation, configuration, the B* relation,
+  the start rule's algebra and the space-weather range and margin guards (they act
+  before any JVM is needed).
 * **``datagen``** (need ``uv sync --group datagen``; skipped cleanly without it):
   closed-form physics checks, independent-implementation checks and determinism.
   They share one JVM per pytest session (the ``ctx`` fixture), because a JVM
@@ -107,14 +109,19 @@ def elements(r, v, mu):
 
 
 def test_importing_project_modules_starts_no_jvm():
-    """Importing any project module (truth_prop included) imports no jpype and starts no JVM."""
+    """Importing every project module (found by walking the package) starts no JVM."""
     code = textwrap.dedent(
         """
-        import sys
+        import importlib, pkgutil, sys
         import orbit_correction
-        from orbit_correction import types, frames, spaceweather, catalog, splits, truth_prop
+        names = [m.name for m in pkgutil.walk_packages(orbit_correction.__path__,
+                                                        "orbit_correction.")]
+        assert "orbit_correction.truth_prop" in names and len(names) >= 7, names
+        for name in names:
+            importlib.import_module(name)
         bad = [m for m in ("jpype", "orekit_jpype", "jdk4py", "_jpype") if m in sys.modules]
         assert not bad, bad
+        from orbit_correction import truth_prop
         assert not truth_prop.jvm_started()
         cfg = truth_prop.load_truth_config()
         truth_prop.area_to_mass_from_bstar(1e-4, cfg)
@@ -127,13 +134,39 @@ def test_importing_project_modules_starts_no_jvm():
     assert out.stdout.strip() == "ok"
 
 
-def test_config_loads_with_decision_1_values():
+def test_start_jvm_refuses_a_process_that_imported_torch():
+    """The JVM never shares a process with PyTorch (checked before any Java import)."""
+    code = textwrap.dedent(
+        """
+        import sys, types
+        sys.modules["torch"] = types.ModuleType("torch")  # stands in for `import torch`
+        from orbit_correction import truth_prop
+        try:
+            truth_prop.start_jvm()
+        except RuntimeError as exc:
+            assert "torch" in str(exc)
+        else:
+            raise AssertionError("start_jvm ran with torch imported")
+        assert "jpype" not in sys.modules
+        print("ok")
+        """
+    )
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, cwd=REPO)
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.strip() == "ok"
+
+
+def test_config_loads_with_decided_values():
+    """Decision 1 plus the truth settings decided on 2026-11-23."""
     cfg = T.load_truth_config()
     assert cfg.gravity_field_file == "eigen-6s.gfc" and cfg.zonal_order == 0
-    assert cfg.zonal_degree >= 2
+    assert cfg.zonal_degree == 36
     assert cfg.atmosphere == "NRLMSISE-00" and cfg.cd == 2.2
+    assert cfg.msis_local_solar_time == "MEAN" and cfg.msis_ap_switch == -1
     assert cfg.integrator == "DOP853"
-    assert cfg.position_tolerance_m == 1.0 and cfg.max_step_s == 300.0
+    assert cfg.position_tolerance_m == 1.0 and cfg.max_step_s == 180.0
+    assert cfg.start_rule == "preserve_sgp4_mean_motion"
+    assert cfg.reentry_altitude_km == 120.0
     assert cfg.output_step_s == 60.0
     assert cfg.iers_conventions == "IERS_2010"
     assert cfg.orekit_data_commit.startswith("2d6edc9")
@@ -150,6 +183,8 @@ def test_config_validation():
         dict(msis_ap_switch=0),
         dict(integrator="RK4"),
         dict(max_step_s=-1.0),
+        dict(start_rule="fitted"),
+        dict(sgp4_mu_km3_s2=0.0),
     ):
         with pytest.raises(ValueError):
             dataclasses.replace(cfg, **bad)
@@ -165,6 +200,129 @@ def test_area_to_mass_from_bstar():
     for bad in (0.0, -2.2675e-05, float("nan")):
         with pytest.raises(ValueError, match="area_to_mass"):
             T.area_to_mass_from_bstar(bad, cfg)
+
+
+def test_sgp4_mu_is_the_sgp4_packages_wgs72():
+    from sgp4.earth_gravity import wgs72
+
+    from orbit_correction import cheap_prop
+
+    assert T.load_truth_config().sgp4_mu_km3_s2 == wgs72.mu
+    assert cheap_prop.GRAVITY_MODEL_NAME == "WGS-72"
+
+
+MU_TRUTH_M3 = 3.986004415e14  # EIGEN-6S GM, as Orekit reads it from the bundle
+
+
+def test_start_rule_preserves_two_body_period_and_shape():
+    """k = (mu_truth / mu_WGS72)^(1/3): same period, eccentricity vector and plane."""
+    cfg = T.load_truth_config()
+    mu72 = cfg.sgp4_mu_km3_s2
+    mu_t = MU_TRUTH_M3 / 1e9
+    k = T.start_rule_scale(MU_TRUTH_M3, cfg)
+    assert k == pytest.approx((mu_t / mu72) ** (1 / 3), rel=1e-15)
+    assert -3.1e-7 < k - 1 < -2.9e-7  # the GMs differ by 9.0e-7 relative
+
+    init = kepler_state(6900.0, 0.012, 97.4, 30.0, 40.0, 75.0, t0=DAY, mu_km=mu72)
+    out = T.apply_start_rule(init, MU_TRUTH_M3, cfg)
+    r0, v0 = init.r_gcrf_km, init.v_gcrf_km_s
+    r1, v1 = out.r_gcrf_km, out.v_gcrf_km_s
+    a0, e0, i0, raan0, w0, _ = elements(r0, v0, mu72)
+    a1, e1, i1, raan1, w1, _ = elements(r1, v1, mu_t)
+    period0 = 2 * np.pi * np.sqrt(a0[0] ** 3 / mu72)
+    period1 = 2 * np.pi * np.sqrt(a1[0] ** 3 / mu_t)
+    assert period1 == pytest.approx(period0, rel=1e-13)
+    # without the rule the same state is slower under the truth GM: about 1.15 km/day
+    a_direct = elements(r0, v0, mu_t)[0][0]
+    n_direct = np.sqrt(mu_t / a_direct**3)
+    n0 = 2 * np.pi / period0
+    drift_km_per_day = (n0 - n_direct) * DAY * np.linalg.norm(r0)
+    assert 1.0 < drift_km_per_day < 1.3
+    np.testing.assert_allclose([e1[0], i1[0], raan1[0], w1[0]], [e0[0], i0[0], raan0[0], w0[0]],
+                               rtol=0, atol=1e-12)
+    # the scaled state sits (k - 1) |r|, about 2 m, from the SGP4 state
+    assert 1.9e-3 < np.linalg.norm(r1 - r0) < 2.2e-3
+    assert out.t_tt_s[0] == init.t_tt_s[0] and out.norad_id == init.norad_id
+
+    direct = dataclasses.replace(cfg, start_rule="sgp4_state_direct")
+    assert T.start_rule_scale(MU_TRUTH_M3, direct) == 1.0
+    assert T.apply_start_rule(init, MU_TRUTH_M3, direct) is init
+
+
+# --------------------------------------------------------------------------------------
+# Always run: space-weather range and data-end margin guards (before any JVM)
+# --------------------------------------------------------------------------------------
+
+
+def _june_copy(tmp_path):
+    """A copy checked for 2024-06-15 .. 2024-06-22 (the fixture is observed to 2024-12-31)."""
+    t0 = utc_to_tt_seconds("2024-06-15T00:00:00")
+    return t0, T.write_space_weather_copy(SW_FIXTURE, tmp_path / "sw_june.txt", t0, t0 + 7 * DAY)
+
+
+def test_space_weather_copy_records_its_checked_range(tmp_path):
+    t0, copy = _june_copy(tmp_path)
+    assert isinstance(copy, T.SpaceWeatherCopy)
+    assert (copy.window_first_utc, copy.window_last_utc) == ("2024-06-15", "2024-06-22")
+    assert copy.last_fully_observed_utc == "2024-12-31" and copy.margin_days == 41.0
+    assert copy.first_allowed_tt_s == t0
+    assert copy.last_allowed_tt_s == pytest.approx(utc_to_tt_seconds("2024-06-23T00:00:00"))
+    assert Path(copy.path).is_file() and len(copy.sha256) == 64
+
+
+def test_window_outside_the_copys_range_is_refused(tmp_path):
+    """A copy checked for June refuses an August window and one starting before it."""
+    t0, copy = _june_copy(tmp_path)
+    init = circular_state(500.0, 51.6, t0)
+    cfg = T.load_truth_config()
+    late = circular_state(500.0, 51.6, utc_to_tt_seconds("2024-08-10T00:00:00"))
+    with pytest.raises(T.SpaceWeatherRangeError, match="outside"):
+        T.propagate_truth(late, 1e-4, T.output_grid(late.t_tt_s[0], DAY, 60.0), cfg, copy)
+    early = circular_state(500.0, 51.6, t0 - 60.0)
+    with pytest.raises(T.SpaceWeatherRangeError, match="outside"):
+        T.propagate_truth(early, 1e-4, T.output_grid(t0 - 60.0, DAY, 60.0), cfg, copy)
+    # running past the checked range's end is refused too
+    with pytest.raises(T.SpaceWeatherRangeError):
+        T.propagate_truth(init, 1e-4, T.output_grid(t0, 8 * DAY, 60.0), cfg, copy)
+    # and the pool refuses the whole batch before starting a worker
+    jobs = [T.TruthJob(init, 1e-4, T.output_grid(t0, DAY, 60.0)),
+            T.TruthJob(late, 1e-4, T.output_grid(late.t_tt_s[0], DAY, 60.0))]
+    with pytest.raises(T.SpaceWeatherRangeError, match="job 1"):
+        T.propagate_batch(jobs, cfg, copy, n_workers=1)
+
+
+def test_bare_path_is_refused_when_drag_is_on(tmp_path):
+    t0, copy = _june_copy(tmp_path)
+    init = circular_state(500.0, 51.6, t0)
+    cfg = T.load_truth_config()
+    with pytest.raises(TypeError, match="SpaceWeatherCopy"):
+        T.propagate_truth(init, 1e-4, T.output_grid(t0, DAY, 60.0), cfg, copy.path)
+    with pytest.raises(TypeError, match="SpaceWeatherCopy"):
+        T.propagate_batch([T.TruthJob(init, 1e-4, T.output_grid(t0, DAY, 60.0))], cfg,
+                          Path(copy.path), n_workers=1)
+
+
+def test_data_end_margin_enforced_where_copies_are_written_and_windows_run(tmp_path):
+    """Fixture last observed day 2024-12-31: windows may end by 2024-11-21T00:00 UTC.
+
+    The rule is the splits one (``splits.latest_window_end_tt_s``, 41 days), applied
+    here independently of split labels.
+    """
+    limit = utc_to_tt_seconds("2024-11-21T00:00:00")
+    # writing a copy for a window ending inside the margin is refused
+    with pytest.raises(T.SpaceWeatherRangeError, match="41 days"):
+        T.write_space_weather_copy(SW_FIXTURE, tmp_path / "a.txt", limit - 7 * DAY, limit + 60.0)
+    # a copy for a window ending exactly at the limit is written, and its checked range
+    # (to the end of 2024-11-21) is cut back to the limit
+    copy = T.write_space_weather_copy(SW_FIXTURE, tmp_path / "b.txt", limit - 7 * DAY, limit)
+    assert copy.window_last_utc == "2024-11-21"
+    assert copy.last_allowed_tt_s == pytest.approx(limit)
+    copy.check_window(limit - 7 * DAY, limit)
+    # so a window inside the copy's days but past the margin is refused at propagation
+    init = circular_state(500.0, 51.6, limit - 7 * DAY)
+    grid = T.output_grid(limit - 7 * DAY, 7 * DAY + 60.0, 60.0)
+    with pytest.raises(T.SpaceWeatherRangeError):
+        T.propagate_truth(init, 1e-4, grid, T.load_truth_config(), copy)
 
 
 def test_output_grid():
@@ -194,12 +352,12 @@ def ctx(cfg):
 @pytest.fixture(scope="session")
 def sw_copy(tmp_path_factory):
     """Orekit copy of the fixture space-weather file, for SW_FIRST..SW_LAST."""
-    path = tmp_path_factory.mktemp("sw") / "sw_orekit.txt"
-    rep = T.write_space_weather_copy(
+    path = tmp_path_factory.mktemp("sw") / "sw_orekit_2024-02-01_2024-11-15.txt"
+    copy = T.write_space_weather_copy(
         SW_FIXTURE, path, utc_to_tt_seconds(SW_FIRST_UTC), utc_to_tt_seconds(SW_LAST_UTC)
     )
-    assert rep.appended_empty_monthly_fit
-    return path
+    assert isinstance(copy, T.SpaceWeatherCopy)
+    return copy
 
 
 @pytest.fixture(scope="session")
@@ -225,21 +383,25 @@ def test_two_body_energy_conserved_7_days(cfg, ctx):
     """Point mass, no drag: specific energy and angular momentum stay constant for 7 days."""
     init = kepler_state(7000.0, 0.05, 51.6, 30.0, 40.0, 0.0, t0=DAY)
     drift = {}
-    for tol in (1.0, 1e-3):
-        c = dataclasses.replace(cfg, zonal_degree=0, atmosphere="none", position_tolerance_m=tol)
+    for key, tol, step in (("truth", cfg.position_tolerance_m, cfg.max_step_s),
+                           ("converged", 1e-3, 30.0)):
+        c = dataclasses.replace(
+            cfg, zonal_degree=0, atmosphere="none", position_tolerance_m=tol, max_step_s=step
+        )
         res = T.propagate_truth(init, None, T.output_grid(DAY, 7 * DAY, 60.0), c, None)
         assert res.status == "ok"
         r, v = _sample(ctx, res)
         energy = 0.5 * np.sum(v**2, axis=1) - ctx.mu / np.linalg.norm(r, axis=1)
         h = np.linalg.norm(np.cross(r, v), axis=1)
-        drift[tol] = (np.max(np.abs(energy / energy[0] - 1)), np.max(np.abs(h / h[0] - 1)))
-    # At the truth tolerance (1 m) the first run gave 3.2e-8 relative energy drift over
-    # 7 days (about 0.2 m of semi-major axis); bounds are set from that.
-    assert drift[1.0][0] < 1e-7 and drift[1.0][1] < 1e-7
-    # The drift is integration error, not a force: it shrinks with the tolerance
-    # (first run: 3.2e-8 at 1 m, 7.5e-9 at 1 mm; at 1 mm the dense-output
-    # interpolation and rounding floor dominate, so the drop is not 1000-fold).
-    assert drift[1e-3][0] < drift[1.0][0] / 3 and drift[1e-3][1] < drift[1.0][1] / 3
+        drift[key] = (np.max(np.abs(energy / energy[0] - 1)), np.max(np.abs(h / h[0] - 1)))
+    # Truth setting (1 m, 180 s): 3.5e-10 relative energy drift and 1.4e-10 in angular
+    # momentum over 7 days (measured 2026-11-23). The 180 s cap sets it: 1 mm at 180 s gives
+    # the same, 1 m at 300 s gives 3.2e-8 and 1 m with no cap 2e-5.
+    assert drift["truth"][0] < 1e-9 and drift["truth"][1] < 1e-9, drift
+    # The drift is integration error, not a force: a converged run (1 mm, 30 s) has
+    # 5.6e-14 and 2.8e-14.
+    assert drift["converged"][0] < drift["truth"][0] / 100, drift
+    assert drift["converged"][1] < drift["truth"][1] / 100, drift
 
 
 @datagen
@@ -436,9 +598,10 @@ def test_circular_decay_under_exponential_atmosphere(cfg, ctx):
     want = sol.y[0, -1] - a0
     got = a_end - a0
     assert want < -1000.0  # a real decay of more than 1 km
-    # the orbit's eccentricity under drag oscillates slightly, which the
-    # circular-orbit formula ignores: a 0.5% tolerance
-    assert got == pytest.approx(want, rel=5e-3)
+    # First run: -1497.098 m against -1497.089 m analytic (6e-6 relative). The
+    # orbit's eccentricity under drag oscillates slightly, which the circular-orbit
+    # formula ignores; tolerance 1e-4.
+    assert got == pytest.approx(want, rel=1e-4)
 
 
 # --------------------------------------------------------------------------------------
@@ -493,7 +656,8 @@ def test_nrlmsise00_matches_pymsis(cfg, ctx, sw_copy):
     # Independent implementations (Orekit's Java port vs NRL's Fortran via pymsis).
     # First run: |ratio - 1| <= 1.1e-5 at these points with the configured settings
     # (mean local solar time, ap-array mode); tolerance 1e-4 from that. With Orekit's
-    # constructor default (apparent solar time) the same points differ by up to 1.2%.
+    # constructor default (apparent solar time) these six points differ by up to 1.2%;
+    # along real orbits the difference reaches 6.8% (800 km, November 2024).
     assert np.max(np.abs(ratios)) < 1e-4, ratios
 
 
@@ -596,7 +760,12 @@ SGP4_IDS = [
 
 @datagen
 def test_orekit_tle_propagator_matches_sgp4_package(ctx, gp_records):
-    """Orekit's TLEPropagator and the sgp4 package agree on the same element sets (TEME)."""
+    """Library check: Orekit's TLEPropagator and the sgp4 package agree (TEME).
+
+    The project never uses Orekit's TLEPropagator (SGP4 comes from cheap_prop.py);
+    this confirms the two SGP4 implementations available here agree, so a later
+    switch between them would not change the cheap side of the residual.
+    """
     from org.orekit.propagation.analytical.tle import TLE, TLEPropagator
     from sgp4 import exporter, omm
     from sgp4.api import Satrec
@@ -627,13 +796,23 @@ def test_orekit_tle_propagator_matches_sgp4_package(ctx, gp_records):
 SAMPLE_EPOCH_UTC = "2024-06-15T00:00:00"
 
 
+#: Bounds on |truth setting - converged run| (m) per test case at 1 and 7 days, at the
+#: configured 180 s maximum step. Measured 2026-11-23: Starlink-1008 (340 km, drag)
+#: 0.124 m at 1 d and 1.57 m at 7 d; the circular 800 km orbit 0.037 m and 0.083 m. The
+#: bounds are about 2.5x those. At the earlier 300 s step the same cases gave 16.6 m and
+#: 16.1 m at 7 days, so a return to it fails here.
+INTEGRATION_BOUND_7D_M = {"starlink_1008_340km": 4.0, "circular_800km": 0.25}
+INTEGRATION_BOUND_1D_M = {"starlink_1008_340km": 0.3, "circular_800km": 0.1}
+
+
 @datagen
 @pytest.mark.parametrize("case", ["starlink_1008_340km", "circular_800km"])
-def test_integrator_tolerance_1m_vs_1cm(cfg, ctx, sw_copy, gp_records, case):
-    """Position tolerance 1 m vs 1 cm: the 7-day difference stays small.
+def test_integration_error_of_the_truth_setting(cfg, ctx, sw_copy, gp_records, case):
+    """Truth setting (1 m, 180 s) against a converged run (1 mm, 30 s), same force model.
 
-    The per-band values for the zonal-degree threshold come from
-    scripts/zonal_convergence.py; this test guards the order of magnitude.
+    At the 180 s cap DOP853 runs at the step limit, so this is the error the step
+    sets, which is part of the truth definition. Measured values are in the module
+    constants' comment; per-band values for the sample objects are in the changelog.
     """
     if case == "starlink_1008_340km":
         init, bstar = T.initial_state_from_omm(gp_records[44714], SAMPLE_EPOCH_UTC)
@@ -641,29 +820,92 @@ def test_integrator_tolerance_1m_vs_1cm(cfg, ctx, sw_copy, gp_records, case):
     else:
         init, bstar = circular_state(800.0, 98.6, utc_to_tt_seconds(SAMPLE_EPOCH_UTC)), None
         a2m = 0.005
+    assert cfg.max_step_s == 180.0 and cfg.position_tolerance_m == 1.0
     grid = T.output_grid(init.t_tt_s[0], 7 * DAY, 3600.0)
     a = T.propagate_truth(init, bstar, grid, cfg, sw_copy, area_to_mass_m2_per_kg=a2m)
-    b = T.propagate_truth(
-        init,
-        bstar,
-        grid,
-        dataclasses.replace(cfg, position_tolerance_m=0.01),
-        sw_copy,
-        area_to_mass_m2_per_kg=a2m,
-    )
+    conv = dataclasses.replace(cfg, position_tolerance_m=1e-3, max_step_s=30.0)
+    b = T.propagate_truth(init, bstar, grid, conv, sw_copy, area_to_mass_m2_per_kg=a2m)
     d = np.linalg.norm(a.trajectory.r_gcrf_km - b.trajectory.r_gcrf_km, axis=1) * 1000.0
-    assert d[-1] < 100.0, d[-1]
-    assert d[24] < 5.0, d[24]  # 1 day
+    assert d[-1] < INTEGRATION_BOUND_7D_M[case], d[-1]
+    assert d[24] < INTEGRATION_BOUND_1D_M[case], d[24]  # 1 day
 
 
 @datagen
-def test_reentry_returns_status_not_partial_trajectory(cfg, ctx, sw_copy):
+def test_configured_gravity_reaches_the_force_model(cfg, ctx, sw_copy):
+    """The built propagator carries EIGEN-6S to the configured degree, order 0, Earth-fixed.
+
+    Guards against a silent fallback (for example J2 only, an 8-26 km change at 7 days)
+    that every physics test would still pass. Checked on the force model itself and by
+    its effect: degree 36 and degree 2 differ by kilometres after one day.
+    """
+    init = circular_state(500.0, 51.6, utc_to_tt_seconds(SAMPLE_EPOCH_UTC))
+    prop, _, _ = T.build_propagator(cfg, init, 0.005, sw_copy)
+    grav = T.describe_gravity(prop)
+    assert len(grav) == 1, grav
+    assert grav[0]["degree"] == cfg.zonal_degree == 36 and grav[0]["order"] == 0
+    assert grav[0]["body_frame"] == ctx.itrf.getName() and "ITRF" in grav[0]["body_frame"]
+    assert grav[0]["mu"] == ctx.mu
+    no_drag = dataclasses.replace(cfg, atmosphere="none")
+    grid = T.output_grid(init.t_tt_s[0], DAY, 3600.0)
+    full = T.propagate_truth(init, None, grid, no_drag, None).trajectory
+    j2 = T.propagate_truth(init, None, grid, dataclasses.replace(no_drag, zonal_degree=2), None)
+    d_km = np.linalg.norm(full.r_gcrf_km[-1] - j2.trajectory.r_gcrf_km[-1])
+    assert d_km > 0.5, d_km  # measured 1.29 km
+
+
+@datagen
+def test_rescaled_start_keeps_the_sgp4_period_in_a_two_body_run(cfg, ctx):
+    """Two-body (point mass) under the truth GM: after one WGS-72 period the scaled state is
+    back where it started; the unscaled state is ~78 m behind."""
+    mu72 = cfg.sgp4_mu_km3_s2
+    init = kepler_state(6900.0, 0.012, 97.4, 30.0, 40.0, 75.0, t0=DAY, mu_km=mu72)
+    a72 = elements(init.r_gcrf_km, init.v_gcrf_km_s, mu72)[0][0]
+    period72 = 2 * np.pi * np.sqrt(a72**3 / mu72)
+    two_body = dataclasses.replace(
+        cfg, zonal_degree=0, atmosphere="none", position_tolerance_m=1e-4, max_step_s=30.0
+    )
+    grid = np.array([DAY, DAY + period72])
+    gap = {}
+    for rule in ("preserve_sgp4_mean_motion", "sgp4_state_direct"):
+        c = dataclasses.replace(two_body, start_rule=rule)
+        tr = T.propagate_truth(init, None, grid, c, None).trajectory
+        gap[rule] = np.linalg.norm(tr.r_gcrf_km[1] - tr.r_gcrf_km[0]) * 1000.0
+    # the scaled state's period under mu_truth equals the original's under mu_WGS72
+    assert gap["preserve_sgp4_mean_motion"] < 0.01, gap
+    # without the rule the same r, v has mean motion lower by 2 dmu/mu = 1.8e-6 under the
+    # truth GM (a grows by dmu/mu as well), so it is 2 pi * 1.8e-6 * |r| ~ 78 m behind
+    # after one revolution (measured 78.6 m), ~1.15 km per day
+    assert 70.0 < gap["sgp4_state_direct"] < 90.0, gap
+
+
+@datagen
+def test_reentry_returns_status_and_the_trajectory_before_it(cfg, ctx, sw_copy):
     init = circular_state(200.0, 51.6, utc_to_tt_seconds("2024-05-10T00:00:00"))
     grid = T.output_grid(init.t_tt_s[0], 7 * DAY, 60.0)
     res = T.propagate_truth(init, None, grid, cfg, sw_copy, area_to_mass_m2_per_kg=0.05)
-    assert res.status == "reentry" and res.trajectory is None
+    assert res.status == "reentry" and "120.0 km" in res.message
     assert init.t_tt_s[0] < res.stop_t_tt_s < grid[-1]
-    assert "120.0 km" in res.message
+    tr = res.trajectory
+    assert isinstance(tr, Trajectory) and tr.source == "truth"
+    # every grid point up to the stop time, and none after it
+    np.testing.assert_array_equal(tr.t_tt_s, grid[grid <= res.stop_t_tt_s])
+    assert len(tr) > 1
+    # the last kept point is still above 120 km, within one 60 s step of the crossing
+    last = Trajectory(1, tr.t_tt_s[-1:], tr.r_gcrf_km[-1:], tr.v_gcrf_km_s[-1:], "truth")
+    assert 120.0 <= T.initial_geodetic_altitude_km(cfg, last) < 130.0
+    assert res.stop_t_tt_s - tr.t_tt_s[-1] < 60.0
+
+
+@datagen
+@pytest.mark.parametrize("alt_km", [100.0, 110.0, 119.0])
+def test_start_below_reentry_altitude_returns_reentry_at_once(cfg, ctx, sw_copy, alt_km):
+    """A start below 120 km is never integrated (it used to run on or raise)."""
+    init = circular_state(alt_km, 0.0, utc_to_tt_seconds("2024-05-10T00:00:00"))
+    grid = T.output_grid(init.t_tt_s[0], DAY, 60.0)
+    res = T.propagate_truth(init, None, grid, cfg, sw_copy, area_to_mass_m2_per_kg=0.01)
+    assert res.status == "reentry" and res.trajectory is None
+    assert res.stop_t_tt_s == init.t_tt_s[0] and res.n_evaluations == 0
+    assert "initial geodetic altitude" in res.message
 
 
 @datagen
@@ -674,9 +916,34 @@ def test_truth_output_satisfies_contract(cfg, ctx, sw_copy, gp_records):
     tr = res.trajectory
     assert isinstance(tr, Trajectory) and tr.source == "truth" and tr.norad_id == 44714
     np.testing.assert_array_equal(tr.t_tt_s, grid)
-    # starts where it was told to (dense output at t0 reproduces the initial state)
-    np.testing.assert_allclose(tr.r_gcrf_km[0], init.r_gcrf_km[0], atol=1e-9)
+    # starts at the start-rule state (dense output at t0 reproduces it), about 2 m from
+    # the SGP4 state: the non-zero residual at t0
+    start = T.apply_start_rule(init, ctx.mu, cfg)
+    np.testing.assert_allclose(tr.r_gcrf_km[0], start.r_gcrf_km[0], atol=1e-9)
+    assert res.start_scale == T.start_rule_scale(ctx.mu, cfg)
+    assert 1.5e-3 < np.linalg.norm(tr.r_gcrf_km[0] - init.r_gcrf_km[0]) < 2.5e-3
     assert res.area_to_mass_m2_per_kg == pytest.approx(T.area_to_mass_from_bstar(bstar, cfg))
+
+
+@datagen
+def test_copy_rewritten_at_the_same_path_is_read_again(cfg, ctx, tmp_path):
+    """Orekit objects are cached by content hash, not path alone."""
+    from orbit_correction.spaceweather import parse_spaceweather
+
+    sw = parse_spaceweather(SW_FIXTURE)
+    t0 = utc_to_tt_seconds("2024-06-15T00:00:00")
+    path = tmp_path / "same.txt"
+    a = T.write_space_weather_copy(sw, path, t0, t0 + DAY)
+    date = ctx.date(utc_to_tt_seconds("2024-06-15T12:00:00"))
+    first = ctx.space_weather(a).getDailyFlux(date)
+    i = int(np.flatnonzero(sw.dates == np.datetime64("2024-06-14"))[0])
+    f107 = sw.scalars["f107_obs"].copy()
+    f107[i] = 999.9
+    b = T.write_space_weather_copy(
+        dataclasses.replace(sw, scalars={**sw.scalars, "f107_obs": f107}), path, t0, t0 + DAY
+    )
+    assert a.sha256 != b.sha256 and first != 999.9
+    assert ctx.space_weather(b).getDailyFlux(date) == 999.9
 
 
 @datagen
@@ -692,24 +959,26 @@ def test_rejects_bad_grids(cfg, ctx, sw_copy):
 
 
 _POOL_SCRIPT = """
-import sys, json, numpy as np
+import pickle, sys, json, numpy as np
 from orbit_correction import truth_prop as T
-from orbit_correction.types import Trajectory
 
 def main():
-    sw, out, recs = sys.argv[1], sys.argv[2], json.loads(open(sys.argv[3]).read())
+    sw = pickle.loads(open(sys.argv[1], "rb").read())
+    out, recs = sys.argv[2], json.loads(open(sys.argv[3]).read())
     cfg = T.load_truth_config()
     jobs = []
-    for rec in recs:
-        init, bstar = T.initial_state_from_omm(rec, "2024-06-15T00:00:00")
+    for rec, epoch in recs:
+        init, bstar = T.initial_state_from_omm(rec, epoch)
         jobs.append(T.TruthJob(init, bstar, T.output_grid(init.t_tt_s[0], 2 * 86400.0, 60.0)))
+    # 2 workers: the last job runs in a JVM that has already propagated other epochs
     two = T.propagate_batch(jobs, cfg, sw, n_workers=2)
-    one = T.propagate_batch(jobs[:1], cfg, sw, n_workers=1)
+    one = T.propagate_batch(jobs[-1:], cfg, sw, n_workers=1)  # a fresh worker
+    assert all(r.status == "ok" for r in two + one), [r.message for r in two + one]
     assert not T.jvm_started(), "parent started a JVM"
     assert "jpype" not in sys.modules, "parent imported jpype"
     np.savez(out, **{f"two_{i}": r.trajectory.r_gcrf_km for i, r in enumerate(two)},
-             one_0=one[0].trajectory.r_gcrf_km, v_one_0=one[0].trajectory.v_gcrf_km_s,
-             v_two_0=two[0].trajectory.v_gcrf_km_s)
+             one=one[0].trajectory.r_gcrf_km, v_one=one[0].trajectory.v_gcrf_km_s,
+             v_two_last=two[-1].trajectory.v_gcrf_km_s)
 
 if __name__ == "__main__":
     main()
@@ -717,39 +986,56 @@ if __name__ == "__main__":
 
 
 @datagen
-def test_determinism_pool_vs_single_worker_vs_in_process(cfg, ctx, sw_copy, gp_records, tmp_path):
-    """Same object: bit-identical in a 2-worker pool (twice), a 1-worker pool and in-process.
+def test_reproducible_to_a_millimetre_across_workers_and_job_order(
+    cfg, ctx, sw_copy, gp_records, tmp_path
+):
+    """Same job: the same trajectory to about a millimetre, whatever ran before it.
 
+    Not bit-identical: a job run after another at a nearby, different epoch can differ
+    from a fresh-worker run by ~1e-4 m over 2 days (Orekit's interpolated frame
+    transforms take their sample grid from the first date a JVM requests). The jobs
+    here run at different epochs, so the last one follows nearby epochs in its worker.
     The pool runs from a fresh parent process that must never import jpype.
     """
-    recs = [gp_records[44714], gp_records[44058], gp_records[44714]]
+    import pickle
+
+    recs = [
+        (gp_records[44714], "2024-06-15T00:00:00"),
+        (gp_records[44058], "2024-06-16T05:00:00"),
+        (gp_records[44714], "2024-06-14T09:30:00"),
+        (gp_records[44058], "2024-06-15T21:00:00"),
+        (gp_records[44714], SAMPLE_EPOCH_UTC),
+    ]
     (tmp_path / "recs.json").write_text(json.dumps(recs))
+    (tmp_path / "sw.pkl").write_bytes(pickle.dumps(sw_copy))
     (tmp_path / "pool.py").write_text(_POOL_SCRIPT)
     out = tmp_path / "out.npz"
     proc = subprocess.run(
         [
             sys.executable,
             str(tmp_path / "pool.py"),
-            str(sw_copy),
+            str(tmp_path / "sw.pkl"),
             str(out),
             str(tmp_path / "recs.json"),
         ],
         capture_output=True,
         text=True,
         cwd=REPO,
-        timeout=600,
+        timeout=900,
     )
     assert proc.returncode == 0, proc.stderr[-3000:]
     got = np.load(out)
-    np.testing.assert_array_equal(got["two_0"], got["two_2"])
-    np.testing.assert_array_equal(got["two_0"], got["one_0"])
-    np.testing.assert_array_equal(got["v_two_0"], got["v_one_0"])
-    assert not np.array_equal(got["two_0"], got["two_1"])
+    tol_km = 1e-6  # 1 mm
+    np.testing.assert_allclose(got["two_4"], got["two_0"], rtol=0, atol=tol_km)
+    np.testing.assert_allclose(got["two_4"], got["one"], rtol=0, atol=tol_km)
+    np.testing.assert_allclose(got["v_two_last"], got["v_one"], rtol=0, atol=1e-9)
     init, bstar = T.initial_state_from_omm(gp_records[44714], SAMPLE_EPOCH_UTC)
     here = T.propagate_truth(
         init, bstar, T.output_grid(init.t_tt_s[0], 2 * DAY, 60.0), cfg, sw_copy
     )
-    np.testing.assert_array_equal(here.trajectory.r_gcrf_km, got["one_0"])
+    np.testing.assert_allclose(here.trajectory.r_gcrf_km, got["one"], rtol=0, atol=tol_km)
+    # different jobs really are different (the comparison above isn't vacuous)
+    assert np.max(np.abs(got["two_0"] - got["two_1"])) > 1.0
 
 
 # --------------------------------------------------------------------------------------

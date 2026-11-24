@@ -5,11 +5,12 @@
 # Force model and integrator approved as decision 1 (2026-11-23): Orekit numerical
 # propagator, EIGEN-6S zonal harmonics (order 0), NRLMSISE-00 drag fed by the
 # project's space-weather copy, Cd 2.2 with area-to-mass from B*, DOP853 at about 1 m
-# position tolerance and a 300 s maximum step. Values marked PROPOSED are worker
-# choices waiting for Kaitlin's decision.
+# position tolerance. The truth-definition settings below (zonal degree, NRLMSISE-00
+# local solar time and switch 9, maximum step, start rule, re-entry) were decided by
+# Kaitlin on 2026-11-23 after review.
 
 [truth]
-status = "exploratory 2026-11-23"
+status = "exploratory 2026-11-23 (truth settings decided 2026-11-23)"
 
 [truth.data]
 # orekit-data bundle (EOP, leap seconds, EIGEN-6S, DE-440). Must match the commit
@@ -21,13 +22,11 @@ orekit_data_commit = "2d6edc9118983d95c51303df05db16ada90b7ee2"
 # ICGEM file name inside the bundle. Its time-variable low-degree terms (gfct, trnd,
 # acos, asin) are evaluated by Orekit at each date.
 field_file = "eigen-6s.gfc"
-# Zonal degree from the convergence check (scripts/zonal_convergence.py, changelog
-# 2026-11-23). PROPOSED, waiting for Kaitlin's decision: 36 is the smallest degree
-# whose 7-day difference from a degree-90 reference (converged integrator) stays
-# below the truth integrator's own 7-day error (1 m, 300 s vs converged: 8 m at
-# 1200 km, 17-22 m at 800 km, 53 m at 500 km, 92-195 m at 300 km) for every sample
-# object; the 300 km band sets it. With the originally specified threshold (1 m vs 1 cm
-# at a 300 s maximum step, which measures step phase rather than error) it is 48.
+# Zonal degree 36: a chosen truncation that is part of the truth definition (decided
+# 2026-11-23), not a converged value. Truth is "EIGEN-6S zonals to degree 36"; the
+# omitted zonals above 36 move a 7-day trajectory by up to ~70 m at 300 km, ~18 m at
+# 500 km, ~8 m at 800 km and ~1 m at 1,200 km (scripts/zonal_convergence.py, against a
+# degree-90 reference, background only; table in the changelog entry of 2026-11-23).
 zonal_degree = 36
 # Order 0: zonal terms only, by design (tesserals are a stated limitation).
 zonal_order = 0
@@ -48,15 +47,20 @@ bstar_reference_density_kg_per_m2_er = 0.15696615
 # Mass cancels (drag acceleration depends on A/m only); it exists because Orekit's
 # drag model takes an area and the state carries a mass.
 mass_kg = 100.0
-# NRLMSISE-00 settings. PROPOSED (not in decision 1):
-# local solar time "MEAN" (UT + longitude/15), the convention of the NRLMSISE-00
-# reference code and of pymsis; Orekit 13.1.9's public constructors default to
-# "APPARENT" (true Sun hour angle), which its own documentation calls inconsistent
-# with the model's calibration.
+# NRLMSISE-00 settings (decided 2026-11-23; not part of decision 1).
+# Local solar time "MEAN" (UT + longitude/15). This is what pymsis and brahe compute,
+# so it is the setting under which Orekit's density can be checked against them
+# (pymsis to 1.1e-5). It is not "the reference convention": the reference notes name
+# the input local *apparent* solar time, give UT + longitude/15 as the consistent
+# formula and call equation-of-time departures of minor importance. Orekit 13.1.9's
+# public constructors pass "APPARENT" (true Sun hour angle) although its class
+# documentation says mean is the default. Along real orbits apparent differs from mean
+# by up to 6.8% in density (800 km, November 2024).
 msis_local_solar_time = "MEAN"
 # Switch 9: 1 = daily Ap only (Orekit and pymsis default), -1 = full ap array with
-# 3-hourly values (storm-time mode). PROPOSED: -1, so 3-hour geomagnetic activity
-# reaches the truth density.
+# 3-hourly values (storm-time mode). -1, so 3-hour geomagnetic activity reaches the
+# truth density. Kept configurable: step 3 runs a labeled daily-Ap (+1) sensitivity
+# subsample.
 msis_ap_switch = -1
 
 [truth.earth]
@@ -72,7 +76,25 @@ method = "DOP853"
 # Position tolerance passed to Orekit's default tolerance provider (Cartesian state).
 position_tolerance_m = 1.0
 min_step_s = 0.001
-max_step_s = 300.0
+# Maximum step 180 s (decided 2026-11-23; was 300 s). At these settings DOP853 runs at
+# the step cap, so the step, not the 1 m tolerance, sets the integration error. Its
+# 7-day error against a converged run (1 mm, 30 s) is recorded per altitude band in the
+# changelog entry of 2026-11-23 and bounded per band in tests/test_truth_prop.py.
+max_step_s = 180.0
+
+[truth.start]
+# Start rule (decided 2026-11-23). The initial state is the SGP4 state at the
+# element-set epoch rotated TEME -> GCRF (frames.teme_to_gcrf). SGP4 states are
+# consistent with the WGS-72 GM; truth integrates with the EIGEN-6S GM, which alone
+# would make truth lag SGP4 by about 1.15 km per day.
+# "preserve_sgp4_mean_motion": position and velocity both multiplied by
+#   k = (mu_truth / sgp4_mu) ** (1/3), which keeps the two-body period (under each
+#   model's own GM), eccentricity and orientation; the state moves by about 2 m.
+# "sgp4_state_direct": k = 1, the SGP4 state as is (kept for comparison).
+rule = "preserve_sgp4_mean_motion"
+# GM SGP4 works with: WGS-72, km^3/s^2 (sgp4.earth_gravity.wgs72.mu; cheap_prop uses
+# WGS-72). The truth GM is read from the gravity field (EIGEN-6S: 398600.4415).
+sgp4_mu_km3_s2 = 398600.8
 
 [truth.output]
 # Default output spacing for callers that build a regular grid (truth_prop.output_grid).
@@ -81,9 +103,12 @@ max_step_s = 300.0
 step_s = 60.0
 
 [truth.reentry]
-# PROPOSED: stop and report status "reentry" if the geodetic altitude (WGS84) drops
-# below this inside the window. 120 km is the conventional entry interface; below
-# it an object completes at most a few more revolutions.
+# Stop and report status "reentry" if the geodetic altitude (WGS84) drops below this
+# inside the window (decided 2026-11-23). The result also carries the truth
+# trajectory up to the stop time, so close approaches before re-entry stay usable. A
+# start already below it returns "reentry" at once with no trajectory. 120 km is the
+# conventional entry interface; below it an object completes at most a few more
+# revolutions. The matching SGP4 floor belongs to cheap_prop.py.
 altitude_km = 120.0
 # Interval between altitude checks during integration (s).
 max_check_s = 60.0
