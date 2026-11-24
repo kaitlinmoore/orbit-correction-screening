@@ -201,8 +201,10 @@ _To be written (build steps 4 and 7)._
 ## Screening and metrics
 
 Engine, classical filters and metric functions: `src/orbit_correction/screening.py`, tested
-on synthetic encounters with known answers (`tests/test_screening.py`). The screening
-comparison itself (truth vs SGP4 vs corrected vs classical filters) has not been run yet.
+on synthetic encounters with known answers (`tests/test_screening.py`) and checked against
+an external answer key (the Aerospace / Department of Commerce test set, below). The
+screening comparison itself (truth vs SGP4 vs corrected vs classical filters) has not been
+run yet.
 
 **Event.** A local minimum of the range between two objects, with miss distance within the
 threshold at its TCA and TCA inside the window. A pair can have several events; a pair
@@ -306,9 +308,84 @@ this implementation, not an optimised one. Engine cost grows roughly as n^2 at t
 trajectory memory is 0.565 MB (0.538 MiB) per object per 7-day set, time arrays included
 (1.13 GB for 2,000 objects).
 
-Triangulation against the public Aerospace / Department of Commerce screening test set
-(Auman, Murphy and George, 2026; CC0) is pending: the files are on Google Drive behind an
-access request, and the ephemerides are a 20.7 GB archive of OCM files.
+**External check: the Aerospace / Department of Commerce test set.** The Aerospace
+Corporation and the Department of Commerce released a conjunction-assessment verification
+set (Auman, Murphy and George, user's guide March 2026; CC0-1.0). It contains OCM
+ephemerides of 26,811 objects for the first week of January 2025, and an answer key from
+Aerospace's CSieve tool: 913,330 events from an all-vs-all screen with a 10 km sphere,
+2025-01-01T12:00 to 2025-01-08T12:00 UTC. The sphere applies to miss distance alone. The
+0.5 m hard-body radius is used only for collision probability. The guide's event
+definition is this engine's: a local range minimum within the volume, with TCA inside
+the window. `scripts/compare_aerospace_testset.py` runs `screen` on the set's own
+ephemerides and compares the events with the key. Neither side uses the other's code or
+this project's propagators, so this checks the engine alone.
+
+- *Subset* (seed 20261124, hash sampling per object, so it was applied while the 22 GB
+  archive streamed past once):
+  - **main:** 10% of the TLE-derived objects whose first state has a two-body
+    semimajor-axis altitude of 500-600 km. That gives 550 objects, all covering the whole
+    window on a single 60 s grid.
+  - **maneuver:** the 87 purpose-built maneuvering ephemerides and victims (IDs
+    90006-90190). Most have three TRAJ blocks (coast, finite burn, coast), and many start
+    or stop inside the window.
+  - **fictitious:** the 9 purpose-built fictitious objects (IDs 99000-99008) and the 81
+    objects the key pairs them with.
+
+  Each group is screened among itself, and the key is restricted to rows with both files
+  in the group. That restriction is valid because a sphere is pair-local. Objects with
+  partial spans are screened on each pair's USEABLE overlap. All 727 files matched the
+  archive's own MD5 list. None failed the guide's 14-day OD-epoch rule.
+- *Reading* (`scripts/aerospace_ocm.py`):
+  - **Time:** UTC to TT is TT - UTC = 69.184 s. No leap second falls in the window, and
+    the reader refuses a block that spans one.
+  - **Frame:** EME2000 to GCRF uses the constant IAU 2006 frame bias (0.0230 arcsec,
+    about 0.8 m at LEO radius). A rotation cannot change any range.
+  - **Resampling:** onto a uniform TT grid, at 60 s over the window, and at the largest
+    step of at most 60 s that spans a partial overlap exactly. The interpolant is
+    8-point Lagrange on positions, with velocity from its derivative. On held-back
+    samples its error is 2.8 mm median and 8 mm maximum in the main group, and 2 mm
+    median in the maneuver group. The worst cases are a 1.6 m maximum in the maneuver
+    group and 213 m in one fictitious-group file whose single TRAJ block contains a
+    maneuver.
+- *Result:* every event matched, in both directions, at a 1 s TCA tolerance:
+
+  | Group | Objects | Key events | Matched | Key only | Engine only | TCA diff., max | Miss diff., median / p95 / max |
+  |---|---|---|---|---|---|---|---|
+  | main | 550 | 3,815 | 3,815 | 0 | 0 | 0.44 ms | 0.7 mm / 3.7 mm / 25 mm |
+  | maneuver | 87 | 111 | 111 | 0 | 0 | 86 ms | 0.3 mm / 10 mm / 0.33 m |
+  | fictitious | 90 | 237 | 237 | 0 | 0 | 24 ms | 2.4 mm / 0.10 m / 0.39 m |
+
+  There are no unmatched events, so none needed explaining. Two checks of the check:
+  - The key's own J2000 states at its TCAs match the files resampled there to 2-4 mm
+    (median). That is a test of the time and frame handling that involves no screening.
+  - A dense re-check finds the range minimum straight from the file samples, without the
+    60 s grid. It agrees with the key to 0.2 mm (median) in the main group.
+
+  The engine's relative speeds differ from the key's by 14 mm/s (median) in the main
+  group and up to 15 m/s in the maneuver group. The key's velocities are the files' own,
+  and those are not the derivatives of the files' positions (next point).
+- *Velocities in the files are not the derivatives of their positions:* by 16 mm/s
+  (median; up to 0.37 m/s) in the TLE-derived files and 4.6 m/s (median; up to 9.5 m/s)
+  in the maneuvering ones. SGP4 itself shows 5-55 mm/s on the project's fixture objects.
+  The engine's cubic Hermite uses velocities between grid points.
+  - Rerun with the files' velocities (`--velocity file`), the main group still matches
+    3,815 of 3,815, but miss differences grow to 2 cm median (0.45 m maximum).
+  - In the maneuver group, miss differences reach 54 m, and one key event (9.988 km) is
+    lost: the engine's grid puts that minimum just above 10 km.
+
+  For screening SGP4 or corrected trajectories, this means between-sample accuracy
+  depends on how consistent their velocities are with their positions.
+- *Limits:*
+  - **What the agreement shows:** the two tools find the same range minima of the same
+    sampled motion. It says nothing about the physical encounters.
+  - **Coverage:** one altitude band of TLE-derived objects and two purpose-built groups.
+    Not covered: the historical-CDM objects (95000-95407; a sample would need thousands
+    of partners), Osiris-REx, the candidate maneuver OCMs of 43476, and the SFSH
+    rectangular-volume key.
+  - **The threshold edge is barely exercised:** only 6 key events in the subset lie
+    within 10 m of 10 km, all in the main group, and all matched.
+  - **Unknowns:** CSieve's interpolation method is not documented, and the guide states
+    that its key may not be exhaustive.
 
 Implemented here vs library: the k-d tree is `scipy.spatial.cKDTree` and tables are
 pyarrow. Interpolation, search bound, minimum finding, element conversions, filters and
