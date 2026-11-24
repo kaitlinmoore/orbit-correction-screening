@@ -2,12 +2,13 @@
 # (read by orbit_correction.residuals.load_residual_config).
 # Every value here is an instrument: log changes in docs/changelog.md.
 #
-# Status: PENDING APPROVAL. The edges and the grid below are proposals. The bins
-# are reporting strata, not model inputs; the grid sets how many rows each window
-# contributes and is decided together with the generation volume.
+# Status: approved 2026-11-24 for the pilot (bins and the 199-horizon grid). The
+# bins are reporting strata, not model inputs; the grid sets how many rows each
+# window contributes and is looked at again with the learning curve and the
+# generation volume.
 
 [residuals]
-status = "pending approval"
+status = "approved 2026-11-24"
 
 # Altitude band of a window: the element set's perigee altitude (catalog column
 # perigee_alt_km: semimajor axis from the Kozai mean motion with the WGS-72 GM,

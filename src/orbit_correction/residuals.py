@@ -37,23 +37,42 @@ Axes from the cheap state: ``u_r = r_c/|r_c|``, ``n = (r_c x v_c)/|r_c x v_c|``,
 ``tests/test_rtn.py`` also checks this against a literal, row-by-row transcription
 of the contract's cross-product formulas.
 
-Where the contract leaves a choice (raised for a decision, not changed here)
----------------------------------------------------------------------------
+Where the contract leaves a choice (limits approved 2026-11-24; ``types.py`` unchanged)
+--------------------------------------------------------------------------------------
 * **Angle wrapping.** ``du`` is defined modulo a full turn, in (-pi, pi]. A truth
   position more than half an orbit behind (or ahead of) the cheap one would wrap to
   the other sign, and one instant can't tell the two apart. Near ``|du| = pi`` the
   target also jumps from about ``+pi |r_c|`` to ``-pi |r_c|`` for a tiny change in
   the state, which a model can't learn. This module refuses ``|du|`` above
-  :data:`MAX_ABS_DU_RAD` (pi/2, about 10,500 km of along-track error at LEO radii;
-  the largest 7-day error measured so far is about 1,000 km at 300 km altitude), in
-  both directions, with :class:`RTNDomainError`.
+  :data:`MAX_ABS_DU_RAD` (pi/2, about 10,500 km of along-track error at LEO radii),
+  in both directions, with :class:`RTNDomainError`.
+
+  **The limit is reachable.** It is not far beyond every residual the catalog
+  filters allow: at the low, high-drag edge a 7-day window can pass it with both
+  propagators still ``ok``. Measured with real truth on synthetic element sets at
+  2024-06-15 (solar maximum): 350 km perigee with B* = 0.01 /ER passes the limit at
+  6.7 days and reaches T = 11,600 km at 7 days (1.12 x the limit); neighbouring
+  windows that are kept (350 km with B* 0.005-0.007, 375-400 km with B* 0.01) reach
+  4,500-8,100 km (43-77% of it). The six fixture objects stay below about 1,000 km.
+  Such a window is refused here, not wrapped: ``du`` starts near 0 and changes
+  continuously, and every value between pi/2 and 3 pi/2 is refused, so a wrap could
+  only pass unseen if ``du`` moved by more than pi between two consecutive horizons.
+  Generation is to count refused windows as their own drop status (``rtn_domain``)
+  by stratum; they are the largest-error windows of the lowest band, so the count
+  belongs next to that band's error statistics.
 * **Out-of-plane angle.** ``du`` is undefined when the truth position sits on the
   cheap orbit's normal (``phi_t = +-pi/2``) and badly conditioned near it. Refused
   above :data:`MAX_ABS_PHI_RAD` (pi/4); real cross-track errors are a few km
   (about 1e-3 rad).
 * **Degenerate angular momentum.** ``n`` needs ``r_c x v_c != 0``. Refused when
-  ``|r_c x v_c| < H_REL_MIN |r_c| |v_c|`` (velocity within about 2e-4 degrees of
+  ``|r_c x v_c| < H_REL_MIN |r_c| |v_c|`` (velocity within about 6e-5 degrees of
   radial), and for zero or non-finite inputs.
+* **Forward and inverse at the limits.** The forward map accepts ``|du| <= pi/2``
+  and ``|phi| <= pi/4``. The inverse recomputes the angles as ``T/|r_c|`` and
+  ``-N/|r_c|``, which can land one float64 step above the angle the forward map
+  accepted (``(|r_c| du)/|r_c|`` is not always ``du``). The inverse therefore
+  accepts one step more (:data:`_INVERSE_DU_LIMIT`, :data:`_INVERSE_PHI_LIMIT`), so
+  every residual the forward map returns can be inverted.
 
 Row builder and the drop rule
 -----------------------------
@@ -64,6 +83,12 @@ failed anywhere in it, either from one of SGP4's own error codes or at the 120 k
 altitude floor (:data:`orbit_correction.cheap_prop.ALTITUDE_FLOOR_CODE`). Dropped
 windows keep their altitude band and solar-activity bin so the caller can count
 them by stratum (:func:`count_windows`); they are never dropped silently.
+
+SGP4's floor is tested at the window's horizons only, truth's continuously, so on a
+sparse grid the drop rule leans on truth: a window where SGP4 alone dips below
+120 km between two horizons and comes back up would be kept.
+``Sgp4Status.first_error_t_tt_s`` is the first sampled time below the floor, which
+depends on the grid; it is not a re-entry time.
 
 The SGP4 and truth trajectories must sit on exactly the same instants: the row
 builder refuses (raises :class:`GridMismatchError`) any trajectory whose
@@ -105,12 +130,21 @@ CONFIG_PATH = REPO / "config" / "residuals.toml"
 # --------------------------------------------------------------------------------------
 
 #: Largest along-track angle |du| accepted, rad (see "Where the contract leaves a
-#: choice" in the module docstring). Pending a project decision.
+#: choice" in the module docstring). Approved 2026-11-24. Reachable at the low,
+#: high-drag edge of the catalog; windows beyond it are refused, to be counted.
 MAX_ABS_DU_RAD = math.pi / 2
-#: Largest out-of-plane angle |phi| accepted, rad. Pending a project decision.
+#: Largest out-of-plane angle |phi| accepted, rad. Approved 2026-11-24.
 MAX_ABS_PHI_RAD = math.pi / 4
 #: Smallest accepted |r_c x v_c| / (|r_c| |v_c|) (sine of the angle between r and v).
+#: Approved 2026-11-24.
 H_REL_MIN = 1e-6
+#: What the inverse accepts: one float64 step above the forward limits. The inverse
+#: recomputes ``du = T/|r_c|`` (and ``phi = -N/|r_c|``) from a product the forward map
+#: rounded, and the quotient can come out one step above the original angle (two
+#: roundings of half a step each at most). Without the margin the inverse refused
+#: about 4% of residuals sitting exactly on a limit.
+_INVERSE_DU_LIMIT = math.nextafter(MAX_ABS_DU_RAD, math.inf)
+_INVERSE_PHI_LIMIT = math.nextafter(MAX_ABS_PHI_RAD, math.inf)
 
 
 class RTNDomainError(ValueError):
@@ -235,8 +269,9 @@ def states_from_rtn(
 
     Raises:
         RTNDomainError: non-finite input, degenerate cheap angular momentum,
-            ``R >= |r_c|`` (no positive radius), ``|du| > MAX_ABS_DU_RAD`` or
-            ``|phi| > MAX_ABS_PHI_RAD``.
+            ``R >= |r_c|`` (no positive radius), or ``|du|`` or ``|phi|`` more than
+            one float64 step above :data:`MAX_ABS_DU_RAD` or :data:`MAX_ABS_PHI_RAD`
+            (the step covers the rounding of ``T/|r_c|``; see the module docstring).
     """
     rc_in, single = _as_rows("r_cheap_km", r_cheap_km)
     vc_in, _ = _as_rows("v_cheap_km_s", v_cheap_km_s)
@@ -249,21 +284,27 @@ def states_from_rtn(
         raise RTNDomainError("R >= |r_c|: the implied truth radius is not positive")
     du = rtn[:, 1] / rc
     phi = -rtn[:, 2] / rc
-    _check_angles(du, phi)
+    _check_angles(du, phi, _INVERSE_DU_LIMIT, _INVERSE_PHI_LIMIT)
 
     d = np.cos(du)[:, None] * u_r - np.sin(du)[:, None] * u_t
     out = rho[:, None] * (np.cos(phi)[:, None] * d + np.sin(phi)[:, None] * n)
     return out[0] if single else out
 
 
-def _check_angles(du: np.ndarray, phi: np.ndarray) -> None:
-    big_du = np.abs(du) > MAX_ABS_DU_RAD
+def _check_angles(
+    du: np.ndarray,
+    phi: np.ndarray,
+    du_limit: float = MAX_ABS_DU_RAD,
+    phi_limit: float = MAX_ABS_PHI_RAD,
+) -> None:
+    """Refuse angles above the limits (the forward limits unless the inverse's are given)."""
+    big_du = np.abs(du) > du_limit
     if np.any(big_du):
         raise RTNDomainError(
             f"|du| up to {np.abs(du).max():.4g} rad in {int(big_du.sum())} row(s), above "
             f"{MAX_ABS_DU_RAD:.4g}: along-track separation too large for an unambiguous angle"
         )
-    big_phi = np.abs(phi) > MAX_ABS_PHI_RAD
+    big_phi = np.abs(phi) > phi_limit
     if np.any(big_phi):
         raise RTNDomainError(
             f"|phi| up to {np.abs(phi).max():.4g} rad in {int(big_phi.sum())} row(s), above "
@@ -581,7 +622,10 @@ def build_window_rows(
         ValueError: unknown split label, or the element set, SGP4 and truth results
             belong to different objects or epochs.
         RTNDomainError: from :func:`rtn_from_states` (a residual outside the
-            conversion's domain); left to the caller rather than dropped.
+            conversion's domain); left to the caller rather than dropped. This does
+            happen for windows the catalog filters allow (low perigee, high B*: see
+            the module docstring), so a caller that generates data must catch it
+            and count the window.
     """
     rec = _elset_record(elset)
     if split not in SPLIT_LABELS:

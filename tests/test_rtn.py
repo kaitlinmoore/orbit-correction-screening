@@ -12,7 +12,9 @@ docstring). Checks:
   scales as separation^2 / r;
 * a large along-track case where rectilinear RTN leaks ~81 km into radial and the
   curvilinear residual doesn't;
-* errors for degenerate inputs.
+* errors for degenerate inputs, including a velocity a hair off radial;
+* forward and inverse agreeing at the angle limits: every residual the forward map
+  returns, the inverse accepts.
 
 All states are synthetic (two-body Keplerian), so no fixture files are needed.
 """
@@ -261,6 +263,110 @@ def test_degenerate_inputs_raise():
         R.rtn_from_states(r_c, v_c, ok_t[:2])
     with pytest.raises(ValueError, match="shape"):
         R.rtn_from_states(r_c[:, :2], v_c, ok_t)
+
+
+def test_near_radial_velocity_is_refused():
+    """A velocity 1e-7 rad from radial: angular momentum not zero, but no usable normal.
+
+    The limit is ``|r x v| / (|r| |v|) >= H_REL_MIN`` = 1e-6, the sine of the angle
+    between position and velocity. 1e-7 rad is below it and must be refused, in both
+    directions; 1e-5 rad is above it and is accepted.
+    """
+    r_c, v_c = random_leo_states(50, seed=15)
+    rc = np.linalg.norm(r_c, axis=1)
+    u_r = r_c / rc[:, None]
+    n = np.cross(r_c, v_c)
+    n /= np.linalg.norm(n, axis=1)[:, None]
+    u_t = np.cross(n, u_r)
+    speed = np.linalg.norm(v_c, axis=1)[:, None]
+
+    def tilted(angle):  # velocity `angle` rad away from the radial direction
+        return speed * (math.cos(angle) * u_r + math.sin(angle) * u_t)
+
+    # truth 1 km behind along the arc (the in-plane direction is still well defined)
+    r_t = rc[:, None] * (np.cos(1.0 / rc)[:, None] * u_r - np.sin(1.0 / rc)[:, None] * u_t)
+    v_bad = tilted(1e-7)
+    h_rel = np.linalg.norm(np.cross(r_c, v_bad), axis=1) / (rc * speed[:, 0])
+    assert np.all(h_rel > 0) and np.all(h_rel < R.H_REL_MIN)  # degenerate, not zero
+    with pytest.raises(R.RTNDomainError, match="angular momentum"):
+        R.rtn_from_states(r_c, v_bad, r_t)
+    with pytest.raises(R.RTNDomainError, match="angular momentum"):
+        R.states_from_rtn(r_c, v_bad, np.zeros_like(r_c))
+    with pytest.raises(R.RTNDomainError, match="angular momentum"):
+        R.rtn_from_states(r_c, tilted(-1e-7), r_t)
+    with pytest.raises(R.RTNDomainError, match="angular momentum"):
+        R.cheap_frame(r_c, v_bad)
+    # one bad row among good ones is enough
+    mixed = v_c.copy()
+    mixed[7] = v_bad[7]
+    with pytest.raises(R.RTNDomainError, match="1 row"):
+        R.rtn_from_states(r_c, mixed, r_t)
+    # just above the limit the frame exists and the conversion works
+    out = R.rtn_from_states(r_c, tilted(1e-5), r_t)
+    # looser than TOL_KM: the normal of so thin a triangle is good to ~1e-11 rad
+    np.testing.assert_allclose(out, np.tile([0.0, 1.0, 0.0], (50, 1)), atol=1e-6)
+
+
+@pytest.mark.parametrize("sign", [1.0, -1.0])
+def test_inverse_accepts_every_residual_at_the_forward_limits(sign):
+    """A residual with |du| = pi/2 or |phi| = pi/4 exactly, as the forward map stores it.
+
+    The forward map accepts the limit itself and returns T = |r_c| du. The inverse
+    recomputes du = T/|r_c|, and that quotient is one float64 step above du for about
+    3.5% of radii. With the same limit in both directions the inverse refused those;
+    it now accepts one step more, so forward output is always invertible.
+    """
+    r_c, v_c = random_leo_states(20_000, seed=16)
+    rc = np.linalg.norm(r_c, axis=1)
+    zero = np.zeros_like(rc)
+    for column, limit in ((1, R.MAX_ABS_DU_RAD), (2, R.MAX_ABS_PHI_RAD)):
+        rtn = np.column_stack([zero, zero, zero])
+        rtn[:, column] = rc * (sign * limit)  # what the forward map computes at the limit
+        recomputed = np.abs(rtn[:, column] / rc)
+        above = recomputed > limit
+        assert 0.01 < above.mean() < 0.10  # the case exists: the quotient overshoots
+        assert np.all(recomputed <= math.nextafter(limit, math.inf))  # by one step, no more
+        r_t = R.states_from_rtn(r_c, v_c, rtn)  # must not raise
+        assert np.all(np.isfinite(r_t))
+        np.testing.assert_allclose(np.linalg.norm(r_t, axis=1), rc, rtol=1e-13)
+        # still a limit: a part in 1e12 beyond it (0.01 mm of arc) is refused
+        beyond = rtn.copy()
+        beyond[:, column] *= 1.0 + 1e-12
+        with pytest.raises(R.RTNDomainError):
+            R.states_from_rtn(r_c, v_c, beyond)
+
+
+def test_forward_output_near_the_along_track_limit_always_inverts():
+    """Truth placed a few float steps either side of du = pi/2: accepted means invertible.
+
+    Each state is converted on its own, so a refused row doesn't hide the others. Rows
+    the forward map accepts must go through the inverse and come back to the same
+    position; rows it refuses must be the ones beyond the limit.
+    """
+    r_c, v_c = random_leo_states(400, seed=17)
+    rc = np.linalg.norm(r_c, axis=1)
+    u_r = r_c / rc[:, None]
+    n = np.cross(r_c, v_c)
+    n /= np.linalg.norm(n, axis=1)[:, None]
+    u_t = np.cross(n, u_r)
+    step = math.ulp(R.MAX_ABS_DU_RAD)
+    accepted = refused = 0
+    for k in (-3, -2, -1, 0, 1, 2, 3):
+        for sign in (1.0, -1.0):
+            du = sign * (R.MAX_ABS_DU_RAD + k * step)
+            r_t = rc[:, None] * (math.cos(du) * u_r - math.sin(du) * u_t)
+            for i in range(r_c.shape[0]):
+                try:
+                    rtn = R.rtn_from_states(r_c[i], v_c[i], r_t[i])
+                except R.RTNDomainError:
+                    refused += 1
+                    assert k >= -2  # only at or beyond the limit, give or take rounding
+                    continue
+                accepted += 1
+                assert abs(rtn[1]) <= R.MAX_ABS_DU_RAD * rc[i]
+                back = R.states_from_rtn(r_c[i], v_c[i], rtn)  # must not raise
+                assert np.linalg.norm(back - r_t[i]) < TOL_KM
+    assert accepted > 1000 and refused > 1000  # both sides of the limit were exercised
 
 
 def test_angle_limits_raise_in_both_directions():

@@ -28,7 +28,10 @@ from orbit_correction import residuals as R
 from orbit_correction.spaceweather import parse_spaceweather
 from orbit_correction.truth_prop import TruthResult
 from orbit_correction.types import (
+    FEATURE_COLUMNS,
+    OBSERVED_FEATURE_COLUMNS,
     RESIDUAL_SCHEMA,
+    SPACE_WEATHER_MODEL_INPUTS,
     TARGET_COLUMNS,
     ContractError,
     Trajectory,
@@ -109,8 +112,9 @@ def window(elsets, norad, grid, epoch_utc=EPOCH_UTC, **changes):
 # ----------------------------------------------------------------- configuration
 
 
-def test_config_is_pending_and_grid_has_the_proposed_shape(cfg, grid):
-    assert "pending" in cfg.status
+def test_config_is_approved_and_grid_has_the_pilot_shape(cfg, grid):
+    """Bins and the 199-horizon grid as approved for the pilot (2026-11-24)."""
+    assert cfg.status == "approved 2026-11-24"
     assert cfg.altitude_edges_km == (250.0, 400.0, 600.0, 800.0, 1200.0, 2000.0)
     assert cfg.solar_edges_sfu == (90.0, 150.0)
     assert grid.size == 199 and grid[0] == 60.0 and grid[-1] == 7 * DAY
@@ -196,6 +200,110 @@ def test_ok_window_rows_targets_and_features(elsets, sw, cfg, grid):
     assert set(t.column("solar_activity_bin").to_pylist()) == {">=150"}
 
 
+def test_asof_values_at_a_start_where_the_next_3_hour_ap_differs(elsets, sw, cfg, grid):
+    """The four model inputs at 2024-12-29T00:00 UTC, against values read off the file.
+
+    The start is chosen so that looking even one 3-hour interval ahead changes an
+    input: the last 3-hour ap ended by the start (2024-12-28, 21-24 UT) is 2 and the
+    next (2024-12-29, 00-03 UT) is 5. At 2024-06-15T00:00 both are 9, so a builder
+    that read space weather 3 hours late passed the test that uses that start.
+    Expected values, from the fixture's row for 2024-12-28 (the last complete day):
+    observed F10.7 260.3 sfu, daily Ap 3; the trailing 81-day mean of observed F10.7
+    is the file's own last-81-day value for that day, 199.8 sfu.
+    """
+    el, sgp4 = window(elsets, 25544, grid, "2024-12-29T00:00:00")
+    epoch = el.column("epoch_tt_s")[0].as_py()
+    # the premise: the as-of rule itself gives a different answer 3 hours later
+    assert sw.as_of(epoch).ap_3h_last == 2.0 and sw.as_of(epoch + 10800.0).ap_3h_last == 5.0
+    res = R.build_window_rows(el, sgp4, synthetic_truth(sgp4, known_rtn(grid)), sw, "train",
+                              grid, cfg)
+    t = res.table
+    assert set(t.column("asof_ap_3h_last").to_pylist()) == {2.0}
+    assert set(t.column("asof_ap_daily").to_pylist()) == {3.0}
+    assert set(t.column("asof_f107_obs_sfu").to_pylist()) == {260.3}
+    trailing = set(t.column("asof_f107_obs_trailing81_sfu").to_pylist())
+    assert len(trailing) == 1 and trailing.pop() == pytest.approx(199.8, abs=0.05)
+    assert res.solar_activity_bin == ">=150"
+
+
+def poisoned_after(sw, start_utc: str, poison: float = 9999.0):
+    """A copy of the space-weather data where everything not yet known at the start is 9999.
+
+    Not known at the start: every daily value of a day that isn't over by then, and
+    every 3-hour Kp and ap value whose interval hasn't ended by then. This is the
+    availability rule of ``SpaceWeather.as_of`` written out a second time, so a row
+    builder that asks ``as_of`` about any later instant, or reads a later row itself,
+    picks up a 9999.
+    """
+    t0 = np.datetime64(start_utc, "us")
+    day_not_over = (sw.dates + np.timedelta64(1, "D")).astype("datetime64[us]") > t0
+    scalars = {name: values.copy() for name, values in sw.scalars.items()}
+    for values in scalars.values():
+        values[day_not_over] = poison
+    interval_ends = (
+        sw.dates.astype("datetime64[us]")[:, None]
+        + np.arange(1, 9)[None, :] * np.timedelta64(3 * 3600 * 10**6, "us")
+    )
+    ap, kp = sw.ap.copy(), sw.kp_x10.copy()
+    ap[interval_ends > t0] = poison
+    kp[interval_ends > t0] = poison
+    return dataclasses.replace(sw, scalars=scalars, ap=ap, kp_x10=kp)
+
+
+@pytest.mark.parametrize(
+    "start_utc",
+    [
+        "2024-06-15T00:00:00",
+        "2024-06-15T03:00:00",
+        "2024-06-15T13:30:00",
+        "2024-06-15T23:59:59.999000",
+        "2024-06-16T00:00:00.000001",
+    ],
+)
+def test_nothing_after_the_start_reaches_a_feature_column(elsets, sw, cfg, grid, start_utc):
+    """Rebuild a window from poisoned space weather: features and labels don't move.
+
+    Every value not yet known at the start is replaced by 9999 (``poisoned_after``).
+    The feature columns, the stratum labels and the targets must come out identical,
+    with no 9999 anywhere in a feature; the ``obs_*`` columns, which are allowed to
+    read the horizon, must change, which shows the poison is where a leak would look.
+    """
+    el, sgp4 = window(elsets, 25544, grid, start_utc)
+    truth = synthetic_truth(sgp4, known_rtn(grid))
+    clean = R.build_window_rows(el, sgp4, truth, sw, "train", grid, cfg, include_observed=True)
+    dirty = R.build_window_rows(
+        el, sgp4, truth, poisoned_after(sw, start_utc), "train", grid, cfg, include_observed=True
+    )
+    assert set(SPACE_WEATHER_MODEL_INPUTS) <= set(FEATURE_COLUMNS)
+    for col in (*FEATURE_COLUMNS, "altitude_band", "solar_activity_bin", *TARGET_COLUMNS):
+        assert dirty.table.column(col).equals(clean.table.column(col)), col
+    for col in FEATURE_COLUMNS:
+        assert 9999.0 not in dirty.table.column(col).to_pylist(), col
+    assert dirty.solar_activity_bin == clean.solar_activity_bin
+    for col in SPACE_WEATHER_MODEL_INPUTS:
+        assert clean.table.column(col).null_count == 0, col
+    # the poison is live: the comparison-only columns over the horizon do pick it up
+    for col in OBSERVED_FEATURE_COLUMNS:
+        assert 9999.0 in dirty.table.column(col).to_pylist(), col
+
+
+def test_altitude_band_comes_from_perigee_not_apogee(elsets, sw, cfg, grid):
+    """CZ-4C R/B (36123): perigee 969 km and apogee 1,203 km sit in different bands."""
+    el, sgp4 = window(elsets, 36123, grid)
+    rec = el.to_pylist()[0]
+    assert rec["perigee_alt_km"] == pytest.approx(969.5, abs=0.1)
+    assert rec["apogee_alt_km"] == pytest.approx(1202.8, abs=0.1)
+    assert R.altitude_band(rec["perigee_alt_km"], cfg) == "800-1200"
+    assert R.altitude_band(rec["apogee_alt_km"], cfg) == "1200-2000"  # the wrong answer
+    res = R.build_window_rows(el, sgp4, synthetic_truth(sgp4, known_rtn(grid)), sw, "train",
+                              grid, cfg)
+    assert res.status == "ok" and res.altitude_band == "800-1200"
+    assert set(res.table.column("altitude_band").to_pylist()) == {"800-1200"}
+    # a dropped window carries the same stratum
+    err = TruthResult(norad_id=36123, status="error", message="x")
+    assert R.build_window_rows(el, sgp4, err, sw, "train", grid, cfg).altitude_band == "800-1200"
+
+
 def test_observed_columns_follow_the_day_of_each_row(elsets, sw, cfg, grid):
     el, sgp4 = window(elsets, 25544, grid)
     res = R.build_window_rows(
@@ -247,7 +355,7 @@ def test_missing_values_stay_null(elsets, sw, cfg, grid):
 
 
 def test_rows_per_window_and_size(elsets, sw, cfg, grid):
-    """One row per horizon; the in-memory size is what H-013's volume estimate needs."""
+    """One row per horizon; the in-memory size feeds the generation volume estimate."""
     el, sgp4 = window(elsets, 44714, grid)
     res = R.build_window_rows(el, sgp4, synthetic_truth(sgp4, known_rtn(grid)), sw, "train",
                               grid, cfg, include_observed=True)
@@ -303,6 +411,43 @@ def test_sgp4_floor_drops_the_window(elsets, sw, cfg, grid):
     res = R.build_window_rows(el, sgp4, truth, sw, "test", grid, cfg)
     assert res.status == "sgp4_floor" and res.causes == ("sgp4_floor",)
     assert res.table is None and res.sgp4_code == C.ALTITUDE_FLOOR_CODE
+
+
+def test_drop_priority_with_two_causes(elsets, sw, cfg, grid):
+    """Which status a window gets when two causes apply; every cause stays in ``causes``.
+
+    The order is ``DROP_STATUSES``: truth_error, sgp4_error, truth_reentry, sgp4_floor.
+    Each pair below is one a real batch can produce.
+    """
+    assert R.DROP_STATUSES == ("truth_error", "sgp4_error", "truth_reentry", "sgp4_floor")
+    el = one(elsets, 25544, bstar_per_earth_radii=0.1)
+    floored = C.propagate_sgp4_from_epoch(el, grid)[0]
+    coded = C.propagate_sgp4_from_epoch(el, grid, floor_km=None)[0]
+    assert floored.status.below_floor and floored.status.truncated
+    assert coded.status.code == 6 and coded.status.truncated
+
+    # SGP4 cut at the floor and truth re-entered: truth's re-entry names the window
+    reentry = synthetic_truth(floored, known_rtn(grid), n=len(floored.trajectory),
+                              status="reentry")
+    res = R.build_window_rows(el, floored, reentry, sw, "train", grid, cfg)
+    assert res.status == "truth_reentry"
+    assert res.causes == ("truth_reentry", "sgp4_floor")
+    assert res.table is None and res.sgp4_code == C.ALTITUDE_FLOOR_CODE
+    assert res.truth_status == "reentry" and "120 km floor" in res.message
+
+    # the truth job failed and SGP4 was cut at the floor: the truth error comes first
+    err = TruthResult(norad_id=25544, status="error", message="RuntimeError: boom")
+    res = R.build_window_rows(el, floored, err, sw, "train", grid, cfg)
+    assert res.status == "truth_error" and res.causes == ("truth_error", "sgp4_floor")
+    assert "boom" in res.message and "120 km floor" in res.message
+
+    # the truth job failed and SGP4 flagged its own error code
+    res = R.build_window_rows(el, coded, err, sw, "train", grid, cfg)
+    assert res.status == "truth_error" and res.causes == ("truth_error", "sgp4_error")
+    assert res.sgp4_code == 6
+
+    # counted under the status that won, in the window's stratum
+    assert R.count_windows([res]) == {("truth_error", "400-600", ">=150"): 1}
 
 
 def test_truth_error_drops_and_counts_by_stratum(elsets, sw, cfg, grid):
