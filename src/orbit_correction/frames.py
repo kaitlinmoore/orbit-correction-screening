@@ -247,12 +247,22 @@ def satrec_epoch_to_tt_seconds(jdsatepoch: float, jdsatepoch_f: float) -> float:
 
     An SGP4 epoch can't fall inside a leap second (the 86,400-second count has no place
     for it), so every value of the pair maps to exactly one instant.
+
+    The UTC day is picked from the two parts separately, never from their sum: a
+    Julian date near 2.46e6 resolves only about 40 microseconds in one float64, so the
+    sum of a pair within about 20 microseconds of the end of a day rounds up to the
+    next midnight. On a leap-second day that put the epoch a full second late (the
+    seconds were then counted back from the wrong midnight, across the leap second).
     """
-    total = float(jdsatepoch) + float(jdsatepoch_f)
-    jd_midnight = math.floor(total - 0.5) + 0.5  # the UTC midnight starting the day
-    # (jd - midnight) is a small whole number of days when jd is a midnight, as SGP4's
-    # pair has it, so adding the fraction last keeps its precision.
-    seconds = ((float(jdsatepoch) - jd_midnight) + float(jdsatepoch_f)) * _DAY_S
+    jd, fr = float(jdsatepoch), float(jdsatepoch_f)
+    # Whole days and the part of a day carried by jd itself. SGP4's pair has jd on a
+    # midnight (x.5), so `in_jd` is 0 and `in_day` is the fraction at its full precision.
+    day0 = math.floor(jd - 0.5)
+    in_jd = (jd - 0.5) - day0
+    in_day = in_jd + fr
+    carry = math.floor(in_day)  # 0 for SGP4's own pairs; other splits may spill over
+    jd_midnight = day0 + carry + 0.5  # the UTC midnight starting the epoch's day
+    seconds = (in_day - carry) * _DAY_S
     midnight = Time(jd_midnight, format="jd", scale="utc")
     return float(time_to_tt_seconds(midnight)) + seconds
 

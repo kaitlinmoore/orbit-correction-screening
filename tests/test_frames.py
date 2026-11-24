@@ -228,6 +228,33 @@ def test_satrec_epoch_from_satrec_and_across_midnight():
     )
 
 
+@pytest.mark.parametrize("date", ["2016-12-31", "2015-06-30", "2016-12-30"])
+@pytest.mark.parametrize("before_s", [1e-3, 3e-5, 1e-5, 1e-6])
+def test_satrec_epoch_just_before_the_end_of_a_day(date, before_s):
+    """Microseconds before midnight stay on their own day, leap second or not.
+
+    The sum ``jd + fraction`` of such a pair rounds to the next midnight (a Julian date
+    resolves about 40 microseconds in one float64). Picking the day from that sum put an
+    epoch 10 or 1 microseconds before the 2016 leap second a full second late; the day
+    must come from the two parts separately. 2016-12-30 is the same check on a day
+    without a leap second, where the same slip would cost nothing and so must not
+    change the answer either.
+    """
+    y, mo, d = (int(x) for x in date.split("-"))
+    sec = 60.0 - before_s
+    jd, fr = jday(y, mo, d, 23, 59, sec)
+    if before_s <= 1e-5:
+        assert jd + fr == jd + 1.0  # the trap: the float sum is already the next midnight
+    got = F.satrec_epoch_to_tt_seconds(jd, fr)
+    # tolerance: TT seconds near 2016 resolve 6e-8 s; a one-second slip is the target
+    assert got == pytest.approx(_tt_seconds_by_hand(date, 23, 59, sec), abs=2e-7)
+    iso = f"{date}T23:59:{sec:09.6f}"
+    assert got == pytest.approx(F.utc_to_tt_seconds(iso), abs=2e-7)
+    # the same instant with a whole day moved from one part to the other
+    assert F.satrec_epoch_to_tt_seconds(jd - 1.0, fr + 1.0) == pytest.approx(got, abs=2e-7)
+    assert F.satrec_epoch_to_tt_seconds(jd + 1.0, fr - 1.0) == pytest.approx(got, abs=2e-7)
+
+
 # ---------------------------------------------------------------- EOP pinning
 
 
