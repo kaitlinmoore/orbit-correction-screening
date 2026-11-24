@@ -68,7 +68,19 @@ Choices
   The altitude is computed from the TEME position (:func:`geodetic_altitude_km`), with
   no JVM and no Earth-rotation angle: the ellipsoid is symmetric about its axis, so
   only the pole matters, and TEME's pole differs from the Earth-fixed (ITRS) pole only
-  by polar motion, which moves the altitude by centimetres (``tests/test_cheap_prop.py``).
+  by polar motion. Ignoring polar motion costs under 10 cm of altitude: the change is
+  at most (a - b) x the pole offset, 21.4 km x 3.3e-6 rad = 7 cm at the largest
+  offsets in the IERS table (``tests/test_cheap_prop.py``).
+
+  The floor is tested **only at the requested times**. SGP4 is not searched for the
+  crossing between two samples, whereas truth stops at the crossing itself. So where
+  a trajectory is cut, and with it ``n_valid`` and ``first_error_t_tt_s``, depends on
+  the sampling grid: on the 199-horizon residual grid the first sample below the
+  floor comes up to hours after the one a 60 s grid finds (the uniform part steps by
+  6,048 s, and a low perigee pass can fall between samples), and a dip below 120 km
+  that falls wholly between two samples is not seen at all.
+  ``first_error_t_tt_s`` is the first *sampled* time below the floor, not a re-entry
+  time; don't use it as one.
 
 Time grids
 ----------
@@ -156,7 +168,10 @@ class Sgp4Status:
         n_valid: number of states returned (the states before the first error or
             the first state below the floor).
         first_error_t_tt_s: TT seconds since J2000.0 of the first failing time (or
-            first time below the floor), or None if there was none.
+            first time below the floor), or None if there was none. It is one of the
+            **requested** times, so it depends on the sampling grid: the object went
+            wrong somewhere in the interval that ends there (for the floor, up to
+            hours earlier on a sparse grid). It is not a re-entry or decay time.
     """
 
     code: int
@@ -405,7 +420,9 @@ def geodetic_altitude_km(r_teme_km: np.ndarray) -> np.ndarray:
     That is exact up to polar motion: geodetic altitude depends only on the distance
     from the ellipsoid's axis and along it, so the Earth-rotation angle drops out, and
     TEME's z axis (the true pole of date) differs from the ITRS pole only by polar
-    motion (~0.5 arcsec), which moves the altitude by centimetres. No JVM, no EOP.
+    motion. Tilting the pole by an angle theta changes the altitude by at most
+    (a - b) theta: 7 cm at the largest pole offsets in the IERS table (0.68 arcsec),
+    so ignoring polar motion costs under 10 cm. No JVM, no EOP.
 
     Args:
         r_teme_km: shape (..., 3), finite TEME positions, km.
@@ -513,7 +530,9 @@ def propagate_sgp4(
     Returns:
         One :class:`Sgp4Result` per row, in row order. Trajectories are truncated
         before the first SGP4 error or the first state below the floor, whichever
-        comes first (see the module docstring).
+        comes first (see the module docstring). Both are tested at ``times_tt_s``
+        only, so the cut and ``status.first_error_t_tt_s`` depend on the grid;
+        the latter is not a re-entry time.
     """
     batch = sgp4_teme(elsets, times_tt_s, chunk_objects=chunk_objects)
     return _to_results(batch, rotation, floor_km)
@@ -531,6 +550,8 @@ def propagate_sgp4_from_epoch(
 
     Same as :func:`propagate_sgp4` except for the grid: object i's trajectory times
     are ``epoch_tt_s[i] + dt_s``. Use for windows that start at the element-set epoch.
+    As there, the floor and SGP4's error flag are tested at the requested times only,
+    so ``status.first_error_t_tt_s`` depends on ``dt_s`` and is not a re-entry time.
     """
     batch = sgp4_teme_from_epoch(elsets, dt_s, chunk_objects=chunk_objects)
     return _to_results(batch, rotation, floor_km)

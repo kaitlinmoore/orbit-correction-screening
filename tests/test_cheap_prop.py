@@ -15,12 +15,14 @@ from __future__ import annotations
 import datetime as dt
 import importlib.util
 import json
+import math
 from importlib.resources import files
 
 import numpy as np
 import pyarrow as pa
 import pytest
 from astropy.time import Time
+from astropy.utils import iers
 from sgp4.api import WGS72, Satrec, jday
 
 from orbit_correction import catalog
@@ -419,7 +421,9 @@ def test_decay_inside_window_truncates(sample):
     assert s.truncated and not s.ok
     assert 0 < s.n_valid < s.n_requested == len(WEEK_60S)
     assert len(dec.trajectory) == s.n_valid
-    assert s.first_error_t_tt_s == pytest.approx(dec.epoch_tt_s + WEEK_60S[s.n_valid])
+    # exact: the same arithmetic as the grid (approx's default tolerance, 1e-6 relative,
+    # is 780 s at this magnitude and would hide an off-by-one sample)
+    assert s.first_error_t_tt_s == dec.epoch_tt_s + WEEK_60S[s.n_valid]
     # every returned state is above one Earth radius; the raw batch confirms the rule
     assert np.all(np.linalg.norm(dec.trajectory.r_gcrf_km, axis=1) > RE_WGS72_KM)
     raw = C.sgp4_teme_from_epoch(decaying, WEEK_60S)
@@ -452,7 +456,9 @@ def test_floor_cuts_a_decaying_trajectory_before_sgp4_does(sample):
     assert s.code == C.ALTITUDE_FLOOR_CODE and s.below_floor and s.truncated and not s.ok
     assert "120 km floor" in s.message
     assert 0 < s.n_valid < no_floor.status.n_valid
-    assert s.first_error_t_tt_s == pytest.approx(res.epoch_tt_s + WEEK_60S[s.n_valid])
+    # exact, and the first state below the floor (not the last one above it)
+    assert s.first_error_t_tt_s == res.epoch_tt_s + WEEK_60S[s.n_valid]
+    assert s.first_error_t_tt_s == res.trajectory.t_tt_s[-1] + 60.0
     # the kept states are those of the unfloored run, and the cut is at the crossing
     np.testing.assert_array_equal(
         res.trajectory.r_gcrf_km, no_floor.trajectory.r_gcrf_km[: s.n_valid]
@@ -463,6 +469,83 @@ def test_floor_cuts_a_decaying_trajectory_before_sgp4_does(sample):
     assert raw.error[0, s.n_valid] == 0  # SGP4 itself still calls this state valid
     assert C.status_counts([res]) == {"ok": 0, "truncated": 1, "empty": 0, "altitude_floor": 1}
     assert not C.Sgp4Status(6, "x", 2, 1, 0.0).below_floor
+
+
+def test_floor_is_on_by_default_on_the_absolute_grid(sample):
+    """``propagate_sgp4`` (the screening path) cuts at the floor without being asked.
+
+    The same decaying set on an absolute TT grid that starts at its epoch: the default
+    must stop where the from-epoch run stops, and only ``floor_km=None`` runs on to
+    SGP4's own decay flag.
+    """
+    i = _row_index(sample, 25544)
+    decaying = _with(sample, i, bstar_per_earth_radii=0.1)
+    epoch = decaying.column("epoch_tt_s")[0].as_py()
+    grid_abs = epoch + WEEK_60S
+    res = C.propagate_sgp4(decaying, grid_abs)[0]
+    from_epoch = C.propagate_sgp4_from_epoch(decaying, WEEK_60S)[0]
+    s = res.status
+    assert s.below_floor and s.truncated and s.code == C.ALTITUDE_FLOOR_CODE
+    assert s.n_valid == from_epoch.status.n_valid
+    assert s.first_error_t_tt_s == grid_abs[s.n_valid]
+    np.testing.assert_allclose(  # the two grids differ only in how the times are formed
+        res.trajectory.r_gcrf_km, from_epoch.trajectory.r_gcrf_km, rtol=0, atol=1e-8
+    )
+    raw = C.sgp4_teme(decaying, grid_abs)
+    alt = C.geodetic_altitude_km(raw.r_teme_km[0, : s.n_valid + 1])
+    assert np.all(alt[:-1] >= C.ALTITUDE_FLOOR_KM) and alt[-1] < C.ALTITUDE_FLOOR_KM
+    off = C.propagate_sgp4(decaying, grid_abs, floor_km=None)[0]
+    assert off.status.code == 6 and off.status.n_valid > s.n_valid
+
+
+def test_start_below_the_floor_gives_no_epoch_state(sample):
+    """``sgp4_epoch_states``: an element set already below 120 km has no start state.
+
+    ISS elements with the mean motion raised to 16.6 rev/day sit at about 111 km.
+    SGP4 itself calls the state valid (code 0), so only the floor refuses it; at
+    16.5 rev/day (about 137 km) the state is returned.
+    """
+    i = _row_index(sample, 25544)
+    low = _with(sample, i, mean_motion_rev_per_day=16.6)
+    raw = C.sgp4_teme_from_epoch(low, np.zeros(1))
+    assert raw.error[0, 0] == 0
+    assert 100.0 < float(C.geodetic_altitude_km(raw.r_teme_km[0, 0])) < C.ALTITUDE_FLOOR_KM
+    res = C.sgp4_epoch_states(low)[0]
+    assert res.trajectory is None
+    assert res.status.below_floor and res.status.n_valid == 0 and not res.status.ok
+    assert res.status.first_error_t_tt_s == res.epoch_tt_s
+    assert C.status_counts([res]) == {"ok": 0, "truncated": 0, "empty": 1, "altitude_floor": 1}
+    above = C.sgp4_epoch_states(_with(sample, i, mean_motion_rev_per_day=16.5))[0]
+    assert above.status.ok and len(above.trajectory) == 1
+
+
+def test_first_error_time_depends_on_the_sampling_grid(sample):
+    """The floor is tested at the requested times only: the cut moves with the grid.
+
+    The decaying set on a 60 s grid and on every 100th sample of it. The coarse run's
+    first time below the floor is one of its own samples and later than the fine
+    run's. Here it is 166 minutes later, more than one coarse step: the object dips
+    under 120 km near perigee and is back above it at the next coarse sample. So
+    ``first_error_t_tt_s`` is not a re-entry time.
+    """
+    i = _row_index(sample, 25544)
+    decaying = _with(sample, i, bstar_per_earth_radii=0.1)
+    fine = C.propagate_sgp4_from_epoch(decaying, WEEK_60S)[0]
+    coarse_grid = WEEK_60S[::100]
+    coarse = C.propagate_sgp4_from_epoch(decaying, coarse_grid)[0]
+    assert fine.status.below_floor and coarse.status.below_floor
+    m_fine, m_coarse = fine.status.n_valid, coarse.status.n_valid
+    assert coarse.status.first_error_t_tt_s == coarse.epoch_tt_s + coarse_grid[m_coarse]
+    late_s = coarse.status.first_error_t_tt_s - fine.status.first_error_t_tt_s
+    assert late_s == 100 * 60.0 * m_coarse - 60.0 * m_fine
+    assert late_s > 6000.0  # later than the fine cut by more than a coarse step
+    # every coarse sample kept is above the floor, including the ones after the fine cut
+    alt = C.geodetic_altitude_km(C.sgp4_teme_from_epoch(decaying, WEEK_60S).r_teme_km[0])
+    assert alt[m_fine] < C.ALTITUDE_FLOOR_KM
+    kept_after = np.arange(0, 100 * m_coarse, 100)
+    kept_after = kept_after[kept_after > m_fine]
+    assert kept_after.size >= 1 and np.all(alt[kept_after] >= C.ALTITUDE_FLOOR_KM)
+    assert alt[100 * m_coarse] < C.ALTITUDE_FLOOR_KM
 
 
 def test_floor_matches_the_truth_reentry_altitude():
@@ -534,7 +617,8 @@ def test_ignoring_polar_motion_moves_altitude_by_centimetres(sample):
     """TEME-based altitude against astropy's ITRS-based altitude: under 0.1 m.
 
     TEME -> ITRS in astropy is a rotation about z (GMST) followed by polar motion, so
-    the difference isolates polar motion; the bound the handoff asks for is 1 m.
+    the difference isolates polar motion. This is a sample on the fixture's dates
+    (a few centimetres); the bound is the next test.
     """
     leo = sample.filter(pa.compute.less(sample.column("perigee_alt_km"), 2000.0))
     res = C.sgp4_teme_from_epoch(leo, 60.0 * np.arange(0, 1440, 7))  # a day, 7-min steps
@@ -543,6 +627,44 @@ def test_ignoring_polar_motion_moves_altitude_by_centimetres(sample):
     diff_m = np.abs(C.geodetic_altitude_km(r) - _itrs_altitude_km(r, t)) * 1000.0
     assert r.shape[0] > 1000
     assert diff_m.max() < 0.1, diff_m.max()
+
+
+def test_polar_motion_bound_on_the_altitude_is_under_10_cm():
+    """Ignoring polar motion costs under 10 cm: at most (a - b) x the pole offset.
+
+    The sample test above measures centimetres on particular dates; this one is the
+    bound. Positions on LEO shells are tilted about equatorial axes by the largest
+    polar motion in the pinned EOP table (largest |x| and |y| combined, about 0.68
+    arcsec, more than any single date has), and the altitude change stays below
+    (a - b) x angle = 7 cm.
+    """
+    from astropy import units as u
+
+    tab = iers.earth_orientation_table.get()
+    theta = math.hypot(
+        float(np.nanmax(np.abs(tab["PM_x"].to_value(u.rad)))),
+        float(np.nanmax(np.abs(tab["PM_y"].to_value(u.rad)))),
+    )
+    assert 0.5 < math.degrees(theta) * 3600.0 < 1.0  # arcsec; 0.68 in the pinned table
+    a, b = 6378.137, 6356.752314245
+    rng = np.random.default_rng(5)
+    unit = rng.normal(size=(50_000, 3))
+    unit /= np.linalg.norm(unit, axis=1)[:, None]
+    r = unit * rng.uniform(a + 100.0, a + 2000.0, 50_000)[:, None]
+    worst_m = 0.0
+    for azimuth in np.linspace(0.0, np.pi, 7):
+        k = np.array([math.cos(azimuth), math.sin(azimuth), 0.0])  # tilt axis
+        tilted = (
+            r * math.cos(theta)
+            + np.cross(k, r) * math.sin(theta)
+            + k * (r @ k)[:, None] * (1.0 - math.cos(theta))
+        )
+        diff = np.abs(C.geodetic_altitude_km(tilted) - C.geodetic_altitude_km(r))
+        worst_m = max(worst_m, float(diff.max()) * 1000.0)
+    bound_m = (a - b) * theta * 1000.0
+    assert worst_m <= bound_m * (1 + 1e-3), (worst_m, bound_m)
+    assert worst_m > 0.9 * bound_m  # the bound is attained (at mid latitudes)
+    assert bound_m < 0.10
 
 
 HAVE_OREKIT = all(

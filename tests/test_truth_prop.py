@@ -332,6 +332,70 @@ def test_output_grid():
 
 
 # --------------------------------------------------------------------------------------
+# always run: the initial-state wrapper (SGP4 only, no JVM)
+# --------------------------------------------------------------------------------------
+
+
+def test_initial_state_wrapper_uses_the_replacement_epoch():
+    """``initial_state_from_omm`` with a replaced epoch, checked without Orekit.
+
+    The same mean elements started at another date: the state's time is the new
+    epoch, and its position is the element set's TEME state at its epoch (which
+    doesn't depend on the date for a near-Earth set) rotated to GCRF **at the new
+    date**. The reference goes through the ``sgp4`` package's TLE-free initialiser
+    and the exact rotation, not through ``sgp4_epoch_states``. Rotating at the
+    record's own 2026 epoch instead would move the position by kilometres
+    (precession over 2.4 years), so ignoring the replacement can't pass.
+    """
+    from orbit_correction import catalog, cheap_prop, frames
+
+    rec = json.loads((FIXTURES / "celestrak_gp_sample.json").read_text())
+    rec = next(r for r in rec if r["NORAD_CAT_ID"] == 44714)
+    new_epoch = "2024-06-15T00:00:00"
+    assert rec["EPOCH"][:4] == "2026"
+
+    init, bstar = T.initial_state_from_omm(rec, new_epoch)
+    assert bstar == rec["BSTAR"]
+    assert isinstance(init, Trajectory) and len(init) == 1 and init.source == "sgp4"
+    assert init.norad_id == 44714
+    t_new = float(utc_to_tt_seconds(new_epoch))
+    assert init.t_tt_s[0] == t_new
+
+    row = catalog.load_celestrak_omm(FIXTURES / "celestrak_gp_sample.json")
+    row = next(r for r in row.to_pylist() if r["norad_id"] == 44714)
+    err, r_teme, v_teme = cheap_prop.satrec_from_row(row).sgp4_tsince(0.0)
+    assert err == 0
+    r_new, v_new = frames.teme_to_gcrf(np.array(r_teme), np.array(v_teme), t_new)
+    np.testing.assert_allclose(init.r_gcrf_km[0], r_new, rtol=0, atol=1e-9)  # 1 micrometre
+    np.testing.assert_allclose(init.v_gcrf_km_s[0], v_new, rtol=0, atol=1e-12)
+
+    # without a replacement the record's own epoch is used, and the state is elsewhere
+    own, _ = T.initial_state_from_omm(rec)
+    assert own.t_tt_s[0] == row["epoch_tt_s"] != t_new
+    r_own, _ = frames.teme_to_gcrf(np.array(r_teme), np.array(v_teme), row["epoch_tt_s"])
+    np.testing.assert_allclose(own.r_gcrf_km[0], r_own, rtol=0, atol=1e-9)
+    assert np.linalg.norm(own.r_gcrf_km[0] - init.r_gcrf_km[0]) > 1.0  # km
+
+
+def test_initial_state_wrapper_refuses_a_start_below_the_floor():
+    """The wrapper passes the 120 km floor through: no state, a clear error.
+
+    ISS elements with the mean motion raised to 16.6 rev/day sit at about 111 km at
+    the epoch. SGP4 itself returns a state there, so only the floor stops it; truth
+    must not be started from it.
+    """
+    rec = json.loads((FIXTURES / "celestrak_gp_sample.json").read_text())
+    rec = next(r for r in rec if r["NORAD_CAT_ID"] == 25544)
+    low = dict(rec, MEAN_MOTION=16.6)
+    for epoch in (None, "2024-06-15T00:00:00"):
+        with pytest.raises(ValueError, match="no SGP4 state at the epoch.*120 km floor"):
+            T.initial_state_from_omm(low, epoch)
+    # the unchanged record is fine, so the refusal is the altitude and nothing else
+    init, _ = T.initial_state_from_omm(rec, "2024-06-15T00:00:00")
+    assert len(init) == 1
+
+
+# --------------------------------------------------------------------------------------
 # datagen: shared JVM and inputs
 # --------------------------------------------------------------------------------------
 
