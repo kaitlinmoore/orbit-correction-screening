@@ -1,5 +1,10 @@
 """Zonal-degree convergence check for the truth propagator.
 
+Background for the zonal degree, not the rule that sets it: degree 36 is a chosen
+truncation that is part of the truth definition (decided 2026-11-23). The table this
+script produced on 2026-11-23 (truth setting then 1 m / 300 s) is summarised in the
+changelog and kept as a record of what the omitted zonals contribute.
+
 Question: how many zonal harmonics does truth need? For sample objects in four
 altitude bands, propagate 7 days at increasing zonal degree and compare each with
 a high-degree reference (degree 90). A degree is converged for an object when its
@@ -11,12 +16,13 @@ Integration: the degree runs and the reference use a converged integrator (DOP85
 position tolerance 1 mm, maximum step 30 s), so integration error doesn't blur the
 degree-to-degree differences.
 
-Threshold: the integration error of the truth setting itself (1 m tolerance, 300 s
-maximum step), measured as its 7-day difference from the converged integrator at
-degree ``THRESHOLD_DEGREE``. The original specification was the "1 m vs 1 cm" tolerance
-effect; at a 300 s maximum step DOP853 runs at the step cap at both tolerances
-(identical evaluation counts), so that difference measures a shift in step phase,
-not the integration error. Both are reported; this script uses the integration error.
+Threshold: the integration error of the truth setting itself (1 m tolerance, the
+configured maximum step: 300 s when the recorded table was made, 180 s since),
+measured as its 7-day difference from the converged integrator at degree
+``THRESHOLD_DEGREE``. The original specification was the "1 m vs 1 cm" tolerance
+effect; at the step cap DOP853 runs at the same evaluation count at both tolerances,
+so that difference measures a shift in step phase, not the integration error. Both
+are reported; this script uses the integration error.
 
 Every run has drag (NRLMSISE-00), as truth does.
 
@@ -140,14 +146,15 @@ def main() -> None:
     samples = sample_states(recs)
     t0 = samples[0][2].t_tt_s[0]
     args.out.parent.mkdir(parents=True, exist_ok=True)
-    sw_copy = args.out.parent / "sw_orekit_zonal.txt"
-    T.write_space_weather_copy(SW_FILE, sw_copy, t0, t0 + HORIZON_S)
+    sw_copy = T.write_space_weather_copy(
+        SW_FILE, args.out.parent / "sw_orekit_zonal_2024-06-15_7d.txt", t0, t0 + HORIZON_S
+    )
 
     # one batch per configuration; each batch runs every sample object
     tol, step = CONVERGED
     configs = {
-        "truth_1m_300s": dataclasses.replace(cfg, zonal_degree=THRESHOLD_DEGREE),
-        "truth_1cm_300s": dataclasses.replace(
+        "truth_setting": dataclasses.replace(cfg, zonal_degree=THRESHOLD_DEGREE),
+        "truth_setting_1cm": dataclasses.replace(
             cfg, zonal_degree=THRESHOLD_DEGREE, position_tolerance_m=0.01
         ),
         "ref_step_15s": dataclasses.replace(
@@ -178,7 +185,7 @@ def main() -> None:
     ref = results[reference]
     rows = []
     for i, (band, nid, _, bstar) in enumerate(samples):
-        thr = maxdiff_m(results["truth_1m_300s"][i], results[THRESHOLD_DEGREE][i])
+        thr = maxdiff_m(results["truth_setting"][i], results[THRESHOLD_DEGREE][i])
         diffs = {d: maxdiff_m(results[d][i], ref[i]) for d in degrees}
         converged = [d for d in degrees if all(diffs[e] < thr for e in degrees if e >= d)]
         rows.append(
@@ -187,8 +194,8 @@ def main() -> None:
                 "norad_id": nid,
                 "bstar": bstar,
                 "threshold_truth_integration_error_m": thr,
-                "tol_1m_vs_1cm_at_300s_m": maxdiff_m(
-                    results["truth_1m_300s"][i], results["truth_1cm_300s"][i]
+                "tol_1m_vs_1cm_at_truth_step_m": maxdiff_m(
+                    results["truth_setting"][i], results["truth_setting_1cm"][i]
                 ),
                 "reference_step_check_m": maxdiff_m(results["ref_step_15s"][i], ref[i]),
                 "max_diff_vs_ref_m": diffs,
@@ -203,11 +210,11 @@ def main() -> None:
         "position difference over 7 days (m)."
     )
     print(
-        "Threshold = truth integrator (1 m, 300 s) vs converged, at degree "
+        f"Threshold = truth integrator (1 m, {cfg.max_step_s:g} s) vs converged, at degree "
         f"{THRESHOLD_DEGREE}. Ref check = reference at max step {step / 2} s vs {step} s."
     )
     hdr = (
-        "| Band | NORAD | Threshold | 1 m vs 1 cm (300 s) | Ref check | "
+        f"| Band | NORAD | Threshold | 1 m vs 1 cm ({cfg.max_step_s:g} s) | Ref check | "
         + " | ".join(f"N={d}" for d in degrees)
         + " | Converged at |"
     )
@@ -218,7 +225,8 @@ def main() -> None:
         print(
             f"| {r['band_km']} | {r['norad_id']} | "
             f"{r['threshold_truth_integration_error_m']:.3g} | "
-            f"{r['tol_1m_vs_1cm_at_300s_m']:.3g} | {r['reference_step_check_m']:.3g} | {cells} | "
+            f"{r['tol_1m_vs_1cm_at_truth_step_m']:.3g} | "
+            f"{r['reference_step_check_m']:.3g} | {cells} | "
             f"{r['smallest_converged_degree']} |"
         )
     print(f"\nChosen zonal degree: {chosen}")
@@ -233,6 +241,7 @@ def main() -> None:
                 "degrees": degrees,
                 "converged_integrator": CONVERGED,
                 "threshold_degree": THRESHOLD_DEGREE,
+                "truth_max_step_s": cfg.max_step_s,
                 "rows": rows,
                 "chosen_degree": chosen,
                 "provenance": T.orekit_provenance(),

@@ -67,7 +67,7 @@ def load_snapshot() -> dict:
 
 
 def run_trial(jobs, cfg, sw_copy, n_workers: int, per_worker: int) -> dict:
-    sw = str(Path(sw_copy).resolve())
+    sw = sw_copy  # the SpaceWeatherCopy, pickled to each worker
     apc = cfg.jvm_active_processor_count
     with ProcessPoolExecutor(
         max_workers=n_workers,
@@ -112,8 +112,9 @@ def main() -> None:
     ]
     t0 = samples[0][2].t_tt_s[0]
     args.out.parent.mkdir(parents=True, exist_ok=True)
-    sw_copy = args.out.parent / "sw_orekit_benchmark.txt"
-    T.write_space_weather_copy(Z.SW_FILE, sw_copy, t0, t0 + WEEK_S)
+    sw_copy = T.write_space_weather_copy(
+        Z.SW_FILE, args.out.parent / "sw_orekit_benchmark_2024-06-15_7d.txt", t0, t0 + WEEK_S
+    )
 
     meta = {
         "cpu": platform.processor() or platform.machine(),
@@ -121,6 +122,7 @@ def main() -> None:
         "python": platform.python_version(),
         "zonal_degree": cfg.zonal_degree,
         "integrator": [cfg.integrator, cfg.position_tolerance_m, cfg.max_step_s],
+        "start_rule": cfg.start_rule,
         "jvm_active_processor_count": cfg.jvm_active_processor_count,
         "provenance": T.orekit_provenance(),
         "objects": [nid for _, nid, _, _ in samples],

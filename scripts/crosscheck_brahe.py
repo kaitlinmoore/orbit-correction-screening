@@ -14,14 +14,15 @@ Matched inputs
   ``truth.toml`` zonal_degree, order 0, written to a fully normalised ICGEM file for
   brahe and passed to Orekit as arrays (``GravityFieldFactory.getNormalizedProvider``).
   Same GM and reference radius in both.
-* **Initial state:** the same GCRF state (SGP4 at the shifted epoch).
+* **Initial state:** the same GCRF state: SGP4 at the shifted epoch with the truth
+  start rule applied (``truth_prop.apply_start_rule``).
 * **EOP:** the bundle's ``finals2000A.all`` (orekit-data 2d6edc9) in both.
 * **Space weather:** Orekit reads the project's copy; brahe reads CelesTrak's
   ``SW-All.txt`` directly (it parses the published file). Same numbers.
 * **Drag:** Cd 2.2, A/m from B*, mass 100 kg (cancels).
 * **Integrators:** Orekit DOP853 at 1 mm / max step 30 s (converged); brahe RKF78
   at rel 1e-13, abs 1e-8, max step 30 s (converged per project research). The truth
-  setting (DOP853, 1 m, 300 s) is reported too.
+  setting (DOP853, 1 m, the configured maximum step) is reported too.
 * **Not matched, stated:** each library's NRLMSISE-00 driver (local solar time
   convention, ap mode, which F10.7 it reads), Sun ephemeris (Orekit DE-440), and
   Earth-rotation implementation details. ``density_probe`` measures the first.
@@ -53,15 +54,19 @@ from orbit_correction import truth_prop as T  # noqa: E402
 REPO = Path(__file__).resolve().parents[1]
 OUT_DIR = REPO / "data" / "derived" / "truth"
 HORIZONS = {"1 h": 3600.0, "1 d": 86400.0, "7 d": 7 * 86400.0}
-QUICK = (63982, 22824)  # 500 km and 800 km
+QUICK = (68828, 63982, 22824)  # 300 km (the larger drag difference), 500 km, 800 km
 OREKIT_CONVERGED = (1e-3, 30.0)
 BRAHE_TOL = dict(abs=1e-8, rel=1e-13, max_step=30.0)
-#: Proposed cross-check tolerance on |brahe - Orekit| at 7 days, metres, both converged.
-#: From the first full run (2026-11-23, 8 objects, 300-1200 km, June 2024 start): no drag
-#: <= 5.1 mm (tolerance 0.1 m); drag with matched NRLMSISE-00 conventions <= 3.9 m, at
-#: 300 km (tolerance 10 m). With the project's ap-array setting brahe differs by up to
-#: 11 km at 300 km; that is a convention difference, reported, not a tolerance.
-TOLERANCE_7D_M = {"no_drag": 0.1, "drag": 10.0, "drag_project_setting": None}
+#: Cross-check tolerance on |brahe - Orekit| at 7 days, metres, both converged (decided
+#: 2026-11-23). No drag: 0.1 m in every band (measured <= 5.1 mm). Drag with matched
+#: NRLMSISE-00 conventions, per altitude band, set from the measured values with
+#: margin: 10 m at 300 km (measured <= 3.9 m), 1 m at 500 km (<= 0.06 m), 0.1 m at
+#: 800 km and above (<= 5 mm). With the project's ap-array setting brahe differs by up
+#: to 11 km at 300 km; that is a convention difference, reported, not checked.
+TOLERANCE_7D_M = {
+    "no_drag": {300: 0.1, 500: 0.1, 800: 0.1, 1200: 0.1},
+    "drag": {300: 10.0, 500: 1.0, 800: 0.1, 1200: 0.1},
+}
 
 
 def bundle_dir() -> Path:
@@ -219,9 +224,12 @@ def main() -> None:
     samples = [s for s in Z.sample_states(recs) if not args.quick or s[1] in QUICK]
     t0 = samples[0][2].t_tt_s[0]
     OUT_DIR.mkdir(parents=True, exist_ok=True)
-    sw_copy = OUT_DIR / "sw_orekit_crosscheck.txt"
-    T.write_space_weather_copy(Z.SW_FILE, sw_copy, t0, t0 + HORIZONS["7 d"])
+    sw_copy = T.write_space_weather_copy(
+        Z.SW_FILE, OUT_DIR / "sw_orekit_crosscheck_2024-06-15_7d.txt", t0, t0 + HORIZONS["7 d"]
+    )
     ctx = T._context(cfg)
+    # the truth start rule, applied once, so both libraries start from the same state
+    samples = [(b, n, T.apply_start_rule(i, ctx.mu, cfg), bs) for b, n, i, bs in samples]
 
     od = bundle_dir()
     bh.set_global_eop_provider(
@@ -300,8 +308,9 @@ def main() -> None:
     prop.propagate(ctx.date(init.t_tt_s[0] + 86400.0))
     eph = gen.getGeneratedEphemeris()
     pts = []
-    # offset from 00:00 UTC: at an exact day boundary Orekit's neighbour lookup returns
-    # the previous day's row (found here), which is a boundary convention, not a model
+    # offset from 00:00 UTC: just after a day boundary brahe keeps the previous day's
+    # space-weather values (for between 1 ms and 1 s), while Orekit switches at
+    # 00:00:00 UTC exactly; a boundary convention, not a model difference
     for dt in 420.0 + np.linspace(0, 86400.0 - 840.0, 49):
         date = ctx.date(init.t_tt_s[0] + dt)
         p = eph.getPVCoordinates(date, ctx.itrf).getPosition()
@@ -342,7 +351,10 @@ def main() -> None:
             f"  {row['band_km']} {row['norad_id']}: "
             + " / ".join(f"{fmt(d[h]['norm'])} ({fmt(d[h]['T'])})" for h in HORIZONS)
         )
-    print("\nOrekit truth setting (1 m, 300 s) minus converged, |dr| at 1 h / 1 d / 7 d:")
+    print(
+        f"\nOrekit truth setting (1 m, {cfg.max_step_s:g} s) minus converged, |dr| at "
+        "1 h / 1 d / 7 d:"
+    )
     for row in results:
         for key in ("no_drag", "drag"):
             d = row[key]["orekit_truth_setting_minus_converged"]
@@ -363,29 +375,44 @@ def main() -> None:
     for k, v in probe.items():
         print(f"  {k}: {v:.3g}")
 
-    def worst7(key, field):
-        return max(r[key][field]["7 d"]["norm"] for r in results)
-
-    worst = {
-        "no_drag": worst7("no_drag", "brahe_minus_orekit_converged"),
-        "drag": worst7("drag", "brahe_minus_orekit_brahe_conventions"),
-        "drag_project_setting": worst7("drag", "brahe_minus_orekit_converged"),
+    fields = {
+        "no_drag": ("no_drag", "brahe_minus_orekit_converged"),
+        "drag": ("drag", "brahe_minus_orekit_brahe_conventions"),
+        "drag_project_setting": ("drag", "brahe_minus_orekit_converged"),
     }
-    tol = dict(TOLERANCE_7D_M)
-    within = all(tol.get(k) is None or worst[k] <= tol[k] for k in worst)
+    bands = sorted({r["band_km"] for r in results})
+    worst = {
+        name: {
+            b: max(r[k][f]["7 d"]["norm"] for r in results if r["band_km"] == b) for b in bands
+        }
+        for name, (k, f) in fields.items()
+    }
+    within = all(
+        worst[name][b] <= TOLERANCE_7D_M[name][b] for name in TOLERANCE_7D_M for b in bands
+    )
     summary = {
-        "worst_7d_m": worst,
-        "tolerance_7d_m": tol,
+        "worst_7d_m_by_band": worst,
+        "tolerance_7d_m_by_band": TOLERANCE_7D_M,
         "density_probe": probe,
         "shared_set_readback_max_abs": shared_check,
     }
-    print(f"\nWorst 7-day |dr|: {worst}; tolerance {tol}; within: {within}")
+    print("\nWorst 7-day |dr| by band (m), and tolerance:")
+    for name in worst:
+        cells = ", ".join(
+            f"{b} km {worst[name][b]:.3g}"
+            + (f" (tol {TOLERANCE_7D_M[name][b]:g})" if name in TOLERANCE_7D_M else "")
+            for b in bands
+        )
+        print(f"  {name}: {cells}")
+    print(f"within tolerance: {within}")
     args.json.parent.mkdir(parents=True, exist_ok=True)
     args.json.write_text(
         json.dumps(
             {
                 "epoch_utc": Z.EPOCH_UTC,
                 "zonal_degree": deg,
+                "start_rule": cfg.start_rule,
+                "objects": [r["norad_id"] for r in results],
                 "brahe": bh.__version__,
                 "provenance": T.orekit_provenance(),
                 "rows": results,
