@@ -39,7 +39,11 @@ space-weather foresight would add.
 - SGP4 TEME output converted with astropy (`src/orbit_correction/frames.py`); EOP pinned via
   `astropy-iers-data`.
 - Residual targets: curvilinear RTN, cheap minus truth, in the frame of the SGP4 state
-  (definition in `types.py`).
+  (definition in `types.py`, code in `residuals.py`).
+- SGP4 Julian dates count every UTC day as 86,400 s; `frames.satrec_epoch_to_tt_seconds`
+  reads them that way (midnight plus seconds), so epochs on leap-second days are exact.
+- Geodetic altitudes (the 120 km floor) are WGS-84, matching the truth propagator's body
+  shape, although SGP4 itself uses WGS-72 constants.
 
 ## Splits
 
@@ -83,7 +87,9 @@ through its Python bindings; the theory and the propagation code are the library
   out-of-range elements, 6 decayed: radius under one Earth radius) and nothing after; each
   object carries a status. Truncated and empty propagations are counted, not dropped
   silently. SGP4's decay flag only fires at one Earth radius, so states just before it can be
-  far below any physical altitude.
+  far below any physical altitude; the wrapper therefore also truncates before the first
+  state below a 120 km geodetic altitude, the truth propagator's re-entry altitude (status
+  code -1, `altitude_floor`).
 - Frames: TEME -> GCRF with the exact astropy chain or an interpolated rotation
   (`frames.teme_to_gcrf_fast`, the default in the wrapper): exact rotations at nodes every
   6 h in TT, degree-5 Lagrange interpolation. Against the exact path over 7 days at 60 s it
@@ -192,7 +198,49 @@ configuration in `config/truth.toml`). The settings below define it; they were d
 
 ## Residual dataset
 
-_To be written (build step 3)._
+`src/orbit_correction/residuals.py`, configuration in `config/residuals.toml` (bins and
+horizon grid pending approval). Contract: `RESIDUAL_SCHEMA` in `types.py`.
+
+- **Window.** One element set, propagated from its epoch (the prediction start in v1) by
+  SGP4 and by truth on the same TT instants, `epoch + dt_s`. The row builder refuses a
+  trajectory whose times differ from those by any amount, so the two propagators are
+  never compared at different instants.
+- **Targets.** The curvilinear RTN residual, cheap minus truth, in the frame of the SGP4
+  state (definition in `types.py`): R is the difference of radii, T the along-track angle
+  times the SGP4 radius, N the out-of-plane angle times the SGP4 radius. Because T is an
+  arc, a large along-track error does not leak into R: a 1,045 km along-track error at
+  342 km altitude shows up as about 81 km of spurious radial error in rectilinear RTN and
+  none here. At small separations the two agree to `s^2 / (2 r)`. The inverse rebuilds a
+  position from the SGP4 state and (R, T, N); it is how a model's prediction becomes a
+  corrected position in screening. Round trip on 20,000 random LEO states (e up to 0.3,
+  along-track up to 2,000 km): 8e-12 km.
+- **Domain.** The along-track angle is defined modulo a full turn, so the conversion
+  refuses angles above pi/2 (about 10,500 km of along-track error in LEO) rather than
+  wrap; it also refuses truth positions more than pi/4 out of the SGP4 orbit plane and
+  SGP4 states with (near-)radial velocity. These limits are far from any measured residual
+  and are pending a decision.
+- **Features.** The element set's mean elements, B* and mean-motion derivative; the four
+  start-of-prediction space-weather values (see Model inputs). The `obs_*` columns, when
+  computed, take each row's UTC day from OBSERVED rows only; a day without an observed row
+  stays null.
+- **Labels.** Altitude band from the element set's perigee altitude (proposed edges 250,
+  400, 600, 800, 1,200 and 2,000 km); solar-activity bin from the trailing 81-day observed
+  F10.7 mean known at the start (proposed edges 90 and 150 sfu; a missing mean is labeled
+  `unknown`). Both are constant over a window.
+- **Horizon grid.** Proposed: 100 log-spaced horizons from 60 s to 7 days plus 100 evenly
+  spaced every 6,048 s, rounded to whole seconds: 199 rows per window, about 41 kB in
+  memory and 7.7 kB as zstd Parquet. Dense early horizons follow the fast initial growth of
+  the residual; the uniform part covers the screening window evenly. dt = 0 is left out.
+- **Drop rule (120 km).** One 120 km geodetic floor for both propagators: truth stops and
+  returns `reentry`; SGP4 is truncated before its first state below 120 km (WGS-84 altitude
+  from the TEME position, within 3.5 cm of Orekit's). A window gives no rows if truth
+  returned `reentry` or `error`, or SGP4 stopped early for any reason (its own error codes
+  or the floor). Dropped windows keep their altitude band and solar bin and are counted by
+  status (`count_windows`), so the drop rate by stratum is reported, never hidden.
+
+Measured on six fixture objects moved to 2024-06-15 (solar maximum): the residual at 60 s
+is 1.8-2.8 m (the start-rule offset), and the 7-day along-track residual runs from 9.7 km
+(770 km altitude) to 963 km (355 km), with R and N within a few km.
 
 ## Models
 
