@@ -44,20 +44,37 @@ sub-intervals of length h/m. At every sub-sample time u the positions of all
 objects go into a k-d tree (:class:`scipy.spatial.cKDTree`), and all pairs
 closer than a search radius R(u) are listed. The search radius is
 
-    R(u) = D_local(u) + V * h / (2 m) + 1 m,
+    R(u) = D_local(u) + V(u) * h / (2 m) + 1 m,
 
-where D_local(u) is the largest threshold over the two sub-intervals touching
-u, and V bounds the relative speed of any pair. The bound is the triangle
-inequality: |v_rel| <= |v_1| + |v_2| <= 2 max|v|, with max|v| taken from the
-samples themselves and increased by (mu / r_min^2) * h/2 to cover speed changes
-between samples. A minimum at time t* lies within h/(2m) of a sub-sample time,
-and over that time the pair can close by at most V * h/(2m). So any interval
-containing a range minimum under the threshold is guaranteed to put the pair in
-the candidate list at the nearest sub-sample. For LEO, V comes out at about
-16 km/s, above the 15 km/s the screening problem needs. Nothing is assumed
-about the encounter geometry. The threshold must not peak between sub-samples;
-any threshold that is monotone between sub-samples satisfies this (a constant,
-a smooth ramp, or steps).
+where D_local(u) is the largest threshold at u and its two neighbouring
+sub-samples, and V(u) bounds the relative speed of any pair on the intervals
+touching u.
+
+*The speed bound* comes from the interpolant itself, not from the physics. On
+an interval, the Hermite cubic of one object is a Bezier curve with control
+points r_k, r_k + h v_k / 3, r_{k+1} - h v_{k+1} / 3, r_{k+1}. Its velocity is a
+quadratic Bezier curve with control points v_k, 3 (r_{k+1} - r_k) / h - v_k -
+v_{k+1} and v_{k+1}, and a Bezier curve stays inside the convex hull of its
+control points. So on that interval the object's interpolated speed is at most
+B = max(|v_k|, |3 (r_{k+1} - r_k) / h - v_k - v_{k+1}|, |v_{k+1}|). For a pair,
+|v_rel| <= B_1 + B_2, so V on interval k is the sum of the two largest B over
+all objects. This holds for any sequence of states, including ones whose
+velocities do not match their positions (for example corrected positions kept
+with SGP4 velocities). On synthetic LEO catalogs with consistent states V is
+15.0-16.1 km/s (the previous bound, 2 x (largest sampled speed + a speed-change
+margin), gave 15.5-16.6).
+
+*Why nothing is skipped.* A minimum at time t* lies within h/(2m) of a
+sub-sample time u, in an interval touching u, and over that time the pair can
+close by at most V(u) * h/(2m). So any interval containing a range minimum
+under the threshold puts the pair in the candidate list at the nearest
+sub-sample, at any relative speed. Nothing is assumed about the encounter
+geometry. The threshold must not peak between sub-samples: D_local(u) covers
+the threshold at u and its neighbours, not in between. Any threshold that is
+monotone between sub-samples satisfies this (a constant, a smooth ramp, or
+steps). A threshold with a narrow bump between sub-samples can lose the event
+under the bump without warning; sample such a threshold more finely
+(``substeps``) or widen the bump.
 
 *Refinement.* Each candidate (pair, interval) first gets a cheap, rigorous lower
 bound on its range over the interval: the distance from the origin to the chord
@@ -82,9 +99,10 @@ O(n log n + P), where P is the number of pairs inside R(u). For objects spread
 through a LEO shell, P grows as n^2 R^3. Total time is O(N m (n log n + P)) for
 N samples. More sub-steps shrink R (and P as R^3) but add tree builds; the
 benchmark in ``scripts/benchmark_screening.py`` sets the default. Memory: the
-trajectories themselves (n N 48 bytes: 0.97 GB for 2,000 objects over 7 days at
-60 s), plus one time chunk of stacked states (``chunk_steps`` x n x 48 bytes)
-and the candidate arrays for that chunk. The engine never builds an
+trajectories themselves (n N 56 bytes: position, velocity and each trajectory's
+own time array; 0.565 MB = 0.538 MiB per object over 7 days at 60 s, 1.13 GB for
+2,000 objects), plus one time chunk of stacked states (``chunk_steps`` x n x 48
+bytes) and the candidate arrays for that chunk. The engine never builds an
 n^2 x N array.
 
 The classical filters (Hoots, Crawford and Roehrich 1984, as described by
@@ -108,15 +126,30 @@ scalar: for a horizon-dependent threshold pass its maximum over the window.
   the two orbit ellipses exceeds threshold + pad, at every sample time given
   (Woodburn samples start, middle and end). The path distance starts at the two
   relative-node points and is refined by damped Newton iteration (Hoots'
-  method). Near-coplanar pairs are always kept, because the node line is
-  undefined there.
+  method). Pairs are always kept when they are near-coplanar (the node line is
+  undefined) or when the mutual inclination is small relative to the
+  eccentricities (sin I < 1.5 (e1 + e2), where Newton from the nodes can settle
+  on a local minimum and overstate the distance).
 * **Time filter**: prune if, over the window, the times when object 1 lies
   within threshold + pad of object 2's orbit plane never overlap the times when
   object 2 lies within threshold + pad of object 1's plane, near the same
   relative node. Windows are computed analytically from the elements
-  (two-body plus optional J2 secular rates). The geometry is recomputed every
-  ``segment_s`` (a simple version of Woodburn's "rectification"), and a time
-  pad widens every window.
+  (two-body plus optional J2 secular rates). The geometry is recomputed from
+  the same elements every ``segment_s`` and held fixed within each segment, and
+  a time pad widens every window.
+
+What the filters lose with exact elements. With pure two-body motion, none of
+the three loses an encounter at zero pad. With J2 secular drift, the elements
+still describe the motion exactly, but over 7 days the orbit-path filter
+(sampled at the start, middle and end) and the time filter (3,600 s segments)
+both lose a few encounters at zero pad, because the geometry changes between
+samples or within a segment. An independent review measured this on several
+synthetic catalogs: for example 1 of 33 events at 5 km on this module's
+generator for each filter, and 16 of 67 (orbit path) and 7 of 67 (time filter)
+at 5 km on a 60 km thick shell with e <= 0.02. Some orbit-path losses persist
+at a 30 km pad; the time-filter losses went away with 2-10 km of distance pad
+or a 10 s time pad. The committed test of exact elements covers 1 day only. Losses from what the
+elements leave out (drag, short-period terms) come on top of these.
 
 Hoots et al. (1984) is paywalled; the implementations follow the later
 descriptions above, and where they differ the docstrings say so.
@@ -151,9 +184,13 @@ J2_EARTH = 1.08262668e-3
 DAY_S = 86400.0
 #: TCA horizons (s) for nested recall: 1, 3 and 7 days (planning package section 5).
 DEFAULT_HORIZONS_S = (1.0 * DAY_S, 3.0 * DAY_S, 7.0 * DAY_S)
+#: Orbit-path filter: pass a pair through when sin(mutual inclination) is below this
+#: multiple of e1 + e2 (see :func:`orbit_path_distance`).
+ECCENTRIC_COPLANAR_FACTOR = 1.5
 
 _TWO_PI = 2.0 * math.pi
-#: Margin added to the search radius for interpolation error and rounding (km).
+#: Margin added to the search radius and the interval bound for floating-point rounding (km).
+#: The events are those of the interpolant, so interpolation error needs no margin here.
 _INTERP_MARGIN_KM = 1e-3
 #: Number of sub-intervals on which the range-rate polynomial is sampled.
 _ROOT_GRID = 16
@@ -214,8 +251,9 @@ class SphericalThreshold:
             to the threshold in km, element-wise. A truth screen passes d_truth;
             a cheap screen passes d_truth + pad(tau).
 
-    The engine evaluates the callable at sub-sample times and assumes it does not
-    peak between them (see the module docstring).
+    The engine evaluates the callable at sub-sample times for the search, and at
+    TCA for acceptance. It assumes the callable does not peak between sub-samples
+    (see the module docstring and :func:`screen`).
     """
 
     radius_km: float | Callable[[np.ndarray], np.ndarray]
@@ -406,7 +444,8 @@ class ScreeningResult:
         events: event table (:data:`EVENT_SCHEMA`).
         stats: counts and costs: ``wall_s`` (whole call), ``search_s`` (k-d tree
             phase), ``refine_s``, ``n_objects``, ``n_samples``, ``step_s``,
-            ``substeps``, ``rel_speed_bound_km_s``, ``search_radius_km_min`` /
+            ``substeps``, ``rel_speed_bound_km_s`` (largest per-interval V) and
+            ``rel_speed_bound_km_s_min``, ``search_radius_km_min`` /
             ``_max``, ``n_candidate_intervals`` (unique pair-intervals listed by
             the search), ``n_refined_intervals`` (left after the convex-hull
             bound), ``n_minima`` (range minima found) and ``n_events``.
@@ -473,7 +512,12 @@ def screen(
         trajectories: :class:`Trajectory` objects with identical, uniformly spaced
             ``t_tt_s`` grids (60 s in practice) and unique NORAD IDs.
         threshold: km. A number, a callable of ``tau_s`` (seconds from
-            ``epoch_tt_s``) or a :class:`ScreeningVolume`.
+            ``epoch_tt_s``) or a :class:`ScreeningVolume`. The search samples it
+            only at sub-sample times (every h / ``substeps``), so it must not
+            peak between them: an event under a narrow bump in the threshold
+            between two sub-samples can be missed, with no warning. Constants,
+            ramps, steps and other thresholds that are monotone between
+            sub-samples are safe. Acceptance uses the threshold at TCA.
         epoch_tt_s: screening epoch from which ``tau_s`` is counted. Default: the
             first grid time.
         window_tt_s: keep only events with TCA in [start, end] (inclusive).
@@ -500,10 +544,6 @@ def screen(
     epoch = float(t[0]) if epoch_tt_s is None else float(epoch_tt_s)
     win_lo, win_hi = (float(t[0]), float(t[-1])) if window_tt_s is None else map(float, window_tt_s)
 
-    # Relative-speed bound V (module docstring): 2 * (max sampled speed + a_max h/2).
-    vmax = max(float(np.max(np.linalg.norm(tr.v_gcrf_km_s, axis=1))) for tr in trajectories)
-    rmin = min(float(np.min(np.linalg.norm(tr.r_gcrf_km, axis=1))) for tr in trajectories)
-    v_bound = 2.0 * (vmax + MU_EARTH_KM3_S2 / rmin**2 * h / 2.0) * 1.001
     m = int(substeps)
     sub_h = h / m
 
@@ -511,6 +551,7 @@ def screen(
     out: list[tuple[np.ndarray, ...]] = []
     n_cand = n_refined = n_minima = 0
     r_min_seen, r_max_seen = math.inf, 0.0
+    v_min_seen, v_max_seen = math.inf, 0.0
     search_s = refine_s = 0.0
 
     for k0 in range(0, n_int, chunk_steps):
@@ -518,6 +559,17 @@ def screen(
         L = k1 - k0
         R = np.stack([tr.r_gcrf_km[k0 : k1 + 1] for tr in trajectories], axis=1)  # (L+1, n, 3)
         V = np.stack([tr.v_gcrf_km_s[k0 : k1 + 1] for tr in trajectories], axis=1)
+
+        # Relative-speed bound per interval (module docstring): each object's
+        # interpolated speed is at most the largest control point of its velocity
+        # curve; a pair's relative speed is at most the sum of the two largest.
+        v_ctrl = np.linalg.norm(3.0 * (R[1:] - R[:-1]) / h - V[:-1] - V[1:], axis=2)  # (L, n)
+        v_end = np.linalg.norm(V, axis=2)  # (L+1, n)
+        b_obj = np.maximum(np.maximum(v_end[:-1], v_end[1:]), v_ctrl)
+        top2 = -np.partition(-b_obj, 1, axis=1)[:, :2]
+        v_int = top2.sum(axis=1)  # (L,)
+        v_min_seen = min(v_min_seen, float(v_int.min()))
+        v_max_seen = max(v_max_seen, float(v_int.max()))
 
         # Threshold at every sub-sample, the local maximum around each, and per interval.
         n_sub = L * m + 1
@@ -527,7 +579,11 @@ def screen(
         b_loc = b_sub.copy()
         b_loc[1:] = np.maximum(b_loc[1:], b_sub[:-1])
         b_loc[:-1] = np.maximum(b_loc[:-1], b_sub[1:])
-        radius = b_loc + v_bound * sub_h / 2.0 + _INTERP_MARGIN_KM
+        # Speed bound over the intervals each sub-sample registers to (see below):
+        # interval (j - 1) // m and interval j // m, where they exist in this chunk.
+        v_loc = np.maximum(v_int[np.minimum(jj // m, L - 1)],
+                           v_int[np.maximum((jj - 1) // m, 0)])
+        radius = b_loc + v_loc * sub_h / 2.0 + _INTERP_MARGIN_KM
         r_min_seen = min(r_min_seen, float(radius.min()))
         r_max_seen = max(r_max_seen, float(radius.max()))
         b_int = np.maximum(b_sub[:-1].reshape(L, m).max(axis=1), b_sub[m::m])
@@ -611,7 +667,8 @@ def screen(
         "n_samples": int(t.size),
         "step_s": h,
         "substeps": m,
-        "rel_speed_bound_km_s": v_bound,
+        "rel_speed_bound_km_s": v_max_seen if math.isfinite(v_min_seen) else float("nan"),
+        "rel_speed_bound_km_s_min": v_min_seen if math.isfinite(v_min_seen) else float("nan"),
         "search_radius_km_min": r_min_seen if math.isfinite(r_min_seen) else float("nan"),
         "search_radius_km_max": r_max_seen,
         "n_candidate_intervals": int(n_cand),
@@ -1155,6 +1212,7 @@ def orbit_path_distance(
     el2: KeplerElements,
     *,
     coplanar_tol_rad: float = 1e-3,
+    eccentric_coplanar_factor: float = ECCENTRIC_COPLANAR_FACTOR,
     iterations: int = 30,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Minimum distance (km) between orbit paths, element-wise over two aligned element sets.
@@ -1163,12 +1221,29 @@ def orbit_path_distance(
     relative-node points (exact for circular orbits) and refine each with a
     damped Newton iteration on |X1(E1) - X2(E2)|^2 in the eccentric anomalies.
     The smaller of the two results is returned. Converges to a local minimum
-    next to a node; for moderately eccentric orbits the global minimum can lie
-    elsewhere, which is one of the filter's known weaknesses.
+    next to a node.
+
+    When the planes are close compared with the eccentricities, the closest
+    point of the paths need not be near a node. Near-circular orbits a fraction
+    of a degree apart are separated mostly by the in-plane radial difference,
+    which varies by up to about a (e1 + e2) around the orbit, while the
+    out-of-plane separation is only about a sin I. Newton from the nodes then
+    settles on a local minimum and can overstate the distance by hundreds of km
+    (Woodburn et al. note the same weakness). Such pairs are not trusted: where
+    ``sin I < eccentric_coplanar_factor * (e1 + e2)`` the pair is passed through
+    with distance 0. The default factor, 1.5, comes from a sweep against a
+    global search (grid plus BFGS) over about 5,700 LEO pairs with q 6,900-7,300
+    km, e up to 0.05 and I from 0.06 to 10 deg: Newton from the nodes overstated
+    the distance by more than 1 m only below sin I / (e1 + e2) = 0.83, and in none
+    of about 4,200 pairs at a ratio of 1 or above. The pass-through costs about
+    0.01% of pairs on :func:`synthetic_leo_elements` and 14-21% of the pairs
+    inside a tight cluster of similar planes. Setting the factor to 0 restores
+    the plain Hoots behaviour.
 
     Returns:
-        (distance_km, coplanar): coplanar is True where the mutual inclination is
-        below ``coplanar_tol_rad``; the distance there is 0, so the pair is kept.
+        (distance_km, passed): passed is True where the pair is kept without a
+        distance, because the mutual inclination is below ``coplanar_tol_rad``
+        or below the eccentricity rule above; the distance there is 0.
     """
     P1, Q1, W1 = _perifocal_axes(el1.raan_rad, el1.i_rad, el1.argp_rad)
     P2, Q2, W2 = _perifocal_axes(el2.raan_rad, el2.i_rad, el2.argp_rad)
@@ -1178,6 +1253,7 @@ def orbit_path_distance(
     hhat = K / np.where(coplanar, 1.0, sin_i)[:, None]
     a1, e1, b1 = el1.a_km, el1.e, el1.a_km * np.sqrt(1 - el1.e**2)
     a2, e2, b2 = el2.a_km, el2.e, el2.a_km * np.sqrt(1 - el2.e**2)
+    passed = coplanar | (sin_i < float(eccentric_coplanar_factor) * (e1 + e2))
 
     def X(a, e, b, P, Q, E):
         return (a * (np.cos(E) - e))[:, None] * P + (b * np.sin(E))[:, None] * Q
@@ -1237,7 +1313,7 @@ def orbit_path_distance(
             E1, E2, f = newE1, newE2, newf
         best = np.minimum(best, f)
     dist = np.sqrt(np.maximum(best, 0.0))
-    return np.where(coplanar, 0.0, dist), coplanar
+    return np.where(passed, 0.0, dist), passed
 
 
 def orbit_path_filter(
@@ -1249,6 +1325,7 @@ def orbit_path_filter(
     j2: bool = True,
     prior: PairMask | None = None,
     coplanar_tol_rad: float = 1e-3,
+    eccentric_coplanar_factor: float = ECCENTRIC_COPLANAR_FACTOR,
 ) -> FilterResult:
     """Orbit-path (geometric) filter: prune pairs whose orbit paths stay far apart.
 
@@ -1264,13 +1341,16 @@ def orbit_path_filter(
 
     The path-to-path distance is computed at every sample
     (:func:`orbit_path_distance`), and a pair is kept if it is within
-    ``threshold_km + pad_km`` at any sample, or if the orbits are near-coplanar.
-    Works from elements.
+    ``threshold_km + pad_km`` at any sample, or if :func:`orbit_path_distance`
+    passes it through (near-coplanar, or a small mutual inclination compared
+    with the eccentricities). Works from elements.
 
     Known misses (Woodburn et al. 2009; Alfano and Finkleman 2013): the path
     distance changes between samples (precession, drag), and a pad alone does not
-    remove every miss. Woodburn recommends not using this filter; it is here as
-    the classical baseline.
+    remove every miss. With exact elements and J2 secular drift, start, middle
+    and end sampling over 7 days still loses a few encounters at zero pad, and
+    some at a 30 km pad (module docstring). Woodburn recommends not using this
+    filter; it is here as the classical baseline.
     """
     t0 = time.perf_counter()
     if isinstance(elements, KeplerElements):
@@ -1299,7 +1379,8 @@ def orbit_path_filter(
             if not todo.any():
                 break
             dist, _ = orbit_path_distance(el.take(i[todo]), el.take(j[todo]),
-                                          coplanar_tol_rad=coplanar_tol_rad)
+                                          coplanar_tol_rad=coplanar_tol_rad,
+                                          eccentric_coplanar_factor=eccentric_coplanar_factor)
             k[np.flatnonzero(todo)] = dist <= d
         keep[blk] = k
     return FilterResult(
@@ -1309,7 +1390,8 @@ def orbit_path_filter(
         int(lin.size - np.count_nonzero(keep)),
         {"threshold_km": float(threshold_km), "pad_km": float(pad_km), "j2": j2,
          "sample_times_tt_s": times,
-         "coplanar_tol_rad": coplanar_tol_rad},
+         "coplanar_tol_rad": coplanar_tol_rad,
+         "eccentric_coplanar_factor": float(eccentric_coplanar_factor)},
         time.perf_counter() - t0,
     )
 
@@ -1333,27 +1415,37 @@ def time_filter(
     orbit's plane. Being within ``d = threshold_km + pad_km`` of the other object
     requires both objects to be within d of the other's plane, near the same node
     direction, at the same time. With r bounded below by the perigee radius q,
-    the angle window around each node is ``|sin theta| <= d / (q sin I)``. This is
-    a superset of the true condition, so the proxy never prunes an encounter the
-    elements describe correctly (Woodburn et al. 2009, figure 8).
+    the angle window around each node is ``|sin theta| <= d / (q sin I)``. For
+    fixed planes this is a superset of the true condition (Woodburn et al. 2009,
+    figure 8), so with two-body motion and exact elements the proxy never prunes
+    a real encounter.
 
     Each window is turned into a time interval with Kepler's equation from the
     elements (two-body, plus J2 secular rates if ``j2``), repeated every
     anomalistic period, and widened by ``time_pad_s`` on each side. The geometry
-    (planes, node line, phase) is recomputed at the middle of every segment of
-    ``segment_s``. That is a simple version of Woodburn's "trust but verify"
-    rectification; Hoots' original propagates one relative nodal period from the
-    middle of the window. A pair is kept if any of its intervals overlap at
-    either node, or if the orbits are near-coplanar, or if one object is always
-    within d of the other's plane.
+    (planes, node line, phase) is recomputed from the same elements at the middle
+    of every segment of ``segment_s`` and held fixed within the segment. This
+    resembles the rectification Woodburn describes, but it only re-evaluates the
+    elements; it does not check them against the trajectory. Hoots' original
+    propagates one relative nodal period from the middle of the window. A pair
+    is kept if any of its intervals overlap at either node, or if the orbits are
+    near-coplanar, or if one object is always within d of the other's plane.
 
     Works from elements: mean elements for element-set objects (osculating
     semimajor axes have J2 short-period swings of about 10 km in LEO, which
     corrupt the mean motion and the predicted timing).
 
-    Known misses: timing error the elements don't model, chiefly drag, which
-    shortens the period and accumulates along-track drift through the window.
-    The time pad (or a large distance pad) has to cover it.
+    Known misses:
+
+    * Geometry frozen within a segment. With J2 secular drift the planes and
+      perigees move during each segment, so even exact elements lose a few
+      encounters at zero pad over 7 days with 3,600 s segments (module
+      docstring). Shorter segments reduce the losses without removing them;
+      2-10 km of distance pad or a 10 s time pad removed them in the review's
+      catalogs.
+    * Timing error the elements don't model, chiefly drag, which shortens the
+      period and accumulates along-track drift through the window. The time pad
+      (or a large distance pad) has to cover it.
     """
     t0 = time.perf_counter()
     ids = elements.norad_id

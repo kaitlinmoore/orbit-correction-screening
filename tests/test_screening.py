@@ -119,6 +119,85 @@ def kepler_pos(el):
     return lambda tt: S.states_from_elements(el, tt)[0][0]
 
 
+def poly_traj(nid, base, coeffs, tc, t) -> Trajectory:
+    """Polynomial motion r(t) = base + sum_p coeffs[p] (t - tc)^p, with its exact velocity.
+
+    Cubic Hermite interpolation reproduces polynomials up to degree 3 exactly, so
+    the engine sees exactly this motion between samples.
+    """
+    tau = (t - tc)[:, None]
+    r = np.broadcast_to(np.asarray(base, float), (t.size, 3)).copy()
+    v = np.zeros((t.size, 3))
+    for p, c in enumerate(coeffs):
+        c = np.asarray(c, float)
+        r = r + c * tau**p
+        if p:
+            v = v + p * c * tau ** (p - 1)
+    return Trajectory(nid, t, r, v, "synthetic")
+
+
+def hermite_positions(r, v, t, idx, tt):
+    """Cubic Hermite interpolant of sampled states at times ``tt``, written out here
+    independently of the engine, as the reference curve for dense-sampling checks.
+
+    ``r``, ``v``: (n_objects, n_samples, 3) on the uniform grid ``t``; ``idx``: object
+    index per time (broadcast against ``tt``). Returns positions, shape tt.shape + (3,).
+    """
+    h = t[1] - t[0]
+    idx, tt = np.broadcast_arrays(np.asarray(idx), np.asarray(tt, float))
+    k = np.clip(np.floor((tt - t[0]) / h).astype(np.int64), 0, t.size - 2)
+    s = ((tt - t[k]) / h)[..., None]
+    h00, h10 = 2 * s**3 - 3 * s**2 + 1, s**3 - 2 * s**2 + s
+    h01, h11 = -2 * s**3 + 3 * s**2, s**3 - s**2
+    return (h00 * r[idx, k] + h10 * h * v[idx, k] + h01 * r[idx, k + 1]
+            + h11 * h * v[idx, k + 1])
+
+
+def dense_reference_events(trajs, threshold, *, epoch_tt_s, dense_step=1.0):
+    """All-pairs reference screen by brute force: no k-d tree, no speed bound, no
+    interval bound. Every pair's range on the Hermite curves every ``dense_step``
+    seconds; every discrete local minimum refined by golden-section search on the range
+    within one dense step either side; kept if the miss distance is within
+    ``threshold(tau)`` at its TCA. Returns sorted (id_1, id_2, tca, miss) tuples."""
+    t = trajs[0].t_tt_s
+    r = np.stack([tr.r_gcrf_km for tr in trajs])
+    v = np.stack([tr.v_gcrf_km_s for tr in trajs])
+    ids = np.array([tr.norad_id for tr in trajs])
+    n = len(trajs)
+    tt = np.arange(t[0], t[-1] + dense_step / 2, dense_step)
+    pos = np.stack([hermite_positions(r, v, t, i, tt) for i in range(n)])
+    d_tt = threshold(tt - epoch_tt_s)
+    ci, cj, ck = [], [], []
+    for i in range(n - 1):
+        d = np.linalg.norm(pos[i + 1 :] - pos[i][None], axis=2)  # (n - i - 1, T)
+        jj, kk = np.nonzero((d[:, 1:-1] <= d[:, :-2]) & (d[:, 1:-1] < d[:, 2:]))
+        kk = kk + 1
+        near = d[jj, kk] <= d_tt[kk] + 1.0  # cheap pre-filter; the exact test is below
+        ci.append(np.full(near.sum(), i))
+        cj.append(i + 1 + jj[near])
+        ck.append(kk[near])
+    ci, cj, ck = (np.concatenate(x) for x in (ci, cj, ck))
+
+    def rng_(x):
+        tq = tt[ck] + x
+        return np.linalg.norm(hermite_positions(r, v, t, cj, tq)
+                              - hermite_positions(r, v, t, ci, tq), axis=-1)
+
+    g = (math.sqrt(5.0) - 1.0) / 2.0
+    lo, hi = np.full(ck.size, -dense_step), np.full(ck.size, dense_step)
+    for _ in range(80):
+        c, e = hi - g * (hi - lo), lo + g * (hi - lo)
+        left = rng_(c) < rng_(e)
+        hi, lo = np.where(left, e, hi), np.where(left, lo, c)
+    x = 0.5 * (lo + hi)
+    tca, miss = tt[ck] + x, rng_(x)
+    ok = miss <= threshold(tca - epoch_tt_s)
+    a, b = ids[ci[ok]], ids[cj[ok]]
+    out = zip(np.minimum(a, b).tolist(), np.maximum(a, b).tolist(), tca[ok].tolist(),
+              miss[ok].tolist(), strict=True)
+    return sorted(out, key=lambda e: (e[2], e[0], e[1]))
+
+
 # --------------------------------------------------------------------------------------
 # Engine: straight lines
 # --------------------------------------------------------------------------------------
@@ -316,6 +395,158 @@ def test_accuracy_random_encounters():
           f"max |dmiss| = {max(dmiss) * 1e3:.3f} m")
     assert max(dtca) < 1e-3
     assert max(dmiss) < 1e-3
+
+
+def test_minimum_where_the_chord_misses_the_threshold():
+    """The interval bound must allow for curvature: here the straight chord between the two
+    samples stays 5.6 km from the other object, but the curved relative path dips to 2 km
+    (relative motion x = u tau, y = 2 + 0.004 tau^2 km, TCA mid-interval)."""
+    t = grid(2400.0)
+    tc = T0 + 1230.0
+    a = poly_traj(1, [7000.0, 0, 0], [], tc, t)
+    b = poly_traj(2, [7000.0, 0, 0], [[0, 2.0, 0], [0, 0, 1.0], [0, 0.004, 0]], tc, t)
+    ev = S.screen([a, b], 5.0).events.to_pylist()
+    assert len(ev) == 1
+    assert ev[0]["tca_tt_s"] == pytest.approx(tc, abs=1e-6)
+    assert ev[0]["miss_km"] == pytest.approx(2.0, abs=1e-9)
+
+
+def test_three_minima_in_one_interval():
+    """Relative motion x = k tau (tau^2 - a^2), 1 km offset: range minima at tau = -15, 0
+    and +15 s, all inside the interval [1200, 1260] s, with range maxima between them."""
+    k, a_s = 1e-4, 15.0
+    t = T0 + 1080.0 + np.arange(0.0, 301.0, STEP)
+    tc = T0 + 1230.0
+    a = poly_traj(1, [7000.0, 0, 0], [], tc, t)
+    b = poly_traj(2, [7000.0, 1.0, 0], [[0, 0, 0], [-k * a_s**2, 0, 0], [0, 0, 0], [k, 0, 0]],
+                  tc, t)
+    ev = S.screen([a, b], 5.0).events
+    np.testing.assert_allclose(ev.column("tca_tt_s").to_numpy() - tc, [-15.0, 0.0, 15.0],
+                               atol=1e-6)
+    np.testing.assert_allclose(ev.column("miss_km").to_numpy(), 1.0, atol=1e-9)
+
+
+def test_ramp_threshold_is_applied_at_tca_not_at_the_interval_maximum():
+    """A steep ramp: 1.5 km at TCA (mid-interval), 3 km at the interval's end. A 1.4 km
+    miss is an event; a 2 km miss is not, although it is under the interval maximum."""
+    t = grid(2400.0)
+    tc = T0 + 1230.0
+
+    def ramp(tau):
+        return np.clip(1.5 + 0.05 * (np.asarray(tau) - 1230.0), 0.5, 3.0)
+
+    for miss, expect in ((1.4, 1), (2.0, 0)):
+        a = line_traj(1, [7000.0, 0, 0], [0, 7.5, 0], tc, t)
+        b = line_traj(2, [7000.0, 0, miss], [0, -7.5, 0], tc, t)
+        ev = S.screen([a, b], ramp).events
+        assert ev.num_rows == expect
+        if expect:
+            assert ev.column("threshold_km").to_numpy()[0] == pytest.approx(1.5, abs=1e-12)
+
+
+def test_step_threshold_search_uses_the_neighbouring_maximum():
+    """The search radius at a sub-sample must use the largest threshold at it and its
+    neighbours. A slow fly-by (relative speed V = 1 km/s exactly, so V h/4 = 15 km) with
+    a 17 km miss at TCA = 1231 s; the threshold steps from 1 km to 17.2 km at 1230.5 s,
+    just after the sub-sample at 1230 s. That sub-sample is 17.03 km from the event, the
+    next one (1260 s) 33.6 km: only the neighbouring maximum (17.2 + 15 km) reaches it."""
+    t = grid(2400.0)
+    tc = T0 + 1231.0
+    a = line_traj(1, [7000.0, 0, 0], [0, 0.5, 0], tc, t)
+    b = line_traj(2, [7000.0, 0, 17.0], [0, -0.5, 0], tc, t)
+
+    def step(tau):
+        return np.where(np.asarray(tau) < 1230.5, 1.0, 17.2)
+
+    res = S.screen([a, b], step)
+    assert res.stats["rel_speed_bound_km_s"] == pytest.approx(1.0, rel=1e-9)  # design check
+    ev = res.events.to_pylist()
+    assert len(ev) == 1
+    assert ev[0]["tca_tt_s"] == pytest.approx(tc, abs=1e-6)
+    assert ev[0]["threshold_km"] == 17.2
+
+
+def test_speed_bound_holds_when_velocities_do_not_match_positions():
+    """States whose velocities contradict their positions (true motion 7.5 km/s each,
+    stored velocity zero). The Hermite curve then moves at up to 1.5 times the chord
+    speed in mid-interval, faster than any sampled velocity. The search must still find
+    the minimum of the interpolant; the dense reference evaluates the same curves."""
+    t = grid(2400.0)
+    tc = T0 + 1218.0  # straight-line crossing at 30% of the interval
+    a = line_traj(1, [7000.0, 0, 0], [0, 7.5, 0], tc, t)
+    b = line_traj(2, [7000.0, 0, 2.0], [0, -7.5, 0], tc, t)
+    a0 = Trajectory(1, t, a.r_gcrf_km, np.zeros_like(a.r_gcrf_km), "synthetic")
+    b0 = Trajectory(2, t, b.r_gcrf_km, np.zeros_like(b.r_gcrf_km), "synthetic")
+    res = S.screen([a0, b0], 5.0)
+    ref = dense_reference_events([a0, b0], lambda tau: np.full(np.shape(tau), 5.0),
+                                 epoch_tt_s=T0, dense_step=0.5)
+    assert len(ref) == 1
+    ev = res.events.to_pylist()
+    assert len(ev) == 1
+    assert ev[0]["tca_tt_s"] == pytest.approx(ref[0][2], abs=1e-6)
+    assert ev[0]["miss_km"] == pytest.approx(ref[0][3], abs=1e-9)
+    assert res.stats["rel_speed_bound_km_s"] == pytest.approx(45.0, rel=1e-9)
+
+
+@pytest.mark.parametrize("substeps", [1, 2, 3])
+def test_speed_bound_covers_both_intervals_at_a_sample(substeps):
+    """At a sample time the search radius must use the speed bound of the interval before
+    it as well as the one after. B moves at 15 km/s, decelerates to rest during the
+    interval [1140, 1200] s (consistent states: v = 15, then 0) and stays at rest; it
+    passes 2 km from A, which is at rest, 24 s before the sample at 1200 s. With one
+    sub-step the only samples near TCA are 1140 s (475 km away, radius 455 km) and 1200 s
+    (125 km away): only the bound of the decelerating interval reaches it from there."""
+    h, w, k = STEP, 15.0, 20
+    t = T0 + np.arange(0.0, 2401.0, h)
+    before = np.arange(t.size) <= k - 1
+    y0 = -450.0
+    y_b = np.where(before, y0 + w * (t - t[k - 1]), y0 + 2 * h * w / 3)
+    zero = np.zeros(t.size)
+    r_b = np.stack([np.full(t.size, 7000.0), y_b, np.full(t.size, 2.0)], axis=1)
+    v_b = np.stack([zero, np.where(before, w, 0.0), zero], axis=1)
+    s_tca = 0.6  # fraction of the interval at TCA: y_b(s) = y0 + h w (s - s^3 / 3)
+    r_a = np.tile([7000.0, y0 + h * w * (s_tca - s_tca**3 / 3), 0.0], (t.size, 1))
+    a = Trajectory(1, t, r_a, np.zeros_like(r_a), "synthetic")
+    b = Trajectory(2, t, r_b, v_b, "synthetic")
+    ev = S.screen([a, b], 5.0, substeps=substeps).events.to_pylist()
+    assert len(ev) == 1
+    assert ev[0]["tca_tt_s"] == pytest.approx(t[k - 1] + s_tca * h, abs=1e-6)
+    assert ev[0]["miss_km"] == pytest.approx(2.0, abs=1e-9)
+
+
+def shell_catalog(n, seed):
+    """Objects in a 20 km thick shell at about 630 km altitude, near-circular, with
+    isotropic orbit normals, so head-on and crossing encounters both occur."""
+    rng = np.random.default_rng(seed)
+    q = rng.uniform(7000.0, 7020.0, n)
+    e = rng.uniform(0.0, 0.005, n)
+    return S.KeplerElements(np.arange(1, n + 1), np.full(n, T0), q / (1 - e), e,
+                            np.arccos(rng.uniform(-1, 1, n)), rng.uniform(0, 2 * np.pi, n),
+                            rng.uniform(0, 2 * np.pi, n), rng.uniform(0, 2 * np.pi, n))
+
+
+def test_all_pairs_regression_against_dense_sampling():
+    """Catalog-level check of the whole engine (search, interval bound, refinement,
+    threshold handling) against a brute-force screen of the same Hermite curves: 40
+    objects, 1 day, two-body plus J2 drift, a ramped threshold from 10 to 50 km. Every
+    event on each side must match one on the other."""
+    t = grid(DAY)
+    trajs = S.trajectories_from_elements(shell_catalog(40, 23), t, j2=True)
+
+    def ramp(tau):
+        return 10.0 + 40.0 * np.asarray(tau) / DAY
+
+    ref = dense_reference_events(trajs, ramp, epoch_tt_s=T0)
+    ev = S.screen(trajs, ramp).events
+    assert len(ref) >= 50
+    got = list(zip(ev.column("norad_id_1").to_pylist(), ev.column("norad_id_2").to_pylist(),
+                   ev.column("tca_tt_s").to_pylist(), ev.column("miss_km").to_pylist(),
+                   strict=True))
+    assert len(got) == len(ref)
+    for (ra, rb, rt, rm), (ea, eb, et, em) in zip(ref, got, strict=True):
+        assert (ra, rb) == (ea, eb)
+        assert et == pytest.approx(rt, abs=1e-4)
+        assert em == pytest.approx(rm, abs=1e-6)
 
 
 def test_window_and_keep_mask():
@@ -526,6 +757,69 @@ def test_orbit_path_distance_matches_brute_force():
     assert checked >= 25
 
 
+def _path_function(el, k):
+    P, Q, _ = S._perifocal_axes(el.raan_rad[k], el.i_rad[k], el.argp_rad[k])
+    a, ecc = el.a_km[k], el.e[k]
+    b = a * math.sqrt(1 - ecc**2)
+    return lambda x: (a * (np.cos(x) - ecc))[..., None] * P + (b * np.sin(x))[..., None] * Q
+
+
+def grid_path_distance(x1, x2, n_grid=360, n_best=6, zoom_steps=12):
+    """Independent search for the distance between two paths: a grid over both eccentric
+    anomalies, then repeated zooming around the best grid points. Every value it returns
+    is a distance between two real points of the paths, so it is an upper bound on the
+    true minimum whether or not it finds the global one."""
+    E = np.linspace(0, 2 * np.pi, n_grid, endpoint=False)
+    dd = np.linalg.norm(x1(E)[:, None, :] - x2(E)[None, :, :], axis=2)
+    best = math.inf
+    for flat in np.argsort(dd, axis=None)[:n_best]:
+        c1, c2, half = E[flat // n_grid], E[flat % n_grid], 2 * np.pi / n_grid
+        for _ in range(zoom_steps):
+            g = np.linspace(-half, half, 21)
+            d = np.linalg.norm(x1(c1 + g)[:, None, :] - x2(c2 + g)[None, :, :], axis=2)
+            i, j = np.unravel_index(np.argmin(d), d.shape)
+            c1, c2, half = c1 + g[i], c2 + g[j], half / 4
+        best = min(best, float(d.min()))
+    return best
+
+
+def test_orbit_path_near_coplanar_cluster_against_global_search():
+    """Pairs of similar planes (mutual inclination up to about 0.6 deg, e <= 0.02, perigees
+    within 10 km), where Newton from the relative nodes can settle on a local minimum.
+    Any pair whose paths come within d = 30 km by an independent search must be kept.
+    The plain Hoots rule (factor 0) wrongly prunes some of them; the pass-through rule
+    keeps them all."""
+    rng = np.random.default_rng(0)
+    n = 40
+    q1 = rng.uniform(7000, 7200, n)
+    q2 = q1 + rng.uniform(-10, 10, n)
+    e1, e2 = rng.uniform(0, 0.02, n), rng.uniform(0, 0.02, n)
+    inc = np.radians(rng.uniform(60, 100, n))
+    raan = rng.uniform(0, 2 * np.pi, n)
+    di, d_raan = np.radians(rng.uniform(-0.4, 0.4, n)), np.radians(rng.uniform(-0.5, 0.5, n))
+    el = S.KeplerElements(np.arange(1, 2 * n + 1), T0, np.r_[q1 / (1 - e1), q2 / (1 - e2)],
+                          np.r_[e1, e2], np.r_[inc, inc + di],
+                          np.r_[raan, np.mod(raan + d_raan, 2 * np.pi)],
+                          rng.uniform(0, 2 * np.pi, 2 * n), 0.0)
+    ea, eb = el.take(np.arange(n)), el.take(np.arange(n, 2 * n))
+    ref = np.array([grid_path_distance(_path_function(ea, k), _path_function(eb, k))
+                    for k in range(n)])
+    d = 30.0
+    close = ref <= d
+    new, passed = S.orbit_path_distance(ea, eb)
+    old, _ = S.orbit_path_distance(ea, eb, eccentric_coplanar_factor=0.0)
+    assert np.count_nonzero(close & (old > d)) >= 1  # the old behaviour loses pairs here
+    assert not np.any(close & (new > d))
+    # Where the distance is still trusted, it never exceeds a distance actually found.
+    assert np.all(new[~passed] <= ref[~passed] + 1e-6)
+    # The same through the filter, at threshold 5 km + pad 25 km.
+    pairs = np.r_[np.arange(n), np.arange(n)], np.r_[np.arange(n, 2 * n), np.arange(n, 2 * n)]
+    res = S.orbit_path_filter(el, [T0], threshold_km=5.0, pad_km=25.0, j2=False)
+    kept = res.mask.keep[S.pair_index(pairs[0][:n], pairs[1][:n], 2 * n)]
+    assert np.all(kept[close])
+    assert res.params["eccentric_coplanar_factor"] == S.ECCENTRIC_COPLANAR_FACTOR
+
+
 def test_orbit_path_filter_zero_pad_miss_and_adequate_pad(drag_crossing):
     """Documented miss: the path distance from window-start elements is 8 km, above the
     5 km threshold, but decay brings the paths together. A 3.5 km pad keeps the pair, and
@@ -589,10 +883,33 @@ def test_time_filter_keeps_exact_node_crossing():
                              j2=False).mask.keep[0]
 
 
-def test_filters_lose_nothing_when_elements_are_exact():
+def test_time_filter_keeps_a_pair_always_within_each_others_plane():
+    """Mutual inclination 1.7 deg: each object is never more than about 210 km from the
+    other's plane, inside d = 250 km, so the pair must be kept at every time. The window
+    is the 20 s around TCA, when both objects are near 89 deg from the relative node,
+    outside any node window an angle limit would give (arcsin of at most 1). A circular
+    orbit meets an e = 0.04 orbit there at 208 km."""
+    tm = T0 + 5000.0
+    t = T0 + np.arange(0.0, 3 * 3600.0 + 1, STEP)
+    e = 0.04
+    el = S.KeplerElements([1, 2], [tm, tm], [7000.0, 7000.0 / (1 - e * e)], [0.0, e],
+                          np.radians([50.0, 51.7]), [0.0, 0.0], [0.0, 0.0],
+                          [math.pi / 2, float(S.true_to_mean(math.pi / 2, e))])
+    trajs = S.trajectories_from_elements(el, t, j2=False)
+    truth = S.screen(trajs, 250.0).events
+    assert truth.num_rows == 1
+    tca = truth.column("tca_tt_s").to_numpy()[0]
+    assert truth.column("miss_km").to_numpy()[0] == pytest.approx(207.6, abs=0.1)
+    res = S.time_filter(el, (tca - 10.0, tca + 10.0), threshold_km=250.0, pad_km=0.0, j2=False)
+    assert res.mask.keep[0]
+
+
+def test_filters_keep_every_truth_pair_on_exact_elements_over_one_day():
     """On a synthetic catalog whose motion is exactly two-body plus J2 secular drift, the
-    elements describe the orbits perfectly. A/P and orbit-path filters at zero pad and the
-    time filter with a 1 km pad then keep every truth pair (sanity check of the geometry)."""
+    elements describe the orbits perfectly. Over 1 day, A/P and orbit-path filters at zero
+    pad and the time filter with a 1 km pad keep every truth pair (sanity check of the
+    geometry). Not a lossless guarantee: over 7 days the orbit-path and time filters lose
+    a few encounters at zero pad on such catalogs (module docstring)."""
     t = grid(DAY)
     el = S.synthetic_leo_elements(300, T0, seed=8)
     trajs = S.trajectories_from_elements(el, t, j2=True)
@@ -692,6 +1009,30 @@ def test_screening_metrics_empty_tables():
     assert sc.event_recall == 0.0 and sc.pair_recall == 0.0
 
 
+def test_screening_metrics_horizon_boundary_is_inclusive():
+    """An event with tau exactly 1 day counts in the 1-day horizon."""
+    ref = table([(1, 2, 1.0, 1.0), (1, 3, 2.0, 1.0)])
+    by = S.screening_metrics(ref, ref, tca_tol_s=1.0).recall_by_horizon
+    assert by[DAY]["n_events"] == 1 and by[DAY]["n_pairs"] == 1
+    assert by[3 * DAY]["n_events"] == 2
+
+
+def test_match_events_takes_the_nearest_of_two_candidates():
+    """Two candidates within tolerance of one reference event: the nearer one matches,
+    the other is a false alarm. With a second reference event between them, nearest-first
+    matching pairs each with its own nearest candidate."""
+    ref = table([(1, 2, 1.0, 1.0)])
+    cand = table([(1, 2, 1.0 + 8 / DAY, 1.0), (1, 2, 1.0 + 3 / DAY, 1.0)])
+    m = S.match_events(ref, cand, tca_tol_s=10.0)
+    tca_c = cand.column("tca_tt_s").to_numpy()
+    assert tca_c[m.ref_to_cand[0]] - ref.column("tca_tt_s").to_numpy()[0] == pytest.approx(3.0)
+    assert S.screening_metrics(ref, cand, tca_tol_s=10.0).false_alarm_events == 1
+    ref2 = table([(1, 2, 1.0, 1.0), (1, 2, 1.0 + 9 / DAY, 1.0)])
+    m2 = S.match_events(ref2, cand, tca_tol_s=10.0)
+    r_t = ref2.column("tca_tt_s").to_numpy()
+    np.testing.assert_allclose(np.abs(tca_c[m2.ref_to_cand] - r_t), [3.0, 1.0], atol=1e-4)
+
+
 def test_filter_metrics(ref_cand):
     ref, _ = ref_cand
     ids = [1, 2, 3, 4]
@@ -715,7 +1056,8 @@ def test_screening_result_reports_cost():
     b = line_traj(2, [7000.0, 0, 1], [0, -7.5, 0], T0 + 600, t)
     res = S.screen([a, b], 5.0)
     assert res.stats["wall_s"] > 0
-    assert res.stats["rel_speed_bound_km_s"] >= 15.0
+    # Control-polygon bound: exactly the 15 km/s closing speed for straight lines.
+    assert res.stats["rel_speed_bound_km_s"] == pytest.approx(15.0, rel=1e-9)
     sc = S.screening_metrics(res.events, res.events, tca_tol_s=0.0, wall_s=res.stats["wall_s"])
     assert sc.event_recall == 1.0 and sc.wall_s == res.stats["wall_s"]
     assert isinstance(res.events, pa.Table)
