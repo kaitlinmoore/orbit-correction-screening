@@ -25,10 +25,15 @@ build-backend = "uv_build"
 [tool.uv.build-backend]
 module-name = "orbit_correction"
 
+[tool.uv.sources]
+orekitdata = { git = "https://gitlab.orekit.org/orekit/orekit-data.git", rev = "2d6edc9118983d95c51303df05db16ada90b7ee2" }
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 markers = [
     "network: fetches from the internet; skipped unless ORBIT_NETWORK_TESTS=1",
+    "datagen: needs the datagen group (Orekit and a JVM); skipped without it",
+    "crosscheck: brahe cross-check; runs only with ORBIT_CROSSCHECK_TESTS=1",
 ]
 
 [tool.ruff]
@@ -39,8 +44,16 @@ target-version = "py312"
 select = ["E", "F", "W", "I", "B", "UP", "NPY"]
 
 [dependency-groups]
+crosscheck = [
+    "brahe>=1.9.0",
+]
+datagen = [
+    "orekit-jpype[jdk4py]>=13.1.9.0",
+    "orekitdata",
+]
 dev = [
     "ipykernel>=7.4.0",
+    "pymsis>=0.13.0",
     "pytest>=9.2.0",
     "ruff>=0.17.6",
 ]

@@ -35,11 +35,15 @@ How it works
    A training or dev row is ``excluded`` if its window reaches past the cutoff
    (so no training target lies at or after the cutoff), or if its window
    overlaps a validation event's exclusion window.
-3. **Data end.** A row of *any* role is ``excluded`` if its window ends after
-   the last fully observed space-weather day (the end of that UTC day). Past
-   it the space-weather file holds only forecasts, so truth propagated there
-   would be driven by predictions rather than measurements. The day comes
-   from :meth:`orbit_correction.spaceweather.SpaceWeather.last_fully_observed_date`
+3. **Data end.** A row of *any* role is ``excluded`` if its window ends later
+   than ``truth_data_end_margin_days`` (41) before the end of the last fully
+   observed space-weather day. Past that day the file holds only forecasts, and
+   the truth propagator's NRLMSISE-00 input is the *centred* 81-day F10.7 mean
+   of the day containing each instant (Orekit 13.1.9
+   ``CssiSpaceWeatherData.getAverageFlux``), which averages observed values up
+   to 40 days ahead. With the margin, every F10.7 value the truth run averages
+   is a measurement, with one day of slack. The day comes from
+   :meth:`orbit_correction.spaceweather.SpaceWeather.last_fully_observed_date`
    at labeling time and should be recorded with any split that is generated.
 
 What the labels allow
@@ -105,6 +109,8 @@ class SplitConfig:
         event_exclusion_days_before, event_exclusion_days_after: training and dev
             windows overlapping ``[tca - before, tca + after]`` of any validation
             event are excluded. 0 and 0 turn the rule off except at the TCA itself.
+        truth_data_end_margin_days: windows must end at least this many days
+            before the end of the last fully observed space-weather day.
         validation_events: the events, for the exclusion rule and the record.
     """
 
@@ -117,6 +123,7 @@ class SplitConfig:
     forced_heldout_norad_ids: tuple[int, ...]
     event_exclusion_days_before: float
     event_exclusion_days_after: float
+    truth_data_end_margin_days: float
     validation_events: tuple[ValidationEvent, ...]
 
     def __post_init__(self) -> None:
@@ -128,6 +135,8 @@ class SplitConfig:
             raise ValueError("max_horizon_days must be positive")
         if self.event_exclusion_days_before < 0 or self.event_exclusion_days_after < 0:
             raise ValueError("event exclusion widths must be >= 0")
+        if self.truth_data_end_margin_days < 0:
+            raise ValueError("truth_data_end_margin_days must be >= 0")
         missing = {i for e in self.validation_events for i in e.norad_ids} - set(
             self.forced_heldout_norad_ids
         )
@@ -191,6 +200,18 @@ def data_end_tt_s(last_observed_date_utc: str) -> float:
     return float(utc_to_tt_seconds(f"{day}T00:00:00"))
 
 
+def latest_window_end_tt_s(last_observed_date_utc: str, cfg: SplitConfig) -> float:
+    """Latest allowed window end: :func:`data_end_tt_s` minus the truth margin.
+
+    Computed in whole UTC days (the margin is applied to the date, then converted),
+    so a leap second inside the margin doesn't shift it.
+    """
+    margin = cfg.truth_data_end_margin_days
+    whole = int(np.floor(margin))
+    day = np.datetime64(last_observed_date_utc, "D") + np.timedelta64(1 - whole, "D")
+    return float(utc_to_tt_seconds(f"{day}T00:00:00")) - (margin - whole) * _DAY_S
+
+
 def assign_split_labels(
     norad_ids: np.ndarray,
     start_epoch_tt_s: np.ndarray,
@@ -206,7 +227,8 @@ def assign_split_labels(
         cfg: the split configuration.
         last_observed_date_utc: last fully observed space-weather day
             (``YYYY-MM-DD``), normally ``SpaceWeather.last_fully_observed_date()``.
-            Windows of any role ending after the end of this day are ``excluded``.
+            Windows of any role ending after :func:`latest_window_end_tt_s` (the
+            end of this day minus ``truth_data_end_margin_days``) are ``excluded``.
             Required, so the rule cannot be skipped by omission.
 
     Returns:
@@ -238,7 +260,7 @@ def assign_split_labels(
     trainable = ~held & ~after
     labels[trainable] = role[trainable]
     labels[trainable & (crosses | near_event)] = "excluded"
-    labels[end > data_end_tt_s(last_observed_date_utc)] = "excluded"
+    labels[end > latest_window_end_tt_s(last_observed_date_utc, cfg)] = "excluded"
     assert set(labels.tolist()) <= set(SPLIT_LABELS)
     return labels
 

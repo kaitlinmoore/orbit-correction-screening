@@ -52,8 +52,9 @@ By object and by time (`src/orbit_correction/splits.py`, `config/splits.toml`, a
   UTC; test rows start at or after it.
 - Training and development windows overlapping [TCA - 7 d, TCA + 1 d] of a validation event
   are excluded.
-- Windows of any split that end after the last fully observed space-weather day are excluded:
-  beyond it the space-weather file holds only forecasts.
+- Windows of any split that end later than 41 days before the end of the last fully observed
+  space-weather day are excluded: beyond that day the file holds only forecasts, and the truth
+  propagator's centred 81-day F10.7 mean reaches 40 days ahead (`truth_data_end_margin_days`).
 
 Row labels: `train` (fitted on), `dev` (development evaluation), `test` (held-out evaluation,
 unexamined until a confirmatory run), `reserved_object`, `reserved_time` and `excluded`.
@@ -93,7 +94,101 @@ through its Python bindings; the theory and the propagation code are the library
 
 ## Truth propagation
 
-_To be written (build step 2)._
+Truth is a numerical model, not tracked positions (`src/orbit_correction/truth_prop.py`,
+configuration in `config/truth.toml`). The settings below define it; they were decided on
+2026-11-23 (decision 1 plus the truth-definition decisions after review).
+
+- **Library behaviour:** Orekit 13.1.9 (through orekit-jpype) does the integration (DOP853),
+  gravity (Holmes-Featherstone with EIGEN-6S from the pinned orekit-data bundle), the
+  NRLMSISE-00 atmosphere and drag force, Earth orientation (IERS 2010, bundle EOP), the Sun
+  (DE-440), the ephemeris output and the altitude event.
+- **Project code:** the configuration and its checks; the B* to area-to-mass relation
+  (A/m = 2 B* / (Cd rho0), Cd 2.2, rho0 = 0.15696615 kg/(m^2 ER)); the start rule; the
+  GCRF/TT/km boundary; reading space weather only from the copy `truth_prop.write_space_weather_copy`
+  writes, and refusing windows outside the range that copy was checked for or inside the
+  data-end margin; the re-entry status and initial-altitude guard; the JVM rules and the
+  spawned worker pool.
+- **Force model:** central body plus EIGEN-6S zonal harmonics (order 0) to degree 36;
+  NRLMSISE-00 drag with mean local solar time and the 3-hourly ap array (switch 9 = -1); a
+  cannonball with Cd 2.2. No tesserals, Sun or Moon gravity, radiation pressure, tides or
+  relativity; truth is "zonal plus drag" by design.
+- **Zonal degree 36 is a chosen truncation**, part of the truth definition, not a converged
+  value. Against a degree-90 reference the omitted zonals move a 7-day trajectory by up to
+  about 70 m at 300 km, 18 m at 500 km, 8 m at 800 km and 1 m at 1,200 km
+  (`scripts/zonal_convergence.py`; background, see the changelog).
+- **NRLMSISE-00 conventions.** Mean local solar time (UT + longitude/15) is what pymsis and
+  brahe compute, which makes the density cross-checks possible (pymsis to 1.1e-5). The
+  reference notes name the input local apparent solar time and call equation-of-time
+  departures of minor importance; along real orbits apparent and mean differ in density by up
+  to 6.8% (800 km, November 2024). Switch 9 = -1 feeds the 3-hourly ap history; daily Ap
+  (+1) differs by up to 7.8% along an orbit and about 20% at storm points, up to 11 km at
+  300 km over 7 days. Switch 9 stays configurable for a labeled daily-Ap sensitivity
+  subsample in residual generation.
+- **Initial state and start rule:** the SGP4 state at the element-set epoch, rotated TEME to
+  GCRF by `frames.teme_to_gcrf`, used as an osculating state, then scaled by
+  k = (mu_truth / mu_WGS72)^(1/3) in position and velocity (`preserve_sgp4_mean_motion`).
+  SGP4 states are consistent with the WGS-72 GM (398600.8 km^3/s^2) and truth integrates
+  with EIGEN-6S's (398600.4415); without the rule the GM difference alone makes truth lag
+  SGP4 by about 1.15 km per day, an artefact a model would learn trivially and that tracked
+  orbits wouldn't have. The scaled state keeps the two-body period (each under its own GM),
+  eccentricity and plane, and sits about 2 m from the SGP4 state, so residuals at t0 are
+  about 2 m, not zero. On eight sample objects (300-1,200 km, June 2024 start;
+  `scripts/truth_settings_check.py`) the rule moves the 7-day SGP4-minus-truth along-track
+  difference by about 8 km in every band. What remains at 7 days is the rest of the model
+  difference: 170-970 km at 300 km and 35-86 km at 500 km, where drag dominates, and
+  3-15 km at 800 and 1,200 km, where drag is small and the zonal model, SGP4's theory and
+  the osculating start account for it (not separated here).
+  A start fitted to SGP4 is a later, labeled sensitivity variant.
+- **Integrator:** DOP853, 1 m position tolerance, 180 s maximum step. At this cap DOP853 runs
+  at the step limit, so the step sets the integration error. Against a converged run (1 mm, 30 s) its
+  7-day error on the eight sample objects is 0.8-7.3 m at 300 km, 0.12-0.18 m at 500 km,
+  0.13-0.15 m at 800 km and 0.06 m at 1,200 km (at the earlier 300 s step: 92-195, 53, 17-22
+  and 8 m), for 50,447 right-hand-side evaluations per object-week instead of 30,302. This is part
+  of the truth definition and is reported as a limit.
+- **Reproducibility:** the same job gives the same trajectory to about a millimetre, not bit
+  for bit: Orekit's interpolated frame transforms depend on the first date a JVM requests, so
+  job order within a worker can change a trajectory by ~1e-4 m over days. At 300 km with drag,
+  runs at a 120 s maximum step and below stop converging at about 1-18 m over 7 days for a
+  high-drag object (cause not identified); that is the reproducibility floor there.
+- **Space weather:** Orekit's NRLMSISE-00 input is the previous day's observed F10.7, the
+  centred 81-day observed mean for the day containing each instant, and the Ap history
+  (Orekit source, `CssiSpaceWeatherData`). Windows therefore end at least 41 days before
+  the end of the last fully observed space-weather day (see Splits). The rule is enforced
+  twice: in the split labels and in `truth_prop`, which refuses to write a copy for, or
+  propagate, a window ending inside the margin, whatever the labels say. Each copy records
+  the dates it was checked for; a window outside them is refused, because outside them the
+  copy holds forecasts or zero placeholders.
+- **Drag in the residual.** For an object whose A/m comes from B*, Cd has no effect: the
+  drag acceleration depends on Cd A/m = 2 B* / rho0 whatever Cd is (Cd matters only when A/m
+  is given directly). Truth drag is then SGP4's own ballistic coefficient flown through
+  NRLMSISE-00, so the drag part of the residual is largely the ratio of NRLMSISE-00 density
+  to the density SGP4's theory assumes. That ratio depends on altitude and solar activity: it
+  runs from about 1.6 (300 km, November 2024) to 0.01 (650 km and above, 2019). The model
+  learns this function of altitude and F10.7 as much as anything about real drag.
+- **Re-entry:** a window in which the geodetic altitude falls below 120 km returns status
+  `reentry` with the truth trajectory up to the crossing, so close approaches before
+  re-entry stay usable. A start below 120 km returns `reentry` at once, without propagating.
+  The matching floor for SGP4 belongs to the cheap propagator.
+- **Checks** (`tests/test_truth_prop.py`): two-body energy and angular momentum over 7 days;
+  J2 node, perigee and mean-anomaly rates against first-order theory over 12 days; zonal
+  truncation (no tesseral terms; degree 4 equal to closed-form J2-J4 to 1e-13); the
+  configured degree, order 0 and Earth-fixed frame on the built force model; drag work
+  equal to the energy lost; circular decay under an exponential atmosphere against the
+  analytic rate (6e-6); NRLMSISE-00 against pymsis (msis00) to 1.1e-5; Orekit's
+  space-weather values against `spaceweather.observed`; Orekit's TEME to GCRF against
+  `frames.teme_to_gcrf` (0.5-1.1 m); the start rule's period in a two-body run; the
+  integration error of the truth setting per case; the range and margin guards; the
+  re-entry outputs; reproducibility to 1 mm across workers and job order. A library check
+  compares Orekit's TLEPropagator with the sgp4 package (9 micrometres); the project doesn't
+  use the former.
+- **Independent check:** brahe 1.9.0 with a shared static zonal set (`scripts/crosscheck_brahe.py`).
+  Without drag the two agree to millimetres at 7 days (tolerance 0.1 m). With drag they
+  agree once both use the same NRLMSISE-00 conventions (daily Ap, mean solar time), within
+  per-band tolerances of 10 m at 300 km, 1 m at 500 km and 0.1 m at 800 km and above.
+  Rerun on all eight sample objects with the start rule and the 180 s setting
+  (2026-11-23): no drag at most 5.1 mm; drag with matched conventions at most 4.1 m at
+  300 km, 0.058 m at 500 km, 4.8 mm at 800 km and 1.8 mm at 1,200 km. With the project's
+  ap-array setting brahe differs by up to 11 km at 300 km, a convention difference.
 
 ## Residual dataset
 

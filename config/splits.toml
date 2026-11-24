@@ -3,10 +3,11 @@
 #
 # Status: approved 2026-11-23. No split has been generated from real data yet.
 #
-# One rule lives outside this file: windows (any split) ending after the last
-# fully observed space-weather day are labeled excluded. That day comes from the
-# space-weather file at labeling time (SpaceWeather.last_fully_observed_date),
-# because the file grows daily; record it with any split that is generated.
+# One input lives outside this file: the last fully observed space-weather day,
+# from the space-weather file at labeling time (SpaceWeather.last_fully_observed_date),
+# because the file grows daily; record it with any split that is generated. Windows
+# (any split) ending later than truth_data_end_margin_days before the end of that
+# day are labeled excluded.
 
 [splits]
 status = "approved 2026-11-23"
@@ -38,6 +39,13 @@ forced_heldout_norad_ids = [
 # window: 7 days before (the event's own window) and 1 day after.
 event_exclusion_days_before = 7.0
 event_exclusion_days_after = 1.0
+
+# Truth windows end at least this many days before the end of the last fully
+# observed space-weather day (approved 2026-11-23). Orekit's NRLMSISE-00 input uses
+# the file's centred 81-day F10.7 mean for the day containing each instant, which
+# averages observed F10.7 up to 40 days after that day; 41 days keeps every value
+# it averages observed, with one day of slack (Orekit also reads the next day's row).
+truth_data_end_margin_days = 41.0
 
 [[splits.validation_events]]
 name = "Iridium 33 / Cosmos 2251"

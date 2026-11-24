@@ -44,6 +44,7 @@ def test_config_is_approved_and_complete(cfg):
     )
     assert cfg.time_cutoff_utc == "2025-01-01T00:00:00" and cfg.max_horizon_days == 7.0
     assert (cfg.event_exclusion_days_before, cfg.event_exclusion_days_after) == (7.0, 1.0)
+    assert cfg.truth_data_end_margin_days == 41.0
     assert {26998, 22236, 13777, 2828, 19826, 36123, 7219, 26207} <= set(
         cfg.forced_heldout_norad_ids
     )
@@ -97,7 +98,7 @@ def test_cutoff_boundary_exact():
         status="test", seed=1, heldout_object_fraction=0.0, dev_object_fraction=0.0,
         time_cutoff_utc="2025-01-01T00:00:00", max_horizon_days=7.0,
         forced_heldout_norad_ids=(5,), event_exclusion_days_before=0.0,
-        event_exclusion_days_after=0.0, validation_events=(),
+        event_exclusion_days_after=0.0, truth_data_end_margin_days=0.0, validation_events=(),
     )
     cut = c.time_cutoff_tt_s
     starts = np.array([cut - 7 * DAY, cut - 7 * DAY + 1e-3, cut - 1e-3, cut, cut, cut - 1.0])
@@ -167,12 +168,16 @@ def test_summary_counts(rows, cfg):
 
 
 def test_windows_ending_after_data_end_are_excluded_in_every_split():
-    """Any window ending after the last fully observed space-weather day is excluded."""
+    """Any window ending after the last fully observed space-weather day is excluded.
+
+    Margin 0 here, to test the data-end rule on its own; the 41-day truth margin
+    is tested below.
+    """
     c = Sp.SplitConfig(
         status="test", seed=1, heldout_object_fraction=0.0, dev_object_fraction=0.0,
         time_cutoff_utc="2025-01-01T00:00:00", max_horizon_days=7.0,
         forced_heldout_norad_ids=(5,), event_exclusion_days_before=0.0,
-        event_exclusion_days_after=0.0, validation_events=(),
+        event_exclusion_days_after=0.0, truth_data_end_margin_days=0.0, validation_events=(),
     )
     last_obs = "2026-11-22"
     end = Sp.data_end_tt_s(last_obs)
@@ -187,6 +192,35 @@ def test_windows_ending_after_data_end_are_excluded_in_every_split():
     s2 = np.array([early_end - 8 * DAY, early_end - 3 * DAY])
     assert label(np.full(2, 1), s2, c, "2024-06-30").tolist() == ["train", "excluded"]
     assert label(np.full(2, 5), s2, c, "2024-06-30").tolist() == ["reserved_object", "excluded"]
+
+
+def test_truth_margin_41_days_before_data_end(cfg):
+    """With the approved margin, windows end >= 41 days before the end of the last observed day."""
+    last_obs = "2026-11-22"
+    c = dataclasses.replace(cfg, heldout_object_fraction=0.0, dev_object_fraction=0.0)
+    assert c.truth_data_end_margin_days == 41.0
+    latest = Sp.latest_window_end_tt_s(last_obs, c)
+    # end of 2026-11-22 is 2026-11-23T00:00 UTC; 41 days earlier is 2026-10-13T00:00 UTC
+    assert latest == pytest.approx(utc_to_tt_seconds("2026-10-13T00:00:00"))
+    assert latest == pytest.approx(Sp.data_end_tt_s(last_obs) - 41 * DAY)  # no leap second inside
+    roles = Sp.object_roles(range(1, 200), c)
+    obj = next(i for i, r in roles.items() if r == "train")
+    forced = c.forced_heldout_norad_ids[0]
+    starts = np.array([latest - 7 * DAY, latest - 7 * DAY + 1e-3, latest - 3 * DAY])
+    # after the 2025 cutoff, so a training object is reserved_time and a held-out one test
+    assert label(np.full(3, obj), starts, c, last_obs).tolist() == [
+        "reserved_time", "excluded", "excluded"
+    ]
+    got = label(np.full(3, forced), starts, c, last_obs).tolist()
+    assert got == ["test", "excluded", "excluded"]
+    # the same windows were allowed under the bare data-end rule
+    c0 = dataclasses.replace(c, truth_data_end_margin_days=0.0)
+    assert label(np.full(3, obj), starts, c0, last_obs).tolist() == ["reserved_time"] * 3
+    # a leap second inside the margin is counted in UTC days, not 86400 s blocks
+    leap = Sp.latest_window_end_tt_s("2017-01-30", c)
+    assert leap == pytest.approx(utc_to_tt_seconds("2016-12-21T00:00:00"))
+    with pytest.raises(ValueError, match="margin"):
+        dataclasses.replace(c, truth_data_end_margin_days=-1.0)
 
 
 def test_data_end_is_required(rows, cfg):
