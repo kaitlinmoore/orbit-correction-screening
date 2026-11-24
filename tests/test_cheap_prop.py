@@ -13,6 +13,7 @@ References:
 from __future__ import annotations
 
 import datetime as dt
+import importlib.util
 import json
 from importlib.resources import files
 
@@ -403,11 +404,14 @@ def test_batched_and_single_results_identical(sample):
 
 
 def test_decay_inside_window_truncates(sample):
-    """A constructed high-drag ISS element set decays (SGP4 code 6) inside 7 days."""
+    """A constructed high-drag ISS element set decays (SGP4 code 6) inside 7 days.
+
+    With the altitude floor off, so SGP4's own decay test is what cuts the trajectory.
+    """
     i = _row_index(sample, 25544)
     decaying = _with(sample, i, bstar_per_earth_radii=0.1)
     both = pa.concat_tables([sample.slice(i, 1), decaying])
-    ok, dec = C.propagate_sgp4_from_epoch(both, WEEK_60S)
+    ok, dec = C.propagate_sgp4_from_epoch(both, WEEK_60S, floor_km=None)
     assert ok.status.ok and len(ok.trajectory) == len(WEEK_60S)
 
     s = dec.status
@@ -433,3 +437,155 @@ def test_invalid_elements_give_no_trajectory(sample):
     assert res.status.code == 1 and res.status.n_valid == 0
     assert res.status.first_error_t_tt_s == res.epoch_tt_s
     assert C.status_counts([res]) == {"ok": 0, "truncated": 0, "empty": 1, "code_1": 1}
+
+
+# ----------------------------------------------------------------- 120 km altitude floor
+
+
+def test_floor_cuts_a_decaying_trajectory_before_sgp4_does(sample):
+    """Default floor: the same decaying set stops at 120 km, long before SGP4's code 6."""
+    i = _row_index(sample, 25544)
+    decaying = _with(sample, i, bstar_per_earth_radii=0.1)
+    res = C.propagate_sgp4_from_epoch(decaying, WEEK_60S)[0]
+    no_floor = C.propagate_sgp4_from_epoch(decaying, WEEK_60S, floor_km=None)[0]
+    s = res.status
+    assert s.code == C.ALTITUDE_FLOOR_CODE and s.below_floor and s.truncated and not s.ok
+    assert "120 km floor" in s.message
+    assert 0 < s.n_valid < no_floor.status.n_valid
+    assert s.first_error_t_tt_s == pytest.approx(res.epoch_tt_s + WEEK_60S[s.n_valid])
+    # the kept states are those of the unfloored run, and the cut is at the crossing
+    np.testing.assert_array_equal(
+        res.trajectory.r_gcrf_km, no_floor.trajectory.r_gcrf_km[: s.n_valid]
+    )
+    raw = C.sgp4_teme_from_epoch(decaying, WEEK_60S)
+    alt = C.geodetic_altitude_km(raw.r_teme_km[0, : s.n_valid + 1])
+    assert np.all(alt[:-1] >= C.ALTITUDE_FLOOR_KM) and alt[-1] < C.ALTITUDE_FLOOR_KM
+    assert raw.error[0, s.n_valid] == 0  # SGP4 itself still calls this state valid
+    assert C.status_counts([res]) == {"ok": 0, "truncated": 1, "empty": 0, "altitude_floor": 1}
+    assert not C.Sgp4Status(6, "x", 2, 1, 0.0).below_floor
+
+
+def test_floor_matches_the_truth_reentry_altitude():
+    """One floor for both propagators: cheap_prop's constant equals config/truth.toml's."""
+    from orbit_correction.truth_prop import load_truth_config
+
+    assert C.ALTITUDE_FLOOR_KM == load_truth_config().reentry_altitude_km
+
+
+def _batch(r_teme: np.ndarray, error: np.ndarray, t0: float = 7.8e8) -> C.TemeBatch:
+    """A hand-made one-object TemeBatch (positions and error codes chosen by the test)."""
+    n = r_teme.shape[0]
+    return C.TemeBatch(
+        norad_id=np.array([1]),
+        epoch_tt_s=np.array([t0]),
+        t_tt_s=t0 + 60.0 * np.arange(n)[None, :],
+        r_teme_km=r_teme[None],
+        v_teme_km_s=np.tile([0.0, 7.5, 0.0], (1, n, 1)),
+        error=error[None].astype(np.uint8),
+    )
+
+
+def test_floor_against_sgp4_flags_on_a_hand_made_batch():
+    """Which cut wins, and flagged (possibly NaN) states never reach the altitude test."""
+    a = 6378.137  # equatorial points: altitude = radius - a
+    r = np.array([[a + h, 0.0, 0.0] for h in (400.0, 300.0, 110.0, 400.0)])
+    # floor first
+    res = C._to_results(_batch(r, np.array([0, 0, 0, 6])), "exact")[0]
+    assert res.status.below_floor and res.status.n_valid == 2
+    # SGP4 flag on the same state as the floor crossing: SGP4's code wins
+    res = C._to_results(_batch(r, np.array([0, 0, 6, 0])), "exact")[0]
+    assert res.status.code == 6 and res.status.n_valid == 2
+    # flagged state with NaN position before any crossing: SGP4's code, no error raised
+    r_nan = r.copy()
+    r_nan[1] = np.nan
+    res = C._to_results(_batch(r_nan, np.array([0, 1, 0, 0])), "exact")[0]
+    assert res.status.code == 1 and res.status.n_valid == 1
+    # start below the floor: no trajectory
+    res = C._to_results(_batch(r[2:], np.array([0, 0])), "exact")[0]
+    assert res.trajectory is None and res.status.below_floor and res.status.n_valid == 0
+    # floor off: only SGP4's flags count
+    res = C._to_results(_batch(r, np.array([0, 0, 0, 0])), "exact", floor_km=None)[0]
+    assert res.status.ok
+
+
+def test_geodetic_altitude_known_points_and_guards():
+    a, b = 6378.137, 6356.752314245  # WGS-84 semi-axes, km
+    r = np.array([[a + 120.0, 0, 0], [0, 0, b + 120.0], [0, -(a + 500.0), 0]])
+    np.testing.assert_allclose(C.geodetic_altitude_km(r), [120.0, 120.0, 500.0], atol=1e-9)
+    with pytest.raises(ValueError, match="NaN"):
+        C.geodetic_altitude_km(np.array([[np.nan, 0.0, 0.0]]))
+    with pytest.raises(ValueError, match="shape"):
+        C.geodetic_altitude_km(np.zeros((2, 2)))
+
+
+def _itrs_altitude_km(r_teme_km: np.ndarray, t_tt_s: np.ndarray) -> np.ndarray:
+    """Altitude after astropy's full TEME -> ITRS rotation (which includes polar motion)."""
+    import erfa
+    from astropy import units as u
+    from astropy.coordinates import ITRS, TEME, CartesianRepresentation
+
+    obstime = F.tt_seconds_to_time(t_tt_s)
+    teme = TEME(CartesianRepresentation(r_teme_km.T * u.km), obstime=obstime)
+    itrs = teme.transform_to(ITRS(obstime=obstime)).cartesian.xyz.to_value(u.m).T
+    return erfa.gc2gd(1, itrs)[2] / 1000.0
+
+
+def test_ignoring_polar_motion_moves_altitude_by_centimetres(sample):
+    """TEME-based altitude against astropy's ITRS-based altitude: under 0.1 m.
+
+    TEME -> ITRS in astropy is a rotation about z (GMST) followed by polar motion, so
+    the difference isolates polar motion; the bound the handoff asks for is 1 m.
+    """
+    leo = sample.filter(pa.compute.less(sample.column("perigee_alt_km"), 2000.0))
+    res = C.sgp4_teme_from_epoch(leo, 60.0 * np.arange(0, 1440, 7))  # a day, 7-min steps
+    ok = res.error == 0
+    r, t = res.r_teme_km[ok], res.t_tt_s[ok]
+    diff_m = np.abs(C.geodetic_altitude_km(r) - _itrs_altitude_km(r, t)) * 1000.0
+    assert r.shape[0] > 1000
+    assert diff_m.max() < 0.1, diff_m.max()
+
+
+HAVE_OREKIT = all(
+    importlib.util.find_spec(m) for m in ("orekit_jpype", "jdk4py", "orekitdata")
+)
+
+
+@pytest.mark.datagen
+@pytest.mark.skipif(not HAVE_OREKIT, reason="needs `uv sync --group datagen` (Orekit)")
+def test_floor_altitude_matches_orekit(sample):
+    """The JVM-free altitude against Orekit's (the truth propagator's) within 10 m.
+
+    Orekit converts GCRF to its WGS-84 body frame with IERS 2010 and the bundle's EOP;
+    here the same state's TEME position goes through ERFA. Sample: every LEO object of
+    the fixture over one day, plus a decaying set's states near the floor.
+    """
+    from orbit_correction import truth_prop as T
+
+    cfg = T.load_truth_config()
+    leo = sample.filter(pa.compute.less(sample.column("perigee_alt_km"), 2000.0))
+    i = _row_index(sample, 25544)
+    decaying = _with(sample, i, bstar_per_earth_radii=0.1)
+    no_floor = C.propagate_sgp4_from_epoch(decaying, WEEK_60S, floor_km=None)[0]
+    cut = C.propagate_sgp4_from_epoch(decaying, WEEK_60S)[0].status.n_valid
+    grids = [(leo, 60.0 * np.arange(0, 1440, 97)), (decaying, WEEK_60S[cut - 3 : cut + 3])]
+    worst_m, lowest_km, n = 0.0, np.inf, 0
+    for elsets, grid in grids:
+        raw = C.sgp4_teme_from_epoch(elsets, grid)
+        for k in range(elsets.num_rows):
+            for j in np.flatnonzero(raw.error[k] == 0):
+                r, v = F.teme_to_gcrf(raw.r_teme_km[k, j], raw.v_teme_km_s[k, j], raw.t_tt_s[k, j])
+                one = Trajectory(
+                    norad_id=int(raw.norad_id[k]),
+                    t_tt_s=np.array([raw.t_tt_s[k, j]]),
+                    r_gcrf_km=r[None],
+                    v_gcrf_km_s=v[None],
+                    source="sgp4",
+                )
+                ours = float(C.geodetic_altitude_km(raw.r_teme_km[k, j]))
+                theirs = T.initial_geodetic_altitude_km(cfg, one)
+                worst_m = max(worst_m, abs(ours - theirs) * 1000.0)
+                lowest_km = min(lowest_km, ours)
+                n += 1
+    assert n > 200 and lowest_km < C.ALTITUDE_FLOOR_KM < lowest_km + 5.0
+    assert no_floor.status.n_valid > cut
+    assert worst_m < 10.0, worst_m
