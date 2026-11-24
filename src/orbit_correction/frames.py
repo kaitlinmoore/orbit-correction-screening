@@ -60,6 +60,7 @@ This module never starts a JVM.
 from __future__ import annotations
 
 import hashlib
+import math
 from pathlib import Path
 
 import erfa
@@ -233,8 +234,27 @@ def elset_epoch_to_tt_seconds(epoch_utc: str | list[str] | np.ndarray) -> np.nda
 
 
 def satrec_epoch_to_tt_seconds(jdsatepoch: float, jdsatepoch_f: float) -> float:
-    """Epoch of an ``sgp4.api.Satrec`` (its UTC Julian date pair) to TT seconds."""
-    return float(time_to_tt_seconds(Time(jdsatepoch, jdsatepoch_f, format="jd", scale="utc")))
+    """Epoch of an ``sgp4.api.Satrec`` (its UTC Julian date pair) to TT seconds.
+
+    SGP4's Julian date (``sgp4.api.jday``, the TLE reader) counts every UTC day as
+    86,400 s: the fraction of the day is ``seconds since 00:00 UTC / 86400`` even on a
+    day that ends with a leap second. Astropy reads a UTC Julian date differently: on
+    a leap-second day it stretches the fraction over 86,401 s. Handing SGP4's pair to
+    ``Time(..., format="jd", scale="utc")`` therefore puts an epoch on 2016-12-31 up to
+    a second late (0.5 s at 12:00). Here the pair is split into the UTC midnight that
+    starts the day (an unambiguous instant) and the seconds after it, which are SI
+    seconds because the leap second, when there is one, comes at the end of the day.
+
+    An SGP4 epoch can't fall inside a leap second (the 86,400-second count has no place
+    for it), so every value of the pair maps to exactly one instant.
+    """
+    total = float(jdsatepoch) + float(jdsatepoch_f)
+    jd_midnight = math.floor(total - 0.5) + 0.5  # the UTC midnight starting the day
+    # (jd - midnight) is a small whole number of days when jd is a midnight, as SGP4's
+    # pair has it, so adding the fraction last keeps its precision.
+    seconds = ((float(jdsatepoch) - jd_midnight) + float(jdsatepoch_f)) * _DAY_S
+    midnight = Time(jd_midnight, format="jd", scale="utc")
+    return float(time_to_tt_seconds(midnight)) + seconds
 
 
 # --------------------------------------------------------------------------------------

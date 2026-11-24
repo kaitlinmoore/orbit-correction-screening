@@ -16,13 +16,15 @@ Reference: Vallado, Crawford, Hujsak and Kelso, "Revisiting Spacetrack Report
    0.2 m of Earth rotation at this radius. Observed: 0.36 m, 0.27 mm/s.
 """
 
+import datetime as dt
+
 import numpy as np
 import pytest
 from astropy import units as u
 from astropy.coordinates import GCRS, ITRS, CartesianDifferential, CartesianRepresentation
 from astropy.time import Time
 from astropy.utils import iers
-from sgp4.api import WGS72, Satrec
+from sgp4.api import WGS72, Satrec, jday
 
 from orbit_correction import frames as F
 
@@ -161,6 +163,69 @@ def test_elset_epoch_matches_satrec_epoch():
     # day 179.78495062 of 2000 = 2000-06-27T18:50:19.733568 UTC
     from_iso = F.elset_epoch_to_tt_seconds("2000-06-27T18:50:19.733568")
     assert from_satrec == pytest.approx(from_iso, abs=1e-4)
+
+
+# ---------------------------------------------------------------- SGP4 epoch on leap-second days
+
+#: TAI - UTC (Delta AT) on the dates used below, typed in from the IERS leap-second list
+#: (Bulletin C) so the reference doesn't go through astropy or ERFA.
+_DELTA_AT = {"2015-06-30": 35.0, "2016-12-30": 36.0, "2016-12-31": 36.0, "2017-01-01": 37.0}
+
+
+def _tt_seconds_by_hand(date: str, h: int, m: int, s: float) -> float:
+    """TT seconds since J2000.0 from calendar arithmetic and a typed-in Delta AT.
+
+    TT = UTC + Delta AT + 32.184 s. Counting naive (86,400-s) days from
+    2000-01-01T12:00:00 and adding the leap seconds inserted since then
+    (Delta AT - 32, the value in 2000) gives SI seconds, because the instant is not
+    inside a leap second.
+    """
+    naive = (
+        dt.datetime.fromisoformat(date) + dt.timedelta(hours=h, minutes=m, seconds=s)
+        - dt.datetime(2000, 1, 1, 12)
+    ).total_seconds()
+    return naive + (_DELTA_AT[date] - 32.0) + 64.184
+
+
+@pytest.mark.parametrize("date", ["2016-12-31", "2015-06-30"])
+@pytest.mark.parametrize(
+    "hms", [(0, 0, 0.0), (0, 0, 0.25), (6, 0, 0.0), (12, 0, 0.0), (23, 0, 0.0), (23, 59, 59.5)]
+)
+def test_satrec_epoch_on_a_leap_second_day(date, hms):
+    """SGP4's 86,400-s Julian date on a leap-second day maps to the right instant.
+
+    Two independent references: astropy from the ISO string (calendar fields, not a
+    Julian date) and calendar arithmetic with a typed-in Delta AT. Before the fix this
+    function was 0.5 s late at 12:00 and 0.96 s late at 23:00 on 2016-12-31.
+    """
+    y, mo, d = (int(x) for x in date.split("-"))
+    jd, fr = jday(y, mo, d, *hms)
+    got = F.satrec_epoch_to_tt_seconds(jd, fr)
+    iso = f"{date}T{hms[0]:02d}:{hms[1]:02d}:{hms[2]:09.6f}"
+    tol = 1e-6  # s; TT seconds near 2016 resolve ~6e-8 s, the pair's fraction ~1e-11 d
+    assert got == pytest.approx(F.utc_to_tt_seconds(iso), abs=tol)
+    assert got == pytest.approx(_tt_seconds_by_hand(date, *hms), abs=tol)
+
+
+def test_satrec_epoch_from_satrec_and_across_midnight():
+    """The pair as a TLE reader stores it, and both sides of a leap-second midnight."""
+    sat = Satrec.twoline2rv(
+        "1 00005U 58002B   16366.50000000  .00000023  00000-0  28098-4 0  4753",
+        "2 00005  34.2682 348.7242 1859667 331.7664  19.3264 10.82419157413667",
+        WGS72,
+    )  # day 366 of 2016 = 2016-12-31, 12:00 UTC
+    got = F.satrec_epoch_to_tt_seconds(sat.jdsatepoch, sat.jdsatepochF)
+    assert got == pytest.approx(_tt_seconds_by_hand("2016-12-31", 12, 0, 0.0), abs=1e-6)
+    # the last second before the leap second and the first after it are 2 SI s apart
+    before = F.satrec_epoch_to_tt_seconds(*jday(2016, 12, 31, 23, 59, 59.0))
+    after = F.satrec_epoch_to_tt_seconds(*jday(2017, 1, 1, 0, 0, 0.0))
+    assert after - before == pytest.approx(2.0, abs=1e-6)
+    assert after == pytest.approx(_tt_seconds_by_hand("2017-01-01", 0, 0, 0.0), abs=1e-6)
+    # a pair split differently (all in the fraction) gives the same instant
+    jd, fr = jday(2016, 12, 31, 18, 0, 0.0)
+    assert F.satrec_epoch_to_tt_seconds(jd + fr - 0.25, 0.25) == pytest.approx(
+        F.satrec_epoch_to_tt_seconds(jd, fr), abs=1e-6
+    )
 
 
 # ---------------------------------------------------------------- EOP pinning
