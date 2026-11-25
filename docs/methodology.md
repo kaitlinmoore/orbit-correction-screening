@@ -12,13 +12,20 @@ not tracked positions.
 
 ## Data
 
-- Element sets: CelesTrak GP (development, tests) and Space-Track `gp_history` (training and
-  test epochs; validation cases). Loading and filtering: `src/orbit_correction/catalog.py`.
+- Element sets: CelesTrak GP (development, tests); Space-Track's yearly bulk TLE files for
+  training and test epochs, 2015-01-01 through 2026-11-23 (decided 2026-11-24, following
+  Space-Track's guidance to use the bulk files for many objects or long date ranges); and
+  Space-Track `gp_history` from 2004-01-01 for the ten validation-case objects only.
+  Loading and filtering: `src/orbit_correction/catalog.py`; the bulk TLE reader and the
+  download list: `src/orbit_correction/generation.py`.
 - Space weather: CelesTrak `SW-All.txt`, read by `src/orbit_correction/spaceweather.py`.
 - Filters and their values: `config/catalog_filters.toml` (approved 2026-11-23). LEO
   (perigee >= 250 km, apogee <= 2000 km), 0 < B* <= 0.01 /ER, SGP4 element sets only,
   payloads, rocket bodies and debris. Non-maneuvering: operational payloads (current SATCAT
-  status) and maneuvering constellations by name are dropped, and so is any object whose
+  status) and payloads of maneuvering constellations by their current SATCAT name are
+  dropped (decided 2026-11-24: the name rule reads SATCAT names, since bulk TLEs carry
+  none and an element set's own name can predate the object's naming, and it applies to
+  payloads only, so constellation debris such as Iridium 33's is kept), and so is any object whose
   element history shows a mean semimajor-axis rise, a drop larger than drag explains, or an
   inclination step. Each rule's rejections are reported by name.
 
@@ -292,8 +299,8 @@ horizon grid approved 2026-11-24 for the pilot). Contract: `RESIDUAL_SCHEMA` in 
   With real truth on synthetic element sets at 2024-06-15, 350 km perigee with B* = 0.01
   /ER passes it at 6.7 days (T = 11,600 km at 7 days, 1.12 x the limit), and neighbouring
   windows that are kept reach 4,500-8,100 km (43-77% of it). Such a window is refused, not
-  wrapped; generation is to count it as its own drop status (`rtn_domain`) by stratum and
-  report the count beside the lowest band's error statistics, because the windows it
+  wrapped; generation counts it as its own drop status (`rtn_domain`) by stratum and
+  reports the count beside the lowest band's error statistics, because the windows it
   removes are that band's largest errors. The inverse accepts one float64 step above the
   forward limits, so every residual the forward conversion returns can be inverted.
 - **Features.** The element set's mean elements, B* and mean-motion derivative; the four
@@ -325,6 +332,56 @@ Measured on six fixture objects moved to 2024-06-15 (solar maximum), with truth 
 epoch-state start rule (before the fitted start became the default): the residual at 60 s
 is 1.8-2.8 m (that rule's start offset), and the 7-day along-track residual runs from 9.7 km
 (770 km altitude) to 963 km (355 km), with R and N within a few km.
+
+## Residual generation
+
+Code: `src/orbit_correction/generation.py`; scripts `build_candidate_ids.py`,
+`extract_bulk_tle.py`, `build_pool.py`, `sample_windows.py`, `generate_residuals.py`,
+`pilot_report.py`; settings in `config/generation.toml` (pending approval).
+
+- **Download list.** A superset of the objects the filters can keep, from SATCAT alone:
+  allowed object types and not an operational payload (both exact, the filter reads the
+  same columns), not launched after the span, not decayed more than 30 days before it,
+  SATCAT apogee at most 2,100 km (the LEO bound plus 100 km: apogee only falls under drag,
+  so the one assumption is that no object raised its orbit after the span; the margin also
+  covers SATCAT apogees 39 km below to 97 km above the loader's values), and the name rule
+  (exact, since the filter reads the same SATCAT names). No perigee test: perigee falls
+  under drag, so an object low now may have been above 250 km earlier. The validation-case
+  objects are always added.
+- **Bulk TLE reading.** TLE fields are read with the `sgp4` package's column layout and
+  arithmetic, so each element set gives the same `Satrec` as the library's reader except
+  for the epoch, which is converted to an ISO string rounded to the microsecond (the TLE
+  resolves 0.864 ms). Bad pairs (checksum, layout) and stray lines are counted per file.
+- **Pool.** Element sets in the span, exact duplicates removed (same object, epoch and
+  elements; same-epoch rows that differ are kept and counted), SATCAT attached, the
+  catalog filters applied with rows and objects removed reported per rule. The pool is
+  built per group of NORAD IDs, which changes nothing because every rule is per object.
+- **Split.** Every pool element set is labeled as a window start with
+  `splits.assign_split_labels`; the last fully observed space-weather day, the seed and
+  the config hashes are recorded with it. Only counts per label are reported.
+- **Window sampling (proposed).** Starts at element-set epochs, train and dev rows only.
+  Per object, its eligible epochs are tried in a seeded random order and a start is kept
+  if it is at least 7 days from the object's other starts, up to a cap. Across objects,
+  round k takes every object's k-th start (objects in a seeded order), so every object
+  has one start before any has two, and a smaller stage is the first part of a larger one.
+  Uniform over element sets means better-tracked periods get more starts; coverage is
+  reported by year, altitude band, solar bin, eccentricity bin and split.
+- **Runs.** Chunks of windows: SGP4 and its epoch states in the parent process (no JVM),
+  truth in spawned workers that keep their JVM for the whole run, rows from
+  `build_window_rows`, one zstd Parquet file per chunk. A chunk is done when its marker,
+  written last, names the same windows and both of its files still hash to what the
+  marker recorded; a rerun skips done chunks and redoes the rest. One space-weather copy
+  covers the run, checked by the existing range and 41-day margin guards.
+- **Window fates.** Every sampled window gets one log record and one status: `ok`, the
+  row builder's drops (`truth_error`, `sgp4_error`, `truth_reentry`, `sgp4_floor`), the
+  conversion's refusal (`rtn_domain`), or one of two statuses for a start with no SGP4
+  state (`start_below_floor`, `start_sgp4_error`; no truth job is made). Counts by
+  status, altitude band and solar bin go into the run manifest, with the code commit,
+  config hashes, orekit-data commit, the space-weather copy's hash and range, the last
+  observed day and the seed.
+- **Daily-Ap sensitivity.** A run option sets NRLMSISE-00 switch 9 to +1 (daily Ap) for a
+  subsample of the same windows and labels every output `dailyap`; `config/truth.toml`
+  is not changed.
 
 ## Models
 
