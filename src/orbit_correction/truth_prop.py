@@ -238,13 +238,29 @@ def area_to_mass_from_bstar(bstar_per_er: float, cfg: TruthConfig) -> float:
     return 2.0 * bstar_per_er / (cfg.cd * cfg.bstar_reference_density_kg_per_m2_er)
 
 
-def initial_state_from_omm(record: dict, epoch_utc: str | None = None) -> tuple[Trajectory, float]:
-    """SGP4 state at the element-set epoch, in GCRF, plus the set's B*.
+def _omm_record_elset(record: dict, epoch_utc: str | None = None):
+    """One OMM record (CelesTrak/Space-Track JSON keys) as a one-row element-set table.
 
-    A stop-gap for this module's tests and scripts: step 3's ``cheap_prop.py``
-    is the project's SGP4 wrapper and will supply initial states in production.
-    Uses the ``sgp4`` package (OMM fields, WGS72, improved mode) and
-    :func:`orbit_correction.frames.teme_to_gcrf`.
+    ``epoch_utc``, if given, replaces the record's EPOCH (``epoch_tt_s`` follows).
+    Goes through the catalog loader's record conversion, so the row is exactly what
+    ``catalog.load_celestrak_omm`` would give for the same record.
+    """
+    from orbit_correction import catalog
+
+    rec = dict(record)
+    if epoch_utc is not None:
+        rec["EPOCH"] = epoch_utc
+    return catalog._records_to_table([rec], "omm_record")
+
+
+def initial_state_from_omm(record: dict, epoch_utc: str | None = None) -> tuple[Trajectory, float]:
+    """SGP4 state at the element-set epoch, in GCRF, plus the set's B*. Deprecated.
+
+    A thin wrapper over :func:`orbit_correction.cheap_prop.sgp4_epoch_states`, the
+    project's SGP4 wrapper (TLE-reader arithmetic, WGS-72, mode 'i', exact TEME ->
+    GCRF rotation, the 120 km floor). It is kept only because tests and scripts start
+    synthetic cases from a raw OMM record with a replaced epoch; new code should load
+    element sets with :mod:`orbit_correction.catalog` and call ``sgp4_epoch_states``.
 
     Args:
         record: one OMM record (CelesTrak/Space-Track JSON keys).
@@ -255,31 +271,19 @@ def initial_state_from_omm(record: dict, epoch_utc: str | None = None) -> tuple[
 
     Returns:
         ``(Trajectory(source="sgp4"), bstar_per_er)``; the trajectory has one state.
+
+    Raises:
+        ValueError: if SGP4 fails at the epoch or the state is below the altitude floor.
     """
-    from sgp4 import omm
-    from sgp4.api import Satrec
+    from orbit_correction.cheap_prop import sgp4_epoch_states
 
-    from orbit_correction.frames import satrec_epoch_to_tt_seconds, teme_to_gcrf
-
-    fields = {k: str(v) for k, v in record.items()}
-    if epoch_utc is not None:
-        # the sgp4 OMM reader wants fractional seconds
-        fields["EPOCH"] = epoch_utc if "." in epoch_utc else epoch_utc + ".000000"
-    sat = Satrec()
-    omm.initialize(sat, fields)
-    err, r, v = sat.sgp4_tsince(0.0)
-    if err:
-        raise ValueError(f"SGP4 error {err} for NORAD {record.get('NORAD_CAT_ID')}")
-    t0 = satrec_epoch_to_tt_seconds(sat.jdsatepoch, sat.jdsatepochF)
-    r_g, v_g = teme_to_gcrf(np.array(r), np.array(v), t0)
-    traj = Trajectory(
-        norad_id=int(record["NORAD_CAT_ID"]),
-        t_tt_s=np.array([t0]),
-        r_gcrf_km=r_g[None, :],
-        v_gcrf_km_s=v_g[None, :],
-        source="sgp4",
-    )
-    return traj, float(sat.bstar)
+    elset = _omm_record_elset(record, epoch_utc)
+    res = sgp4_epoch_states(elset)[0]
+    if res.trajectory is None:
+        raise ValueError(
+            f"NORAD {res.norad_id}: no SGP4 state at the epoch ({res.status.message})"
+        )
+    return res.trajectory, float(elset.column("bstar_per_earth_radii")[0].as_py())
 
 
 def start_rule_scale(mu_truth_m3_s2: float, cfg: TruthConfig) -> float:

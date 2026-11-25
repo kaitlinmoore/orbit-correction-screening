@@ -60,6 +60,7 @@ This module never starts a JVM.
 from __future__ import annotations
 
 import hashlib
+import math
 from pathlib import Path
 
 import erfa
@@ -233,8 +234,37 @@ def elset_epoch_to_tt_seconds(epoch_utc: str | list[str] | np.ndarray) -> np.nda
 
 
 def satrec_epoch_to_tt_seconds(jdsatepoch: float, jdsatepoch_f: float) -> float:
-    """Epoch of an ``sgp4.api.Satrec`` (its UTC Julian date pair) to TT seconds."""
-    return float(time_to_tt_seconds(Time(jdsatepoch, jdsatepoch_f, format="jd", scale="utc")))
+    """Epoch of an ``sgp4.api.Satrec`` (its UTC Julian date pair) to TT seconds.
+
+    SGP4's Julian date (``sgp4.api.jday``, the TLE reader) counts every UTC day as
+    86,400 s: the fraction of the day is ``seconds since 00:00 UTC / 86400`` even on a
+    day that ends with a leap second. Astropy reads a UTC Julian date differently: on
+    a leap-second day it stretches the fraction over 86,401 s. Handing SGP4's pair to
+    ``Time(..., format="jd", scale="utc")`` therefore puts an epoch on 2016-12-31 up to
+    a second late (0.5 s at 12:00). Here the pair is split into the UTC midnight that
+    starts the day (an unambiguous instant) and the seconds after it, which are SI
+    seconds because the leap second, when there is one, comes at the end of the day.
+
+    An SGP4 epoch can't fall inside a leap second (the 86,400-second count has no place
+    for it), so every value of the pair maps to exactly one instant.
+
+    The UTC day is picked from the two parts separately, never from their sum: a
+    Julian date near 2.46e6 resolves only about 40 microseconds in one float64, so the
+    sum of a pair within about 20 microseconds of the end of a day rounds up to the
+    next midnight. On a leap-second day that put the epoch a full second late (the
+    seconds were then counted back from the wrong midnight, across the leap second).
+    """
+    jd, fr = float(jdsatepoch), float(jdsatepoch_f)
+    # Whole days and the part of a day carried by jd itself. SGP4's pair has jd on a
+    # midnight (x.5), so `in_jd` is 0 and `in_day` is the fraction at its full precision.
+    day0 = math.floor(jd - 0.5)
+    in_jd = (jd - 0.5) - day0
+    in_day = in_jd + fr
+    carry = math.floor(in_day)  # 0 for SGP4's own pairs; other splits may spill over
+    jd_midnight = day0 + carry + 0.5  # the UTC midnight starting the epoch's day
+    seconds = (in_day - carry) * _DAY_S
+    midnight = Time(jd_midnight, format="jd", scale="utc")
+    return float(time_to_tt_seconds(midnight)) + seconds
 
 
 # --------------------------------------------------------------------------------------

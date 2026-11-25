@@ -1,0 +1,43 @@
+# Residual dataset: stratification labels and the horizon grid
+# (read by orbit_correction.residuals.load_residual_config).
+# Every value here is an instrument: log changes in docs/changelog.md.
+#
+# Status: approved 2026-11-24 for the pilot (bins and the 199-horizon grid). The
+# bins are reporting strata, not model inputs; the grid sets how many rows each
+# window contributes and is looked at again with the learning curve and the
+# generation volume.
+
+[residuals]
+status = "approved 2026-11-24"
+
+# Altitude band of a window: the element set's perigee altitude (catalog column
+# perigee_alt_km: semimajor axis from the Kozai mean motion with the WGS-72 GM,
+# times (1 - e), minus the WGS-72 equatorial radius). Constant over the window.
+# Bins are [-inf, e0), [e0, e1), ..., [e_last, inf); labels are "<e0", "e0-e1", ...,
+# ">=e_last" (km). Windows outside 250-2,000 km should not occur after the catalog
+# filters; if they do, they get the open-ended labels rather than being dropped.
+[residuals.altitude_band]
+quantity = "perigee_alt_km"
+edges_km = [250.0, 400.0, 600.0, 800.0, 1200.0, 2000.0]
+
+# Solar-activity bin of a window: the trailing 81-day mean of observed F10.7 known
+# at the start (residual column asof_f107_obs_trailing81_sfu, SpaceWeather.as_of).
+# Same bin and label rule as above (sfu). A window whose trailing mean is missing
+# gets the label below rather than a guessed bin.
+[residuals.solar_activity_bin]
+quantity = "asof_f107_obs_trailing81_sfu"
+edges_sfu = [90.0, 150.0]
+missing_label = "unknown"
+
+# Times since the start (dt_s) at which every window is sampled: the union of
+# log_points log-spaced values from log_first_s to max_horizon_s and uniform_points
+# evenly spaced values (max_horizon_s / uniform_points, 2 x that, ..., max_horizon_s),
+# each rounded to a multiple of round_to_s, duplicates removed. With the values
+# below: 199 horizons from 60 s to 7 days (7 days is in both parts). dt = 0 is
+# not included (the start-rule offset of about 2 m is the only residual there).
+[residuals.horizon_grid]
+max_horizon_s = 604800.0
+log_first_s = 60.0
+log_points = 100
+uniform_points = 100
+round_to_s = 1.0

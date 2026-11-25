@@ -20,6 +20,18 @@ Data is gitignored and never committed. Downloads go under `data/raw/`.
 | Space-Track `gp_history` (historical element sets) | https://www.space-track.org (`basicspacedata/query/class/gp_history`) | per download, recorded in `data/raw/spacetrack/manifest.jsonl` | not yet downloaded | Free account; Space-Track User Agreement. This project never commits or redistributes Space-Track data |
 | IERS Earth orientation data and leap seconds, via `astropy-iers-data` | https://pypi.org/project/astropy-iers-data/ (data from https://www.iers.org) | 0.2026.11.23.0.35.53, pinned in `uv.lock` | 2026-11-23 | Package BSD-3-Clause; IERS data freely available |
 | Conjunction-assessment verification test set (The Aerospace Corporation with the Department of Commerce; Auman, Murphy and George, user's guide "Conjunction Assessment Verification Data and Process") | Dataset page https://space.commerce.gov/?p=13145; user's guide https://space.commerce.gov/wp-content/uploads/2026/03/Conjunction_Screening_Testset_Users_Guide.pdf | Released March 2026. Ephemerides `AerospaceIVVDataset_20251009a.tar.gz` (22,255,966,812 bytes, SHA-256 `0e990091659c9c564c731882eb213938d32455d4d294995b6fec22e405e13d66`); 10 km spherical answer key `IVV_Releasable_Dataset_Spherical_DefaultHBR.csv.gz` (SHA-256 `3cb76041785ab0302589a7331823fc0e902a825573a8d97a5291232258d755dd`). The SFSH-volume key and volume mappings were not downloaded | 2026-11-23 | CC0-1.0. Not redistributed here: the files stay in `data/` (gitignored); used only for the external check of the screening engine (`scripts/compare_aerospace_testset.py`) |
+| Orekit data bundle (`orekit-data`) | https://gitlab.orekit.org/orekit/orekit-data | git commit `2d6edc9118983d95c51303df05db16ada90b7ee2`, installed by uv from that commit (`orekitdata` in `uv.lock`, `datagen` group) | 2026-11-23 | The bundle has no license file of its own; each file stays under its producer's terms. The truth propagator reads the EIGEN-6S gravity field (GFZ, via ICGEM), JPL DE-440 ephemerides, IERS Earth orientation parameters and the leap-second table; it does not read the bundle's CSSI space-weather file (it reads the project's own copy of CelesTrak's file). Per-source terms not yet checked file by file |
+
+Software that produces or checks data (installed by uv from `uv.lock`; nothing is redistributed here):
+
+| Software | URL | Version | License | Used for |
+|---|---|---|---|---|
+| Orekit | https://www.orekit.org | 13.1.9 | Apache-2.0 | truth propagator (`truth_prop.py`) |
+| orekit-jpype | https://pypi.org/project/orekit-jpype/ | 13.1.9.0 | Apache-2.0 | Python bindings to Orekit through JPype (`datagen` group) |
+| jdk4py | https://pypi.org/project/jdk4py/ | 25.0.5.1 (JDK 25) | GPL-2.0 with the Classpath exception | the Java runtime orekit-jpype runs on (`datagen` group) |
+| brahe | https://github.com/duncaneddy/brahe | 1.9.0 | MIT | independent cross-check of the truth propagator (`crosscheck` group) |
+| pymsis | https://github.com/SWxTREC/pymsis | 0.13.0 | MIT | reference densities in tests only (`dev` group) |
+| astropy-iers-data | https://pypi.org/project/astropy-iers-data/ | 0.2026.11.23.0.35.53 | BSD-3-Clause | Earth orientation data for TEME -> GCRF (row above) |
 
 CelesTrak downloads used here (`curl` with a generic user agent):
 
@@ -41,6 +53,7 @@ WSL2 (Ubuntu), because PhysicsNeMo supports Windows only through WSL. The repo s
 cd /mnt/c/dev/GitHub/orbit-correction-screening
 direnv allow                 # .envrc sets UV_PROJECT_ENVIRONMENT=$HOME/.venvs/orbit-correction-screening
 uv sync                      # Python 3.12 from .python-version; locked deps from uv.lock
+uv sync --group datagen --group crosscheck   # for data generation (Orekit, JVM) and the brahe cross-check
 cp .env.example .env         # then fill in Space-Track credentials (only for the download script)
 ```
 
@@ -72,6 +85,7 @@ None yet.
 What is implemented here and what is library behaviour:
 - SGP4 is the `sgp4` package (Vallado's implementation). TEME to GCRF rotations and time-scale arithmetic are astropy and ERFA. This project adds the conventions and wrappers, EOP pinning and range checks, and tests against the Vallado et al. (2006) reference examples.
 - The space-weather parser, the leak-free as-of lookup, the Orekit-compatible writer, the catalog loaders and filters, and the split logic are this project's own code.
+- The curvilinear RTN residual, its inverse and the residual-row builder (`residuals.py`), and SGP4's 120 km altitude floor (`cheap_prop.py`, geodetic altitude from ERFA's `gc2gd`), are this project's own code.
 
 ## Limitations and scope
 

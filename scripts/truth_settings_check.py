@@ -13,9 +13,9 @@ Part 2, step cap. The truth setting (``config/truth.toml``: DOP853, 1 m toleranc
 the configured maximum step, degree 36) against a converged run (1 mm, 30 s, same
 degree and force model), at 1 h, 1 d and 7 d and as the maximum over 7 days.
 
-SGP4 here is the ``sgp4`` package (WGS-72, mode 'i', the same Satrec as
-``truth_prop.initial_state_from_omm``), rotated TEME -> GCRF with
-``frames.teme_to_gcrf``. Components are RTN of the truth state (T is along-track).
+SGP4 here is ``cheap_prop`` (the ``sgp4`` package with WGS-72, mode 'i', the same
+element set as ``truth_prop.initial_state_from_omm``), rotated TEME -> GCRF exactly.
+Components are rectilinear RTN of the truth state (T is along-track).
 
 Sample objects and epoch: ``scripts/zonal_convergence.py`` (two per band, mean
 elements started at 2024-06-15T00:00 UTC; synthetic states, train-role objects).
@@ -40,7 +40,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import zonal_convergence as Z  # noqa: E402  (sample objects and epoch)
 
 from orbit_correction import truth_prop as T  # noqa: E402
-from orbit_correction.frames import teme_to_gcrf  # noqa: E402
 
 REPO = Path(__file__).resolve().parents[1]
 OUT = REPO / "data" / "derived" / "truth" / "truth_settings_check.json"
@@ -51,25 +50,17 @@ CONVERGED = (1e-3, 30.0)
 
 
 def sgp4_gcrf(record: dict, epoch_utc: str, t_tt_s: np.ndarray) -> np.ndarray:
-    """SGP4 positions (km, GCRF) at TT times, from the shifted-epoch element set."""
-    from sgp4 import omm
-    from sgp4.api import Satrec
+    """SGP4 positions (km, GCRF) at TT times, from the shifted-epoch element set.
 
-    from orbit_correction.frames import satrec_epoch_to_tt_seconds
+    Through ``cheap_prop`` (exact rotation), the same element set and SGP4 path as the
+    truth start (``truth_prop.initial_state_from_omm``).
+    """
+    from orbit_correction.cheap_prop import propagate_sgp4
 
-    fields = {k: str(v) for k, v in record.items()}
-    fields["EPOCH"] = epoch_utc if "." in epoch_utc else epoch_utc + ".000000"
-    sat = Satrec()
-    omm.initialize(sat, fields)
-    t0 = satrec_epoch_to_tt_seconds(sat.jdsatepoch, sat.jdsatepochF)
-    r = np.empty((t_tt_s.size, 3))
-    v = np.empty((t_tt_s.size, 3))
-    for i, t in enumerate(t_tt_s):
-        err, ri, vi = sat.sgp4_tsince((t - t0) / 60.0)
-        if err:
-            raise RuntimeError(f"SGP4 error {err}")
-        r[i], v[i] = ri, vi
-    return teme_to_gcrf(r, v, t_tt_s)[0]
+    res = propagate_sgp4(T._omm_record_elset(record, epoch_utc), t_tt_s, rotation="exact")[0]
+    if not res.status.ok:
+        raise RuntimeError(f"NORAD {res.norad_id}: {res.status.message}")
+    return res.trajectory.r_gcrf_km
 
 
 def rtn_m(r_ref, v_ref, dr):

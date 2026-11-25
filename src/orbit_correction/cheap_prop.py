@@ -56,9 +56,31 @@ Choices
   the states before the first error and nothing after, because once SGP4 has failed
   for an object its later output isn't trustworthy even if the flag clears. If the
   first state already fails, there is no trajectory. Each object gets an
-  :class:`Sgp4Status` saying what happened. (Open decision: whether downstream steps
-  should drop truncated windows, keep them, or use an altitude floor that truncates
-  earlier than SGP4's own one-Earth-radius test.)
+  :class:`Sgp4Status` saying what happened.
+* **120 km altitude floor.** SGP4's decay flag (code 6) fires only below one Earth
+  radius, so a decaying object keeps returning "valid" states far below any physical
+  altitude. A trajectory is also truncated before its first state whose geodetic
+  altitude (WGS-84) is below :data:`ALTITUDE_FLOOR_KM`, the same 120 km threshold at
+  which the truth propagator stops (``config/truth.toml``, ``[truth.reentry]``):
+  one floor for both propagators (approved 2026-11-23). Such a status carries
+  :data:`ALTITUDE_FLOOR_CODE`, which is not one of SGP4's codes. Residual generation
+  drops any window where either propagator stopped early (``residuals.py``).
+  The altitude is computed from the TEME position (:func:`geodetic_altitude_km`), with
+  no JVM and no Earth-rotation angle: the ellipsoid is symmetric about its axis, so
+  only the pole matters, and TEME's pole differs from the Earth-fixed (ITRS) pole only
+  by polar motion. Ignoring polar motion costs under 10 cm of altitude: the change is
+  at most (a - b) x the pole offset, 21.4 km x 3.3e-6 rad = 7 cm at the largest
+  offsets in the IERS table (``tests/test_cheap_prop.py``).
+
+  The floor is tested **only at the requested times**. SGP4 is not searched for the
+  crossing between two samples, whereas truth stops at the crossing itself. So where
+  a trajectory is cut, and with it ``n_valid`` and ``first_error_t_tt_s``, depends on
+  the sampling grid: on the 199-horizon residual grid the first sample below the
+  floor comes up to hours after the one a 60 s grid finds (the uniform part steps by
+  6,048 s, and a low perigee pass can fall between samples), and a dip below 120 km
+  that falls wholly between two samples is not seen at all.
+  ``first_error_t_tt_s`` is the first *sampled* time below the floor, not a re-entry
+  time; don't use it as one.
 
 Time grids
 ----------
@@ -81,6 +103,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal
 
+import erfa
 import numpy as np
 import pyarrow as pa
 from sgp4.api import SGP4_ERRORS, WGS72, Satrec, SatrecArray, jday
@@ -95,6 +118,12 @@ GRAVITY_MODEL_NAME = "WGS-72"
 OPERATION_MODE = "i"
 #: ``source`` of every trajectory this module produces.
 SOURCE = "sgp4"
+#: Geodetic altitude (km, WGS-84) below which a trajectory is truncated. The same value
+#: as the truth propagator's re-entry altitude (``config/truth.toml``); a test checks it.
+ALTITUDE_FLOOR_KM = 120.0
+#: :attr:`Sgp4Status.code` of a trajectory cut at the altitude floor. SGP4's own codes
+#: are 1-6, so a negative code can't be mistaken for one of them.
+ALTITUDE_FLOOR_CODE = -1
 
 #: Objects propagated per SatrecArray call. Bounds memory: one chunk of a 7-day, 60 s
 #: grid holds 256 x 10,081 x 6 float64 values, about 124 MB.
@@ -130,12 +159,19 @@ class Sgp4Status:
 
     Attributes:
         code: 0 if every requested state is valid; otherwise the SGP4 error code at
-            the first failing time (1-4 invalid or out-of-range elements, 6 decayed).
-        message: ``"ok"`` or the ``sgp4`` package's message for ``code``.
+            the first failing time (1-4 invalid or out-of-range elements, 6 decayed),
+            or :data:`ALTITUDE_FLOOR_CODE` (-1) if the trajectory was cut first at
+            the altitude floor.
+        message: ``"ok"``, the ``sgp4`` package's message for ``code``, or a
+            description of the floor crossing.
         n_requested: number of times asked for.
-        n_valid: number of states returned (the states before the first error).
-        first_error_t_tt_s: TT seconds since J2000.0 of the first failing time, or
-            None if there was none.
+        n_valid: number of states returned (the states before the first error or
+            the first state below the floor).
+        first_error_t_tt_s: TT seconds since J2000.0 of the first failing time (or
+            first time below the floor), or None if there was none. It is one of the
+            **requested** times, so it depends on the sampling grid: the object went
+            wrong somewhere in the interval that ends there (for the floor, up to
+            hours earlier on a sparse grid). It is not a re-entry or decay time.
     """
 
     code: int
@@ -153,6 +189,11 @@ class Sgp4Status:
     def truncated(self) -> bool:
         """True when some, but not all, requested states were returned."""
         return 0 < self.n_valid < self.n_requested
+
+    @property
+    def below_floor(self) -> bool:
+        """True when the trajectory was cut at the altitude floor (not an SGP4 error)."""
+        return self.code == ALTITUDE_FLOOR_CODE
 
 
 @dataclass(frozen=True)
@@ -362,17 +403,66 @@ def sgp4_teme_from_epoch(elsets: pa.Table, dt_s: Sequence[float] | np.ndarray,
 # --------------------------------------------------------------------------------------
 
 
+def _first_true(mask: np.ndarray) -> np.ndarray:
+    """Index of the first True in each row, or the row length if none."""
+    return np.where(mask.any(axis=1), mask.argmax(axis=1), mask.shape[1])
+
+
 def _first_errors(error: np.ndarray) -> np.ndarray:
     """Index of the first nonzero code in each row, or the row length if none."""
-    bad = error != 0
-    return np.where(bad.any(axis=1), bad.argmax(axis=1), error.shape[1])
+    return _first_true(error != 0)
 
 
-def _to_results(batch: TemeBatch, rotation: Rotation) -> list[Sgp4Result]:
+def geodetic_altitude_km(r_teme_km: np.ndarray) -> np.ndarray:
+    """Geodetic altitude above the WGS-84 ellipsoid of TEME positions, km.
+
+    Uses ERFA's ``gc2gd`` (WGS-84) on the TEME position as if it were Earth-fixed.
+    That is exact up to polar motion: geodetic altitude depends only on the distance
+    from the ellipsoid's axis and along it, so the Earth-rotation angle drops out, and
+    TEME's z axis (the true pole of date) differs from the ITRS pole only by polar
+    motion. Tilting the pole by an angle theta changes the altitude by at most
+    (a - b) theta: 7 cm at the largest pole offsets in the IERS table (0.68 arcsec),
+    so ignoring polar motion costs under 10 cm. No JVM, no EOP.
+
+    Args:
+        r_teme_km: shape (..., 3), finite TEME positions, km.
+
+    Returns:
+        shape (...), altitude in km.
+    """
+    r = np.asarray(r_teme_km, dtype=np.float64)
+    if r.shape[-1:] != (3,):
+        raise ValueError(f"r_teme_km must have shape (..., 3), got {r.shape}")
+    if not np.all(np.isfinite(r)):
+        raise ValueError("r_teme_km contains NaN or inf")
+    _, _, height_m = erfa.gc2gd(1, r * 1000.0)  # 1 = WGS-84
+    return np.asarray(height_m, dtype=np.float64) / 1000.0
+
+
+def _first_below_floor(batch: TemeBatch, n_err: np.ndarray, floor_km: float) -> np.ndarray:
+    """Index of each row's first state below the floor among its unflagged states."""
+    k, n = batch.error.shape
+    unflagged = np.arange(n)[None, :] < n_err[:, None]
+    below = np.zeros((k, n), dtype=bool)
+    if unflagged.any():
+        below[unflagged] = geodetic_altitude_km(batch.r_teme_km[unflagged]) < floor_km
+    return _first_true(below)
+
+
+def _to_results(
+    batch: TemeBatch, rotation: Rotation, floor_km: float | None = ALTITUDE_FLOOR_KM
+) -> list[Sgp4Result]:
     if rotation not in ("fast", "exact"):
         raise ValueError(f"rotation must be 'fast' or 'exact', got {rotation!r}")
     k, n = batch.error.shape
-    n_valid = _first_errors(batch.error)
+    n_err = _first_errors(batch.error)
+    if floor_km is None:
+        n_floor = np.full(k, n)
+    else:
+        n_floor = _first_below_floor(batch, n_err, float(floor_km))
+    # Cut at whichever comes first; on the same state, SGP4's own flag wins (a flagged
+    # state's position isn't trustworthy enough to place it against the floor).
+    n_valid = np.minimum(n_err, n_floor)
 
     # Rotate every valid state in one call; the fast path's cost is then dominated by
     # the node rotations it hasn't cached yet.
@@ -389,6 +479,14 @@ def _to_results(batch: TemeBatch, rotation: Rotation) -> list[Sgp4Result]:
         m = int(n_valid[i])
         if m == n:
             status = Sgp4Status(0, "ok", n, n, None)
+        elif n_floor[i] < n_err[i]:
+            status = Sgp4Status(
+                ALTITUDE_FLOOR_CODE,
+                f"geodetic altitude below the {floor_km:g} km floor",
+                n,
+                m,
+                float(batch.t_tt_s[i, m]),
+            )
         else:
             code = int(batch.error[i, m])
             status = Sgp4Status(
@@ -413,6 +511,7 @@ def propagate_sgp4(
     *,
     rotation: Rotation = "fast",
     chunk_objects: int = DEFAULT_CHUNK_OBJECTS,
+    floor_km: float | None = ALTITUDE_FLOOR_KM,
 ) -> list[Sgp4Result]:
     """Propagate every element set with SGP4 onto one shared TT grid, in GCRF.
 
@@ -425,12 +524,18 @@ def propagate_sgp4(
             the exact path) or ``"exact"`` (:func:`frames.teme_to_gcrf`).
         chunk_objects: element sets per SGP4 batch (memory bound only; results do not
             depend on it).
+        floor_km: geodetic altitude floor (default :data:`ALTITUDE_FLOOR_KM`); None
+            turns it off and keeps only SGP4's own error test.
 
     Returns:
         One :class:`Sgp4Result` per row, in row order. Trajectories are truncated
-        before the first SGP4 error (see the module docstring).
+        before the first SGP4 error or the first state below the floor, whichever
+        comes first (see the module docstring). Both are tested at ``times_tt_s``
+        only, so the cut and ``status.first_error_t_tt_s`` depend on the grid;
+        the latter is not a re-entry time.
     """
-    return _to_results(sgp4_teme(elsets, times_tt_s, chunk_objects=chunk_objects), rotation)
+    batch = sgp4_teme(elsets, times_tt_s, chunk_objects=chunk_objects)
+    return _to_results(batch, rotation, floor_km)
 
 
 def propagate_sgp4_from_epoch(
@@ -439,14 +544,17 @@ def propagate_sgp4_from_epoch(
     *,
     rotation: Rotation = "fast",
     chunk_objects: int = DEFAULT_CHUNK_OBJECTS,
+    floor_km: float | None = ALTITUDE_FLOOR_KM,
 ) -> list[Sgp4Result]:
     """Propagate each element set to ``dt_s`` SI seconds after its own epoch, in GCRF.
 
     Same as :func:`propagate_sgp4` except for the grid: object i's trajectory times
     are ``epoch_tt_s[i] + dt_s``. Use for windows that start at the element-set epoch.
+    As there, the floor and SGP4's error flag are tested at the requested times only,
+    so ``status.first_error_t_tt_s`` depends on ``dt_s`` and is not a re-entry time.
     """
     batch = sgp4_teme_from_epoch(elsets, dt_s, chunk_objects=chunk_objects)
-    return _to_results(batch, rotation)
+    return _to_results(batch, rotation, floor_km)
 
 
 def sgp4_epoch_states(elsets: pa.Table) -> list[Sgp4Result]:
@@ -454,7 +562,8 @@ def sgp4_epoch_states(elsets: pa.Table) -> list[Sgp4Result]:
 
     This is the state the truth propagator starts from. Converting the SGP4 mean
     elements to an osculating state this way is the project's deliberate, logged
-    initialisation (see ``docs/methodology.md``).
+    initialisation (see ``docs/methodology.md``). A state already below the altitude
+    floor gives no trajectory (status code :data:`ALTITUDE_FLOOR_CODE`).
     """
     return propagate_sgp4_from_epoch(elsets, np.zeros(1), rotation="exact")
 
@@ -465,9 +574,11 @@ def results_ok(results: Sequence[Sgp4Result]) -> list[Trajectory]:
 
 
 def status_counts(results: Sequence[Sgp4Result]) -> dict[str, int]:
-    """Counts of ok, truncated and empty results, plus counts per SGP4 error code.
+    """Counts of ok, truncated and empty results, plus counts per cause.
 
-    Failed propagations are a metric to report, never something to drop silently.
+    Causes are keyed ``code_<n>`` for SGP4's error codes and ``altitude_floor`` for
+    trajectories cut at the floor. Failed propagations are a metric to report, never
+    something to drop silently.
     """
     counts: dict[str, int] = {"ok": 0, "truncated": 0, "empty": 0}
     for r in results:
@@ -476,12 +587,14 @@ def status_counts(results: Sequence[Sgp4Result]) -> dict[str, int]:
             counts["ok"] += 1
             continue
         counts["truncated" if s.n_valid else "empty"] += 1
-        key = f"code_{s.code}"
+        key = "altitude_floor" if s.below_floor else f"code_{s.code}"
         counts[key] = counts.get(key, 0) + 1
     return counts
 
 
 __all__ = [
+    "ALTITUDE_FLOOR_CODE",
+    "ALTITUDE_FLOOR_KM",
     "DEFAULT_CHUNK_OBJECTS",
     "GRAVITY_MODEL",
     "GRAVITY_MODEL_NAME",
@@ -491,6 +604,7 @@ __all__ = [
     "Sgp4Result",
     "Sgp4Status",
     "TemeBatch",
+    "geodetic_altitude_km",
     "propagate_sgp4",
     "propagate_sgp4_from_epoch",
     "results_ok",
