@@ -396,6 +396,148 @@ def test_initial_state_wrapper_refuses_a_start_below_the_floor():
 
 
 # --------------------------------------------------------------------------------------
+# Always run: the fitted start rule's configuration, samples and guards (no JVM)
+# --------------------------------------------------------------------------------------
+
+FIT = T.FIT_START_RULE
+
+
+def _fit_cfg(**changes):
+    return dataclasses.replace(T.load_truth_config(), start_rule=FIT, **changes)
+
+
+def _gravity_elset(gp_record, epoch_utc, *, hp_km=800.0, e=0.001, ma_deg=90.0, bstar=1e-7):
+    """A fixture element set with its perigee altitude, eccentricity, mean anomaly and B*
+    replaced (a synthetic case, as in ``initial_state_from_omm``)."""
+    import math
+
+    rec = dict(gp_record)
+    a = (6378.135 + hp_km) / (1.0 - e)  # WGS-72 radius and GM, as SGP4's mean elements
+    rec.update(
+        ECCENTRICITY=e,
+        MEAN_ANOMALY=ma_deg,
+        BSTAR=bstar,
+        MEAN_MOTION=math.sqrt(398600.8 / a**3) * DAY / (2 * math.pi),
+    )
+    return T._omm_record_elset(rec, epoch_utc)
+
+
+def _gp_record(norad):
+    for r in json.loads((FIXTURES / "celestrak_gp_sample.json").read_text()):
+        if int(r["NORAD_CAT_ID"]) == norad:
+            return r
+    raise KeyError(norad)
+
+
+def test_fitted_rule_is_selectable_but_not_the_default(tmp_path):
+    cfg = T.load_truth_config()
+    assert cfg.start_rule == "preserve_sgp4_mean_motion"
+    assert FIT == "fit_to_sgp4_before_epoch" and FIT in T.START_RULES
+    assert (cfg.fit_span_s, cfg.fit_step_s, cfg.fit_max_iterations) == (DAY, 60.0, 8)
+    assert (cfg.fit_tolerance_m, cfg.fit_tolerance_m_s) == (1e-3, 1e-6)
+    assert dataclasses.replace(cfg, start_rule=FIT).start_rule == FIT
+    # a config file written before the fitted rule (no fit_* keys) still loads
+    text = (REPO / "config" / "truth.toml").read_text()
+    old = "\n".join(line for line in text.splitlines() if not line.startswith("fit_"))
+    (tmp_path / "old.toml").write_text(old)
+    assert T.load_truth_config(tmp_path / "old.toml") == cfg
+    for bad in (
+        dict(fit_span_s=0.0),
+        dict(fit_step_s=-60.0),
+        dict(fit_step_s=DAY),  # fewer than three samples
+        dict(fit_max_iterations=0),
+        dict(fit_tolerance_m=0.0),
+        dict(fit_tolerance_m_s=-1e-6),
+    ):
+        with pytest.raises(ValueError):
+            dataclasses.replace(cfg, **bad)
+
+
+def test_fit_sample_offsets_end_exactly_at_the_epoch():
+    off = T.fit_sample_offsets_s(_fit_cfg())
+    assert off.size == 1441 and off[0] == -DAY and off[-1] == 0.0
+    assert np.all(off <= 0.0) and np.all(np.diff(off) == 60.0)
+    off = T.fit_sample_offsets_s(_fit_cfg(fit_span_s=1000.0, fit_step_s=300.0))
+    np.testing.assert_array_equal(off, [-900.0, -600.0, -300.0, 0.0])
+
+
+def test_fit_samples_ask_sgp4_for_nothing_after_the_epoch(monkeypatch):
+    """Every time handed to SGP4 for the fit samples is at or before the epoch."""
+    from orbit_correction import cheap_prop
+
+    asked = []
+    real = cheap_prop._sgp4_teme
+
+    def spy(elsets, grid_s, from_epoch, chunk_objects):
+        asked.append((np.array(grid_s), from_epoch))
+        return real(elsets, grid_s, from_epoch, chunk_objects)
+
+    monkeypatch.setattr(cheap_prop, "_sgp4_teme", spy)
+    el = _gravity_elset(_gp_record(25544), "2024-06-15T00:00:00")
+    res = T.fit_samples_from_elsets(el, _fit_cfg())[0]
+    epoch = el.column("epoch_tt_s")[0].as_py()
+    assert res.status.ok and len(res.trajectory) == 1441
+    assert len(asked) == 1 and asked[0][1] is True and asked[0][0].max() == 0.0
+    assert res.trajectory.t_tt_s.max() == epoch and res.trajectory.t_tt_s.min() == epoch - DAY
+
+
+def test_fit_samples_after_the_epoch_are_refused():
+    """Refused before any JVM is needed: late samples, missing samples, samples under
+    another rule, too few, another object's, and the start rule applied without samples."""
+    t0 = utc_to_tt_seconds("2024-06-15T00:00:00")
+    init = circular_state(800.0, 51.6, t0, nid=7)
+    grid = T.output_grid(t0, DAY, 60.0)
+    no_drag = _fit_cfg(atmosphere="none")
+
+    def samples(times, nid=7):
+        n = len(times)
+        return Trajectory(nid, np.asarray(times, float), np.tile(init.r_gcrf_km, (n, 1)),
+                          np.tile(init.v_gcrf_km_s, (n, 1)), "sgp4")
+
+    ok = samples(t0 + np.array([-120.0, -60.0, 0.0]))
+    late = samples(t0 + np.array([-120.0, -60.0, 0.0, 1e-3]))
+    with pytest.raises(ValueError, match="after the epoch"):
+        T.propagate_truth(init, None, grid, no_drag, None, fit_samples=late)
+    with pytest.raises(ValueError, match="needs fit_samples"):
+        T.propagate_truth(init, None, grid, no_drag, None)
+    with pytest.raises(ValueError, match="at least 3"):
+        T.propagate_truth(init, None, grid, no_drag, None, fit_samples=samples([t0 - 60.0, t0]))
+    with pytest.raises(ValueError, match="NORAD"):
+        T.propagate_truth(init, None, grid, no_drag, None,
+                          fit_samples=samples(t0 + np.array([-120.0, -60.0, 0.0]), nid=8))
+    with pytest.raises(ValueError, match="would be ignored"):
+        T.propagate_truth(init, None, grid, dataclasses.replace(no_drag, start_rule=
+                          "preserve_sgp4_mean_motion"), None, fit_samples=ok)
+    with pytest.raises(ValueError, match="fit_start_to_sgp4"):
+        T.apply_start_rule(init, MU_TRUTH_M3, no_drag)
+    # the pool refuses the batch before starting a worker
+    with pytest.raises(ValueError, match="job 1 .*after the epoch"):
+        T.propagate_batch([T.TruthJob(init, None, grid, fit_samples=ok),
+                           T.TruthJob(init, None, grid, fit_samples=late)], no_drag, None, 1)
+    with pytest.raises(ValueError, match="job 0 .*needs fit_samples"):
+        T.propagate_batch([T.TruthJob(init, None, grid)], no_drag, None, 1)
+
+
+def test_space_weather_guard_covers_the_fit_span(tmp_path):
+    """A copy checked from the epoch's day refuses a fitted window whose span starts the
+    day before; a copy checked from the first sample's day accepts it."""
+    t0, june = _june_copy(tmp_path)  # checked from 2024-06-15T00:00
+    init = circular_state(500.0, 51.6, t0 + 3600.0)
+    grid = T.output_grid(t0 + 3600.0, DAY, 60.0)
+    fit_s = Trajectory(1, t0 + 3600.0 + T.fit_sample_offsets_s(_fit_cfg()),
+                       np.tile(init.r_gcrf_km, (1441, 1)), np.tile(init.v_gcrf_km_s, (1441, 1)),
+                       "sgp4")
+    cfg = _fit_cfg()
+    with pytest.raises(T.SpaceWeatherRangeError, match="outside"):
+        T.propagate_truth(init, 1e-4, grid, cfg, june, fit_samples=fit_s)
+    with pytest.raises(T.SpaceWeatherRangeError, match="job 0"):
+        T.propagate_batch([T.TruthJob(init, 1e-4, grid, fit_samples=fit_s)], cfg, june, 1)
+    wide = T.write_space_weather_copy(SW_FIXTURE, tmp_path / "sw_wide.txt",
+                                      float(fit_s.t_tt_s[0]), float(grid[-1]))
+    wide.check_window(float(fit_s.t_tt_s[0]), float(grid[-1]))
+
+
+# --------------------------------------------------------------------------------------
 # datagen: shared JVM and inputs
 # --------------------------------------------------------------------------------------
 
@@ -1100,6 +1242,173 @@ def test_reproducible_to_a_millimetre_across_workers_and_job_order(
     np.testing.assert_allclose(here.trajectory.r_gcrf_km, got["one"], rtol=0, atol=tol_km)
     # different jobs really are different (the comparison above isn't vacuous)
     assert np.max(np.abs(got["two_0"] - got["two_1"])) > 1.0
+
+
+# --------------------------------------------------------------------------------------
+# datagen: the fitted start rule
+# --------------------------------------------------------------------------------------
+
+
+def _fit_inputs(el):
+    from orbit_correction.cheap_prop import sgp4_epoch_states
+
+    row = el.to_pylist()[0]
+    init = sgp4_epoch_states(el)[0].trajectory
+    return row, init
+
+
+@datagen
+def test_fitted_start_reads_no_sgp4_state_after_the_epoch(ctx, sw_copy, monkeypatch):
+    """The whole fitted path, SGP4 samples to truth trajectory, under a spy on SGP4: every
+    instant SGP4 is evaluated at is at or before the epoch, and the fitted start is the
+    same when every SGP4 state after the epoch is replaced by garbage."""
+    from orbit_correction import cheap_prop
+
+    el = _gravity_elset(_gp_record(25544), SAMPLE_EPOCH_UTC, e=0.02, ma_deg=90.0)
+    row, init = _fit_inputs(el)
+    epoch = row["epoch_tt_s"]
+    asked = []
+    real = cheap_prop._sgp4_teme
+
+    def poisoned(elsets, grid_s, from_epoch, chunk_objects):
+        batch = real(elsets, grid_s, from_epoch, chunk_objects)
+        asked.append(batch.t_tt_s.copy())
+        after = batch.t_tt_s > batch.epoch_tt_s[:, None]
+        batch.r_teme_km[after] = 1.0e6  # garbage anything after the epoch would read
+        return batch
+
+    monkeypatch.setattr(cheap_prop, "_sgp4_teme", poisoned)
+    cfg = _fit_cfg()
+    samples = T.fit_samples_from_elsets(el, cfg)[0].trajectory
+    grid = T.output_grid(epoch, DAY, 600.0)
+    res = T.propagate_truth(init, row["bstar_per_earth_radii"], grid, cfg, sw_copy,
+                            fit_samples=samples)
+    assert asked and max(float(a.max()) for a in asked) <= epoch
+    assert res.status == "ok" and res.start_fit.converged
+    assert res.start_fit.last_sample_tt_s <= epoch
+    assert res.start_scale is None and res.trajectory.t_tt_s[0] == epoch
+    # nothing above read the poisoned states, so the start is the unpoisoned fit's
+    monkeypatch.setattr(cheap_prop, "_sgp4_teme", real)
+    clean = T.fit_samples_from_elsets(el, cfg)[0].trajectory
+    again, _ = T.fit_start_to_sgp4(init, clean, row["bstar_per_earth_radii"], cfg, sw_copy)
+    np.testing.assert_allclose(res.trajectory.r_gcrf_km[0], again.r_gcrf_km[0], rtol=0,
+                               atol=1e-9)
+
+
+@datagen
+def test_fit_recovers_a_known_state(cfg, ctx):
+    """Synthetic ground truth: samples made by the truth model itself from a known state.
+    Started 200 m and 0.2 m/s away, the fit returns that state to a millimetre."""
+    no_drag = dataclasses.replace(cfg, start_rule=FIT, atmosphere="none")
+    t0 = utc_to_tt_seconds(SAMPLE_EPOCH_UTC)
+    true = kepler_state(7178.0, 0.03, 63.0, 40.0, 25.0, 140.0, t0, nid=5)
+    prop, _, ctx2 = T.build_propagator(no_drag, true, None, None)
+    gen = prop.getEphemerisGenerator()
+    times = t0 + T.fit_sample_offsets_s(no_drag)
+    prop.propagate(ctx2.date(t0), ctx2.date(float(times[0])))
+    eph = gen.getGeneratedEphemeris()
+    r = np.array([[p.getX(), p.getY(), p.getZ()] for p in
+                  (eph.getPVCoordinates(ctx2.date(float(t)), ctx2.gcrf).getPosition()
+                   for t in times)]) / 1000.0
+    samples = Trajectory(5, times, r, np.zeros_like(r), "sgp4")
+    guess = Trajectory(5, true.t_tt_s.copy(), true.r_gcrf_km + [0.2, -0.1, 0.1],
+                       true.v_gcrf_km_s + [1e-4, 2e-4, -1e-4], "sgp4")
+    fitted, rec = T.fit_start_to_sgp4(guess, samples, None, no_drag, None)
+    assert rec.converged and rec.iterations <= 4, rec
+    assert rec.rms_initial_m > 1e3 and rec.rms_m < 1e-3, rec
+    dr = np.linalg.norm(fitted.r_gcrf_km[0] - true.r_gcrf_km[0]) * 1e3
+    dv = np.linalg.norm(fitted.v_gcrf_km_s[0] - true.v_gcrf_km_s[0]) * 1e3
+    assert dr < 1e-3 and dv < 1e-6, (dr, dv)
+
+
+@datagen
+def test_a_fit_that_does_not_converge_is_a_status(ctx, sw_copy):
+    """One pass is not enough: status fit_failed with the fit's record, no trajectory,
+    no fallback start."""
+    el = _gravity_elset(_gp_record(25544), SAMPLE_EPOCH_UTC)
+    row, init = _fit_inputs(el)
+    cfg = _fit_cfg(fit_max_iterations=1)
+    samples = T.fit_samples_from_elsets(el, cfg)[0].trajectory
+    res = T.propagate_truth(init, row["bstar_per_earth_radii"],
+                            T.output_grid(row["epoch_tt_s"], DAY, 600.0), cfg, sw_copy,
+                            fit_samples=samples)
+    assert res.status == "fit_failed" and res.trajectory is None
+    f = res.start_fit
+    assert f.status == "not_converged" and f.iterations == 1 and not f.converged
+    assert f.n_samples == 1441 and f.n_evaluations > 0 and "not_converged" in res.message
+    assert f.status in T.FIT_STATUSES
+
+
+@datagen
+def test_fitted_start_removes_the_phase_drift(ctx, sw_copy):
+    """800 km, e = 0.02, almost no drag, mean anomaly 90 and 270 degrees at the epoch.
+    Started at the SGP4 state the truth orbit drifts against SGP4 by about +74 and
+    -72 km in 7 days (opposite signs: the artifact depends on phase). The fitted start
+    leaves under 2 km."""
+    from orbit_correction.cheap_prop import propagate_sgp4
+    from orbit_correction.residuals import rtn_from_states
+
+    t7 = {}
+    for ma in (90.0, 270.0):
+        el = _gravity_elset(_gp_record(25544), SAMPLE_EPOCH_UTC, e=0.02, ma_deg=ma)
+        row, init = _fit_inputs(el)
+        grid = T.output_grid(row["epoch_tt_s"], 7 * DAY, 3600.0)
+        sg = propagate_sgp4(el, grid)[0].trajectory
+        samples = T.fit_samples_from_elsets(el, _fit_cfg())[0].trajectory
+        for rule in ("preserve_sgp4_mean_motion", FIT):
+            cfg = dataclasses.replace(T.load_truth_config(), start_rule=rule)
+            kw = {"fit_samples": samples} if rule == FIT else {}
+            tr = T.propagate_truth(init, row["bstar_per_earth_radii"], grid, cfg, sw_copy, **kw)
+            rtn = rtn_from_states(sg.r_gcrf_km, sg.v_gcrf_km_s, tr.trajectory.r_gcrf_km)
+            t7[(ma, rule)] = rtn[-1, 1]
+    assert t7[(90.0, "preserve_sgp4_mean_motion")] > 50.0, t7
+    assert t7[(270.0, "preserve_sgp4_mean_motion")] < -50.0, t7
+    assert abs(t7[(90.0, FIT)]) < 2.0 and abs(t7[(270.0, FIT)]) < 2.0, t7
+
+
+_FIT_POOL_SCRIPT = """
+import dataclasses, pickle, sys, json
+from orbit_correction import truth_prop as T
+from orbit_correction.cheap_prop import sgp4_epoch_states
+
+def main():
+    sw = pickle.loads(open(sys.argv[1], "rb").read())
+    rec, epoch = json.loads(open(sys.argv[2]).read())
+    cfg = dataclasses.replace(T.load_truth_config(), start_rule=T.FIT_START_RULE)
+    el = T._omm_record_elset(rec, epoch)
+    init = sgp4_epoch_states(el)[0].trajectory
+    samples = T.fit_samples_from_elsets(el, cfg)[0]
+    assert samples.status.ok
+    bstar = el.column("bstar_per_earth_radii")[0].as_py()
+    job = T.TruthJob(init, bstar, T.output_grid(init.t_tt_s[0], 86400.0, 600.0),
+                     fit_samples=samples.trajectory)
+    res = T.propagate_batch([job], cfg, sw, n_workers=1)[0]
+    assert res.status == "ok", res.message
+    assert res.start_fit is not None and res.start_fit.converged, res.start_fit
+    assert not T.jvm_started() and "jpype" not in sys.modules
+    print("OK", res.start_fit.iterations, res.start_fit.rms_m)
+
+if __name__ == "__main__":
+    main()
+"""
+
+
+@datagen
+def test_fitted_start_runs_through_the_worker_pool(sw_copy, gp_records, tmp_path):
+    """The generation hook: SGP4 fit samples made in a JVM-free parent, carried by
+    TruthJob into a spawned worker; the result carries the fit's record back."""
+    import pickle
+
+    (tmp_path / "rec.json").write_text(json.dumps([gp_records[44714], SAMPLE_EPOCH_UTC]))
+    (tmp_path / "sw.pkl").write_bytes(pickle.dumps(sw_copy))
+    (tmp_path / "pool.py").write_text(_FIT_POOL_SCRIPT)
+    proc = subprocess.run(
+        [sys.executable, str(tmp_path / "pool.py"), str(tmp_path / "sw.pkl"),
+         str(tmp_path / "rec.json")],
+        capture_output=True, text=True, cwd=REPO, timeout=900,
+    )
+    assert proc.returncode == 0, proc.stderr[-3000:]
+    assert proc.stdout.startswith("OK")
 
 
 # --------------------------------------------------------------------------------------

@@ -57,8 +57,30 @@ artefact: position and velocity are both multiplied by
 ``mu_truth`` the scaled state has the original state's two-body period under
 ``mu_WGS72``, the same eccentricity vector and the same orbit plane; it sits
 about 2 m from the SGP4 state. ``sgp4_state_direct`` (k = 1) is kept for
-comparison. A start fitted to SGP4 is a separate, labeled sensitivity variant
-and is not implemented here.
+comparison.
+
+The fitted start, ``fit_to_sgp4_before_epoch``
+----------------------------------------------
+A labeled variant, not the default. Starting from SGP4's state at one instant
+ties the truth orbit's mean motion to where in its orbit the object is at the
+epoch: SGP4's short-periodic terms make that state's osculating period differ
+from the period SGP4 itself keeps, by an amount that depends on the orbital
+phase. Truth then drifts along-track against SGP4 by a phase-dependent amount
+(about +-13 km over 7 days at 800 km near-circular, hundreds of km at
+e = 0.07, with no drag). Element sets fitted to tracking over a span don't
+carry that artifact.
+
+The variant fits the truth state at the epoch (position and velocity, six
+numbers) by least squares to SGP4's GCRF positions at times in
+``[epoch - span, epoch]`` (:func:`fit_start_to_sgp4`). Each pass propagates
+backwards from the epoch with the full truth force model (the same
+:func:`build_propagator`: zonals, drag with the B*-derived A/m, the run's
+space-weather copy) and Orekit's state transition matrix, and takes one
+Gauss-Newton step. **Only SGP4 states at or before the epoch enter the fit**;
+:func:`fit_start_to_sgp4` refuses any sample after it, so nothing from the
+prediction window can shape the start. The GM rescale is not needed: the fit
+finds whatever state matches SGP4 under the truth GM. A fit that does not
+converge returns ``TruthResult(status="fit_failed")``, never a fallback start.
 
 Reproducibility
 ---------------
@@ -95,8 +117,12 @@ REPO = Path(__file__).resolve().parents[2]
 CONFIG_PATH = REPO / "config" / "truth.toml"
 #: Source of the truth data-end margin (``truth_data_end_margin_days``).
 SPLITS_CONFIG_PATH = REPO / "config" / "splits.toml"
+#: The fitted start rule (a labeled sensitivity variant; see the module docstring).
+FIT_START_RULE = "fit_to_sgp4_before_epoch"
 #: Start rules accepted in ``[truth.start] rule``.
-START_RULES = ("preserve_sgp4_mean_motion", "sgp4_state_direct")
+START_RULES = ("preserve_sgp4_mean_motion", "sgp4_state_direct", FIT_START_RULE)
+#: Outcomes of a fitted start (:class:`StartFit`); only ``converged`` gives a trajectory.
+FIT_STATUSES = ("converged", "not_converged", "diverged")
 
 _DAY_S = 86400.0
 
@@ -139,6 +165,12 @@ class TruthConfig:
     jvm_active_processor_count: int
     start_rule: str = "preserve_sgp4_mean_motion"
     sgp4_mu_km3_s2: float = 398600.8
+    # Fitted start (used only when start_rule == FIT_START_RULE; see [truth.start]).
+    fit_span_s: float = 86400.0
+    fit_step_s: float = 60.0
+    fit_max_iterations: int = 8
+    fit_tolerance_m: float = 1.0e-3
+    fit_tolerance_m_s: float = 1.0e-6
 
     def __post_init__(self) -> None:
         if self.zonal_degree < 0 or self.zonal_degree == 1:
@@ -173,6 +205,13 @@ class TruthConfig:
             raise ValueError(f"start_rule must be one of {START_RULES}, got {self.start_rule!r}")
         if not self.sgp4_mu_km3_s2 > 0:
             raise ValueError("sgp4_mu_km3_s2 must be positive")
+        for name in ("fit_span_s", "fit_step_s", "fit_tolerance_m", "fit_tolerance_m_s"):
+            if not getattr(self, name) > 0:
+                raise ValueError(f"{name} must be positive")
+        if self.fit_step_s > self.fit_span_s / 2:
+            raise ValueError("fit_step_s must leave at least three samples in fit_span_s")
+        if self.fit_max_iterations < 1:
+            raise ValueError("fit_max_iterations must be >= 1")
         if self.jvm_active_processor_count < 0:
             raise ValueError("jvm_active_processor_count must be >= 0 (0 = no cap)")
 
@@ -181,6 +220,15 @@ def load_truth_config(path: str | Path = CONFIG_PATH) -> TruthConfig:
     """Read ``config/truth.toml`` (or another file with the same layout)."""
     with open(path, "rb") as f:
         t = tomllib.load(f)["truth"]
+    start = t["start"]
+    # The fit settings are optional, so files written before the fitted rule still load.
+    fit = {
+        "fit_span_s": float(start.get("fit_span_days", 1.0)) * _DAY_S,
+        "fit_step_s": float(start.get("fit_step_s", 60.0)),
+        "fit_max_iterations": int(start.get("fit_max_iterations", 8)),
+        "fit_tolerance_m": float(start.get("fit_tolerance_m", 1.0e-3)),
+        "fit_tolerance_m_s": float(start.get("fit_tolerance_m_s", 1.0e-6)),
+    }
     return TruthConfig(
         status=t["status"],
         orekit_data_commit=t["data"]["orekit_data_commit"],
@@ -206,8 +254,9 @@ def load_truth_config(path: str | Path = CONFIG_PATH) -> TruthConfig:
         reentry_altitude_km=float(t["reentry"]["altitude_km"]),
         reentry_max_check_s=float(t["reentry"]["max_check_s"]),
         jvm_active_processor_count=int(t["jvm"]["active_processor_count"]),
-        start_rule=t["start"]["rule"],
-        sgp4_mu_km3_s2=float(t["start"]["sgp4_mu_km3_s2"]),
+        start_rule=start["rule"],
+        sgp4_mu_km3_s2=float(start["sgp4_mu_km3_s2"]),
+        **fit,
     )
 
 
@@ -293,7 +342,9 @@ def start_rule_scale(mu_truth_m3_s2: float, cfg: TruthConfig) -> float:
     ``r' = k r`` and ``v' = k v``, the vis-viva relation gives ``a' = k a``
     under ``mu_truth = k^3 mu_sgp4``, so the mean motion ``sqrt(mu / a^3)`` is
     unchanged; the eccentricity vector ``(v x h) / mu - r / |r|`` and the plane
-    are unchanged too. ``sgp4_state_direct``: k = 1.
+    are unchanged too. ``sgp4_state_direct``: k = 1. ``fit_to_sgp4_before_epoch``:
+    the same k as ``preserve_sgp4_mean_motion``, applied to the fit's initial guess
+    only (the fitted state replaces it).
 
     Args:
         mu_truth_m3_s2: GM of the truth gravity field (Orekit's, m^3/s^2).
@@ -304,14 +355,7 @@ def start_rule_scale(mu_truth_m3_s2: float, cfg: TruthConfig) -> float:
     return (float(mu_truth_m3_s2) / (cfg.sgp4_mu_km3_s2 * 1.0e9)) ** (1.0 / 3.0)
 
 
-def apply_start_rule(initial: Trajectory, mu_truth_m3_s2: float, cfg: TruthConfig) -> Trajectory:
-    """The truth initial state: ``initial`` scaled by :func:`start_rule_scale`.
-
-    :func:`propagate_truth` calls this; scripts that build their own Orekit
-    propagators (the brahe cross-check) call it to start from the same state.
-    Returns ``initial`` itself when k = 1.
-    """
-    k = start_rule_scale(mu_truth_m3_s2, cfg)
+def _scaled(initial: Trajectory, k: float) -> Trajectory:
     if k == 1.0:
         return initial
     return Trajectory(
@@ -323,6 +367,25 @@ def apply_start_rule(initial: Trajectory, mu_truth_m3_s2: float, cfg: TruthConfi
     )
 
 
+def apply_start_rule(initial: Trajectory, mu_truth_m3_s2: float, cfg: TruthConfig) -> Trajectory:
+    """The truth initial state: ``initial`` scaled by :func:`start_rule_scale`.
+
+    :func:`propagate_truth` calls this; scripts that build their own Orekit
+    propagators (the brahe cross-check) call it to start from the same state.
+    Returns ``initial`` itself when k = 1.
+
+    Raises:
+        ValueError: for the fitted rule, whose start depends on SGP4 states before
+            the epoch, not on ``initial`` alone (use :func:`fit_start_to_sgp4`).
+    """
+    if cfg.start_rule == FIT_START_RULE:
+        raise ValueError(
+            f"start rule {FIT_START_RULE!r} needs SGP4 samples before the epoch; "
+            "use fit_start_to_sgp4 or propagate_truth(..., fit_samples=...)"
+        )
+    return _scaled(initial, start_rule_scale(mu_truth_m3_s2, cfg))
+
+
 def output_grid(t0_tt_s: float, horizon_s: float, step_s: float) -> np.ndarray:
     """A regular output grid ``t0, t0 + step, ..., t0 + horizon`` (TT seconds).
 
@@ -331,6 +394,37 @@ def output_grid(t0_tt_s: float, horizon_s: float, step_s: float) -> np.ndarray:
     """
     n = int(math.floor(horizon_s / step_s + 1e-9))
     return float(t0_tt_s) + step_s * np.arange(n + 1, dtype=np.float64)
+
+
+def fit_sample_offsets_s(cfg: TruthConfig) -> np.ndarray:
+    """Times of the fitted start's SGP4 samples, seconds from the epoch: ``-span .. 0``.
+
+    ``-n * step, ..., -step, 0`` with ``n = floor(span / step)``, built from the epoch
+    backwards so the last sample is exactly the epoch. Every value is <= 0: the fit
+    sees nothing after the epoch.
+    """
+    n = int(math.floor(cfg.fit_span_s / cfg.fit_step_s + 1e-9))
+    return -cfg.fit_step_s * np.arange(n, -1, -1, dtype=np.float64)
+
+
+def fit_samples_from_elsets(elsets, cfg: TruthConfig):
+    """SGP4 states for the fitted start, one :class:`~orbit_correction.cheap_prop.Sgp4Result`
+    per element set, at :func:`fit_sample_offsets_s` from each set's own epoch (GCRF).
+
+    This is the hook a generation pipeline uses (no JVM; run it in the parent
+    process beside the window's own SGP4 run): pass each result's ``trajectory`` as
+    ``fit_samples`` to :func:`propagate_truth` or :class:`TruthJob`. Only results
+    with ``status.ok`` are usable; any other status (an SGP4 error before the epoch,
+    or the 120 km floor) means the window has no fitted start and should be counted
+    under its own status, not given a fallback start.
+
+    Args:
+        elsets: element sets with the catalog schema (``catalog.ELEMENT_SET_SCHEMA``).
+        cfg: configuration (``fit_span_s``, ``fit_step_s``).
+    """
+    from orbit_correction.cheap_prop import propagate_sgp4_from_epoch
+
+    return propagate_sgp4_from_epoch(elsets, fit_sample_offsets_s(cfg))
 
 
 # --------------------------------------------------------------------------------------
@@ -554,17 +648,24 @@ class TruthResult:
             grid points up to the stop time, or is None if there are none or the
             start was below the threshold) or ``"error"`` (only from
             :func:`propagate_batch`, which catches per-job exceptions so one bad
-            object doesn't stop a batch; ``message`` says why).
+            object doesn't stop a batch; ``message`` says why), or ``"fit_failed"``
+            (fitted start rule only: the fit did not converge; ``start_fit`` says
+            how, and there is no trajectory).
         trajectory: ``Trajectory(source="truth")`` on the requested grid (all of
             it for ``ok``, the points at or before ``stop_t_tt_s`` for
             ``reentry``), or None.
         stop_t_tt_s: when the re-entry altitude was crossed (TT seconds), the
             initial epoch for a start below it, else None.
         area_to_mass_m2_per_kg: the A/m used.
-        start_scale: the start rule's factor k (1.0 for ``sgp4_state_direct``).
-        n_evaluations: right-hand-side evaluations of the integrator.
-        wall_s: wall-clock time of the propagation and sampling.
+        start_scale: the start rule's factor k (1.0 for ``sgp4_state_direct``;
+            None for the fitted rule, whose start is the fitted state).
+        n_evaluations: right-hand-side evaluations of the forward integration
+            (the fit's own are in ``start_fit``).
+        wall_s: wall-clock time of the whole call: fit (if any), propagation and
+            sampling.
         message: human-readable detail.
+        start_fit: the fit's record (:class:`StartFit`) under the fitted rule, else
+            None.
     """
 
     norad_id: int
@@ -576,6 +677,53 @@ class TruthResult:
     n_evaluations: int | None = None
     wall_s: float | None = None
     message: str = ""
+    start_fit: StartFit | None = None
+
+
+@dataclass(frozen=True)
+class StartFit:
+    """Record of one fitted start (:func:`fit_start_to_sgp4`).
+
+    Attributes:
+        status: ``"converged"`` (the last Gauss-Newton correction was below both
+            tolerances), ``"not_converged"`` (``fit_max_iterations`` passes without
+            that) or ``"diverged"`` (the RMS rose between passes, or went
+            non-finite). Only ``converged`` gives a start.
+        iterations: propagations with the state transition matrix (passes).
+        n_samples: SGP4 positions fitted.
+        first_sample_tt_s, last_sample_tt_s: their time span (TT seconds); the last
+            is at or before the epoch.
+        rms_m: RMS of |SGP4 - truth| position over the samples at the last pass.
+        max_m: largest |SGP4 - truth| over the samples at the last pass.
+        rms_initial_m: the same RMS at the initial guess (the start-rule-scaled SGP4
+            epoch state), for comparison.
+        offset_r_m, offset_v_m_s: fitted state minus the (unscaled) SGP4 epoch
+            state, GCRF, m and m/s.
+        last_correction_r_m, last_correction_v_m_s: size of the last correction.
+        n_evaluations: right-hand-side evaluations over all passes.
+        wall_s: wall-clock time of the fit.
+        message: detail for a failed fit.
+    """
+
+    status: str
+    iterations: int
+    n_samples: int
+    first_sample_tt_s: float
+    last_sample_tt_s: float
+    rms_m: float
+    max_m: float
+    rms_initial_m: float
+    offset_r_m: tuple[float, float, float]
+    offset_v_m_s: tuple[float, float, float]
+    last_correction_r_m: float
+    last_correction_v_m_s: float
+    n_evaluations: int
+    wall_s: float
+    message: str = ""
+
+    @property
+    def converged(self) -> bool:
+        return self.status == "converged"
 
 
 def build_propagator(
@@ -696,6 +844,188 @@ def initial_geodetic_altitude_km(cfg: TruthConfig, initial: Trajectory) -> float
     return float(gp.getAltitude()) / 1000.0
 
 
+def _area_to_mass(
+    cfg: TruthConfig, bstar_per_er: float | None, area_to_mass_m2_per_kg: float | None
+) -> float | None:
+    if cfg.atmosphere == "none":
+        return None
+    if area_to_mass_m2_per_kg is not None:
+        return float(area_to_mass_m2_per_kg)
+    return area_to_mass_from_bstar(float(bstar_per_er), cfg)
+
+
+def _check_fit_samples(initial: Trajectory, samples: Trajectory | None) -> None:
+    """Refuse fit samples that are missing, too few, or reach past the epoch."""
+    if samples is None:
+        raise ValueError(
+            f"start rule {FIT_START_RULE!r} needs fit_samples: SGP4 states at or before "
+            "the epoch (truth_prop.fit_samples_from_elsets)"
+        )
+    if not isinstance(samples, Trajectory):
+        raise TypeError(f"fit_samples must be a Trajectory, got {type(samples).__name__}")
+    if samples.norad_id != initial.norad_id:
+        raise ValueError(
+            f"fit_samples are for NORAD {samples.norad_id}, the start is {initial.norad_id}"
+        )
+    if len(samples) < 3:
+        raise ValueError(f"the fit needs at least 3 samples, got {len(samples)}")
+    t0 = float(initial.t_tt_s[0])
+    late = samples.t_tt_s > t0
+    if late.any():
+        raise ValueError(
+            f"{int(late.sum())} fit sample(s) lie after the epoch (latest "
+            f"{float(samples.t_tt_s.max()) - t0:+.6f} s); only SGP4 states at or before "
+            "the epoch may enter the fit"
+        )
+    if not samples.t_tt_s[0] < t0:
+        raise ValueError("the fit samples must start before the epoch")
+
+
+def _fit_pass(cfg, ctx, x_m, t0, dates, a2m, space_weather):
+    """One backward propagation from state ``x_m`` (m, m/s) at ``t0`` with the STM.
+
+    Returns the model positions at ``dates`` (N, 3) in metres, d(position)/d(x0) at
+    each date (N, 3, 6), and the number of right-hand-side evaluations. The state
+    transition matrix comes from Orekit's matrices harvester (Cartesian state,
+    variational equations integrated with the state); the step control uses the
+    main state only, so the trajectory is the one :func:`build_propagator` gives
+    without the matrix.
+    """
+    state = Trajectory(1, np.array([t0]), x_m[None, :3] / 1000.0, x_m[None, 3:] / 1000.0, "fit")
+    prop, integ, _ = build_propagator(cfg, state, a2m, space_weather)
+    harvester = prop.setupMatricesComputation("stm", None, None)
+    generator = prop.getEphemerisGenerator()
+    prop.propagate(ctx.date(t0), dates[0])
+    ephemeris = generator.getGeneratedEphemeris()
+    pos = np.empty((len(dates), 3))
+    jac = np.empty((len(dates), 3, 6))
+    gcrf = ctx.gcrf
+    for j, d in enumerate(dates):
+        s = ephemeris.propagate(d)
+        p = s.getPVCoordinates(gcrf).getPosition()
+        pos[j] = (p.getX(), p.getY(), p.getZ())
+        phi = harvester.getStateTransitionMatrix(s)
+        jac[j] = [[phi.getEntry(a, b) for b in range(6)] for a in range(3)]
+    return pos, jac, int(integ.getEvaluations())
+
+
+def fit_start_to_sgp4(
+    initial: Trajectory,
+    samples: Trajectory,
+    bstar_per_er: float | None,
+    cfg: TruthConfig,
+    space_weather: SpaceWeatherCopy | None,
+    *,
+    area_to_mass_m2_per_kg: float | None = None,
+) -> tuple[Trajectory | None, StartFit]:
+    """Fit the truth state at the epoch to SGP4 positions at or before it.
+
+    Unknowns: the GCRF position and velocity at ``initial``'s epoch. Data: the
+    positions of ``samples`` (SGP4 in GCRF, all at or before the epoch). Model: the
+    truth propagator (:func:`build_propagator` with ``cfg``), integrated backwards
+    from the epoch. Unweighted least squares on position by Gauss-Newton: each pass
+    propagates once with the state transition matrix and solves the linearized
+    problem (columns scaled 1 m : 1 mm/s). It stops when the correction is below
+    ``fit_tolerance_m`` and ``fit_tolerance_m_s``; the returned state includes that
+    last correction. The initial guess is ``initial`` scaled by
+    :func:`start_rule_scale`.
+
+    Own Gauss-Newton rather than Orekit's propagator converters: the fitted state
+    must sit at the epoch, which is the *last* sample, with exactly the truth force
+    model, and the convergence record (status, passes, RMS) is ours to report.
+
+    The space-weather range is not checked here; :func:`propagate_truth` checks the
+    whole span from the first sample to the end of the window.
+
+    Args:
+        initial: one-state ``Trajectory``, the SGP4 state at the epoch (GCRF).
+        samples: SGP4 GCRF states of the same object at or before the epoch (at
+            least 3), for example from :func:`fit_samples_from_elsets`. Only the
+            positions are used.
+        bstar_per_er, area_to_mass_m2_per_kg: as in :func:`propagate_truth`.
+        cfg: configuration (force model, integrator and ``fit_*`` settings).
+        space_weather: the run's copy (None only without drag).
+
+    Returns:
+        ``(state, record)``: the fitted one-state ``Trajectory`` (``source`` copied
+        from ``initial``) or None if the fit did not converge, and its
+        :class:`StartFit`.
+
+    Raises:
+        ValueError: if any sample lies after the epoch, there are fewer than 3, or
+            they are for another object.
+    """
+    _check_fit_samples(initial, samples)
+    wall0 = time.perf_counter()
+    ctx = _context(cfg)
+    a2m = _area_to_mass(cfg, bstar_per_er, area_to_mass_m2_per_kg)
+    t0 = float(initial.t_tt_s[0])
+    guess = _scaled(initial, start_rule_scale(ctx.mu, cfg))
+    x = np.concatenate([guess.r_gcrf_km[0], guess.v_gcrf_km_s[0]]) * 1000.0
+    obs = samples.r_gcrf_km * 1000.0
+    dates = [ctx.date(float(t)) for t in samples.t_tt_s]
+    col = np.array([1.0, 1.0, 1.0, 1.0e-3, 1.0e-3, 1.0e-3])  # 1 m ~ 1 mm/s
+
+    status, message = "not_converged", f"no convergence in {cfg.fit_max_iterations} passes"
+    rms0 = rms = prev = math.inf
+    worst = math.inf
+    dr = dv = math.inf
+    n_eval = 0
+    it = 0
+    for it in range(1, cfg.fit_max_iterations + 1):
+        pos, jac, nev = _fit_pass(cfg, ctx, x, t0, dates, a2m, space_weather)
+        n_eval += nev
+        res = obs - pos
+        dist = np.linalg.norm(res, axis=1)
+        rms, worst = float(np.sqrt(np.mean(dist**2))), float(dist.max())
+        if it == 1:
+            rms0 = rms
+        # Gauss-Newton on a least-squares problem this close to linear never raises
+        # the RMS by more than rounding; a rise means the linearization broke down.
+        if not math.isfinite(rms) or rms > prev * (1.0 + 1.0e-6) + 1.0e-3:
+            status = "diverged"
+            message = f"RMS rose from {prev:.6g} m to {rms:.6g} m at pass {it}"
+            break
+        prev = rms
+        dx, *_ = np.linalg.lstsq(jac.reshape(-1, 6) * col, res.reshape(-1), rcond=None)
+        dx = dx * col
+        dr, dv = float(np.linalg.norm(dx[:3])), float(np.linalg.norm(dx[3:]))
+        x = x + dx
+        if dr < cfg.fit_tolerance_m and dv < cfg.fit_tolerance_m_s:
+            status, message = "converged", ""
+            break
+
+    r0 = initial.r_gcrf_km[0] * 1000.0
+    v0 = initial.v_gcrf_km_s[0] * 1000.0
+    record = StartFit(
+        status=status,
+        iterations=it,
+        n_samples=len(samples),
+        first_sample_tt_s=float(samples.t_tt_s[0]),
+        last_sample_tt_s=float(samples.t_tt_s[-1]),
+        rms_m=rms,
+        max_m=worst,
+        rms_initial_m=rms0,
+        offset_r_m=tuple(float(a) for a in x[:3] - r0),
+        offset_v_m_s=tuple(float(a) for a in x[3:] - v0),
+        last_correction_r_m=dr,
+        last_correction_v_m_s=dv,
+        n_evaluations=n_eval,
+        wall_s=time.perf_counter() - wall0,
+        message=message,
+    )
+    if status != "converged":
+        return None, record
+    fitted = Trajectory(
+        norad_id=initial.norad_id,
+        t_tt_s=initial.t_tt_s.copy(),
+        r_gcrf_km=x[None, :3] / 1000.0,
+        v_gcrf_km_s=x[None, 3:] / 1000.0,
+        source=initial.source,
+    )
+    return fitted, record
+
+
 def propagate_truth(
     initial: Trajectory,
     bstar_per_er: float | None,
@@ -704,11 +1034,14 @@ def propagate_truth(
     space_weather: SpaceWeatherCopy | None,
     *,
     area_to_mass_m2_per_kg: float | None = None,
+    fit_samples: Trajectory | None = None,
 ) -> TruthResult:
     """Propagate one object with the truth model and sample it on a time grid.
 
-    Steps: check the window against the space-weather copy; apply the start
-    rule (:func:`apply_start_rule`); return ``reentry`` at once if the start is
+    Steps: check the window against the space-weather copy (from the first fit
+    sample under the fitted rule); apply the start rule (:func:`apply_start_rule`;
+    under the fitted rule, :func:`fit_start_to_sgp4`, returning ``fit_failed`` if
+    it does not converge); return ``reentry`` at once if the start is
     below the re-entry altitude; otherwise one integration from the initial
     epoch to the last grid time, with Orekit's ephemeris generator recording the
     dense output, read at each grid time. Never one ``propagate()`` call per
@@ -732,16 +1065,22 @@ def propagate_truth(
             ``cfg.atmosphere == "none"``.
         area_to_mass_m2_per_kg: explicit A/m, overriding B* (for objects whose
             B* has no physical meaning, such as negative B*).
+        fit_samples: fitted rule only, and required there: SGP4 GCRF states of
+            this object at or before the epoch (:func:`fit_samples_from_elsets`).
+            Given with any other rule, it is refused rather than ignored.
 
     Returns:
-        :class:`TruthResult` with status ``"ok"`` or ``"reentry"``.
+        :class:`TruthResult` with status ``"ok"``, ``"reentry"`` or (fitted rule)
+        ``"fit_failed"``.
 
     Raises:
         TypeError: if drag is on and ``space_weather`` isn't a
             :class:`SpaceWeatherCopy` (a bare path carries no checked range).
-        SpaceWeatherRangeError: if the window isn't inside the copy's checked
-            range or ends inside the data-end margin.
-        ValueError: on other bad inputs. Orekit exceptions propagate as raised.
+        SpaceWeatherRangeError: if the window (from the first fit sample under
+            the fitted rule) isn't inside the copy's checked range or ends inside
+            the data-end margin.
+        ValueError: on other bad inputs, including fit samples after the epoch.
+            Orekit exceptions propagate as raised.
     """
     t_out = np.asarray(t_out_tt_s, dtype=np.float64)
     if t_out.ndim != 1 or t_out.size == 0:
@@ -751,21 +1090,29 @@ def propagate_truth(
     t0 = float(initial.t_tt_s[0])
     if t_out[0] < t0:
         raise ValueError("output times must not precede the initial epoch")
+    fitted = cfg.start_rule == FIT_START_RULE
+    if fitted:
+        _check_fit_samples(initial, fit_samples)
+    elif fit_samples is not None:
+        raise ValueError(
+            f"fit_samples given but the start rule is {cfg.start_rule!r}; they would be ignored"
+        )
+    t_first = float(fit_samples.t_tt_s[0]) if fitted else t0
 
     a2m = None
     if cfg.atmosphere != "none":
         _require_copy(space_weather)
-        space_weather.check_window(t0, float(t_out[-1]))
-        a2m = (
-            float(area_to_mass_m2_per_kg)
-            if area_to_mass_m2_per_kg is not None
-            else area_to_mass_from_bstar(float(bstar_per_er), cfg)
-        )
+        space_weather.check_window(t_first, float(t_out[-1]))
+        a2m = _area_to_mass(cfg, bstar_per_er, area_to_mass_m2_per_kg)
 
     wall0 = time.perf_counter()
     ctx = _context(cfg)
     k = start_rule_scale(ctx.mu, cfg)
-    start = apply_start_rule(initial, ctx.mu, cfg)
+    # The altitude guard runs on the start-rule state (for the fitted rule, the
+    # fit's initial guess, tens of metres from the fitted state), so a start below
+    # the re-entry altitude is never fitted or integrated.
+    start = _scaled(initial, k)
+    record = None
 
     alt0 = initial_geodetic_altitude_km(cfg, start)
     if alt0 < cfg.reentry_altitude_km:
@@ -774,7 +1121,7 @@ def propagate_truth(
             status="reentry",
             stop_t_tt_s=t0,
             area_to_mass_m2_per_kg=a2m,
-            start_scale=k,
+            start_scale=None if fitted else k,
             n_evaluations=0,
             wall_s=time.perf_counter() - wall0,
             message=(
@@ -782,6 +1129,23 @@ def propagate_truth(
                 f"{cfg.reentry_altitude_km} km; not propagated"
             ),
         )
+
+    if fitted:
+        start, record = fit_start_to_sgp4(
+            initial, fit_samples, bstar_per_er, cfg, space_weather,
+            area_to_mass_m2_per_kg=a2m,
+        )
+        k = None
+        if start is None:
+            return TruthResult(
+                norad_id=initial.norad_id,
+                status="fit_failed",
+                area_to_mass_m2_per_kg=a2m,
+                n_evaluations=0,
+                wall_s=time.perf_counter() - wall0,
+                message=f"fitted start {record.status}: {record.message}",
+                start_fit=record,
+            )
 
     prop, integ, ctx = build_propagator(cfg, start, a2m, space_weather)
 
@@ -834,6 +1198,7 @@ def propagate_truth(
                 f"{(stop_t - t0) / _DAY_S:.3f} d; trajectory holds the {t_keep.size} "
                 f"grid points before that"
             ),
+            start_fit=record,
         )
     return TruthResult(
         norad_id=initial.norad_id,
@@ -843,6 +1208,7 @@ def propagate_truth(
         start_scale=k,
         n_evaluations=n_eval,
         wall_s=time.perf_counter() - wall0,
+        start_fit=record,
     )
 
 
@@ -1008,12 +1374,17 @@ def write_space_weather_copy(
 
 @dataclass(frozen=True)
 class TruthJob:
-    """One propagation for :func:`propagate_batch` (the arguments of :func:`propagate_truth`)."""
+    """One propagation for :func:`propagate_batch` (the arguments of :func:`propagate_truth`).
+
+    ``fit_samples`` is required under the fitted start rule and refused under any
+    other: the SGP4 states at or before the epoch from :func:`fit_samples_from_elsets`.
+    """
 
     initial: Trajectory
     bstar_per_er: float | None
     t_out_tt_s: np.ndarray = field(repr=False)
     area_to_mass_m2_per_kg: float | None = None
+    fit_samples: Trajectory | None = field(default=None, repr=False)
 
 
 _WORKER: dict[str, object] = {}
@@ -1037,6 +1408,7 @@ def _worker_run(job: TruthJob) -> TruthResult:
             _WORKER["cfg"],
             _WORKER["sw"],
             area_to_mass_m2_per_kg=job.area_to_mass_m2_per_kg,
+            fit_samples=job.fit_samples,
         )
     except Exception as exc:  # noqa: BLE001  (reported per job, batch continues)
         return TruthResult(
@@ -1060,7 +1432,10 @@ def propagate_batch(
     (a few seconds) in its initializer.
 
     Every job's window is checked against the space-weather copy before any
-    worker starts; one window outside it refuses the whole batch.
+    worker starts (from its first fit sample under the fitted rule); one window
+    outside it refuses the whole batch, and so does a job whose ``fit_samples``
+    don't match the start rule (missing under the fitted rule, present under
+    another, or reaching past the epoch).
 
     Results come back in job order. A job that raises inside a worker gives
     ``TruthResult(status="error")`` instead of stopping the batch.
@@ -1074,8 +1449,8 @@ def propagate_batch(
         active_processor_count: per-JVM processor cap; defaults to the config's.
 
     Raises:
-        TypeError, SpaceWeatherRangeError: as in :func:`propagate_truth`, for
-            any job, before anything runs.
+        TypeError, SpaceWeatherRangeError, ValueError: as in
+            :func:`propagate_truth`, for any job, before anything runs.
 
     Note:
         Scripts that call this need an ``if __name__ == "__main__":`` guard,
@@ -1084,13 +1459,21 @@ def propagate_batch(
     import multiprocessing as mp
     from concurrent.futures import ProcessPoolExecutor
 
+    fitted = cfg.start_rule == FIT_START_RULE
+    for i, job in enumerate(jobs):
+        try:
+            if fitted:
+                _check_fit_samples(job.initial, job.fit_samples)
+            elif job.fit_samples is not None:
+                raise ValueError(f"fit_samples given but the start rule is {cfg.start_rule!r}")
+        except ValueError as exc:
+            raise ValueError(f"job {i} (NORAD {job.initial.norad_id}): {exc}") from None
     if cfg.atmosphere != "none":
         _require_copy(space_weather)
         for i, job in enumerate(jobs):
+            first = float(job.fit_samples.t_tt_s[0]) if fitted else float(job.initial.t_tt_s[0])
             try:
-                space_weather.check_window(
-                    float(job.initial.t_tt_s[0]), float(np.asarray(job.t_out_tt_s)[-1])
-                )
+                space_weather.check_window(first, float(np.asarray(job.t_out_tt_s)[-1]))
             except SpaceWeatherRangeError as exc:
                 raise SpaceWeatherRangeError(
                     f"job {i} (NORAD {job.initial.norad_id}): {exc}"
@@ -1109,7 +1492,10 @@ def propagate_batch(
 
 __all__ = [
     "CONFIG_PATH",
+    "FIT_START_RULE",
+    "FIT_STATUSES",
     "START_RULES",
+    "StartFit",
     "SpaceWeatherCopy",
     "SpaceWeatherRangeError",
     "TruthConfig",
@@ -1119,6 +1505,9 @@ __all__ = [
     "area_to_mass_from_bstar",
     "build_propagator",
     "describe_gravity",
+    "fit_sample_offsets_s",
+    "fit_samples_from_elsets",
+    "fit_start_to_sgp4",
     "initial_geodetic_altitude_km",
     "initial_state_from_omm",
     "jvm_started",

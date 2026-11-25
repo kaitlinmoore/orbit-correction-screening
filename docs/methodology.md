@@ -147,8 +147,48 @@ configuration in `config/truth.toml`). The settings below define it; they were d
   difference by about 8 km in every band. What remains at 7 days is the rest of the model
   difference: 170-970 km at 300 km and 35-86 km at 500 km, where drag dominates, and
   3-15 km at 800 and 1,200 km, where drag is small and the zonal model, SGP4's theory and
-  the osculating start account for it (not separated here).
-  A start fitted to SGP4 is a later, labeled sensitivity variant.
+  the osculating start account for it. The fitted-start comparison below separates the
+  start's share.
+- **Fitted start (labeled variant, `fit_to_sgp4_before_epoch`; not the default).** An
+  independent review found that a start at one SGP4 state ties the truth orbit's mean
+  motion to where in its orbit the object is at the epoch: SGP4's short-periodic terms
+  make that state's osculating period differ from the period SGP4 keeps, by an amount
+  that depends on the phase. Truth then drifts along-track against SGP4 by a
+  phase-dependent amount that tracked element sets, fitted over a span, would not show,
+  and that a model would learn from its inputs. The variant fits the six-number epoch
+  state by unweighted least squares to SGP4's GCRF positions at 60 s spacing over
+  [epoch - span, epoch] (`truth_prop.fit_start_to_sgp4`). Each Gauss-Newton pass
+  propagates backwards from the epoch with the full truth force model and Orekit's state
+  transition matrix; it stops when the correction is below 1 mm and 1 micrometre/s
+  (typically 3 passes). **Only SGP4 states at or before the epoch enter the fit**, so no
+  information from the prediction window shapes the start; the code refuses later
+  samples and a test runs the whole path under a spy on SGP4. The GM rescale is not
+  needed: the fit finds the state that matches SGP4 under the truth GM. A fit that does
+  not converge is a truth status (`fit_failed`), never a fallback. Project code: the fit,
+  its convergence rule and its record; Orekit's: the integration and the variational
+  equations. Measured with `scripts/fitted_start_comparison.py` (2026-11-24; synthetic
+  phases and moved epochs on real train/dev orbits, details in the changelog):
+  - On the review's gravity-only cases (800 km, B* 1e-7, e 0.001 to 0.07) the current
+    rule's 7-day T of up to 678 km becomes at most 0.32 km.
+  - On 360 stratified windows with drag (five perigee bands, three eccentricities up to
+    90% of the apogee limit, three solar bins, four phases), the spread of 7-day T across
+    the four phases falls by a factor of 8 to 2,700 per stratum (medians). Above 800 km the fitted
+    start leaves a 7-day T of about 1 km (800-1,200 km) and 0.3 km (1,200-2,000 km),
+    the same in every solar bin. On the eight truth sample objects, 4-11 km remain at
+    800-1,200 km for the three whose B* is large for their altitude; run gravity-only on
+    both sides (B* 0 in SGP4, no drag in truth) the fitted start leaves 0.18-0.28 km on
+    all four objects there. So the 3-15 km the current rule leaves at 800-1,200 km is the
+    start plus the drag-model difference, and SGP4's gravity theory against the
+    degree-36 zonals is a few hundred metres at 7 days.
+  - Below 600 km, where the drag models differ, the fit also absorbs part of that
+    difference over the span into the start: at 250-400 km and a 1-day span the start
+    sits about 2 km (median) from the SGP4 state, and the 7-day T of near-circular orbits grows by about 2.5% (0.125-day
+    span) to 17% (1-day span) at 250-400 km. Shorter spans absorb less; two revolutions
+    already average the short-periodic terms.
+  - Truth compute per window, with the rules interleaved on 60 windows at one worker
+    count, is 2.69 times the current rule's at a 1-day span and 1.47 times at 0.25 days
+    (2.57 times at 1 day over the 360 stratified windows).
+  Which rule and span residual generation uses is open.
 - **Integrator:** DOP853, 1 m position tolerance, 180 s maximum step. At this cap DOP853 runs
   at the step limit, so the step sets the integration error. Against a converged run (1 mm, 30 s) its
   7-day error on the eight sample objects is 0.8-7.3 m at 300 km, 0.12-0.18 m at 500 km,
