@@ -57,9 +57,9 @@ Where the contract leaves a choice (limits approved 2026-11-24; ``types.py`` unc
   Such a window is refused here, not wrapped: ``du`` starts near 0 and changes
   continuously, and every value between pi/2 and 3 pi/2 is refused, so a wrap could
   only pass unseen if ``du`` moved by more than pi between two consecutive horizons.
-  Generation is to count refused windows as their own drop status (``rtn_domain``)
-  by stratum; they are the largest-error windows of the lowest band, so the count
-  belongs next to that band's error statistics.
+  Generation counts refused windows as their own drop status (``rtn_domain``, in
+  :data:`DROP_STATUSES`) by stratum; they are the largest-error windows of the lowest
+  band, so the count belongs next to that band's error statistics.
 * **Out-of-plane angle.** ``du`` is undefined when the truth position sits on the
   cheap orbit's normal (``phi_t = +-pi/2``) and badly conditioned near it. Refused
   above :data:`MAX_ABS_PHI_RAD` (pi/4); real cross-track errors are a few km
@@ -461,7 +461,13 @@ def solar_activity_bin(f107_trailing81_sfu: float, cfg: ResidualConfig) -> str:
 #: sgp4_error: SGP4 flagged an error code (1-6) inside the window.
 #: truth_reentry: truth fell below 120 km (or started below it).
 #: sgp4_floor: SGP4 fell below the 120 km floor (``cheap_prop``).
-DROP_STATUSES = ("truth_error", "sgp4_error", "truth_reentry", "sgp4_floor")
+#: rtn_domain: both propagators ran the whole window, but a residual is outside the
+#:   conversion's domain (:class:`RTNDomainError`, in practice ``|du| > pi/2`` at the
+#:   low, high-drag edge). :func:`build_window_rows` raises rather than returning it;
+#:   generation catches the error per window and records this status
+#:   (``generation.window_result``). Lowest priority, and in practice never combined
+#:   with another cause: the residual is computed only when nothing else applies.
+DROP_STATUSES = ("truth_error", "sgp4_error", "truth_reentry", "sgp4_floor", "rtn_domain")
 WINDOW_STATUSES = ("ok", *DROP_STATUSES)
 
 #: Element-set columns the row builder reads.

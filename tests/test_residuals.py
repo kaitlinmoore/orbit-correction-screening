@@ -416,10 +416,13 @@ def test_sgp4_floor_drops_the_window(elsets, sw, cfg, grid):
 def test_drop_priority_with_two_causes(elsets, sw, cfg, grid):
     """Which status a window gets when two causes apply; every cause stays in ``causes``.
 
-    The order is ``DROP_STATUSES``: truth_error, sgp4_error, truth_reentry, sgp4_floor.
-    Each pair below is one a real batch can produce.
+    The order is ``DROP_STATUSES``: truth_error, sgp4_error, truth_reentry, sgp4_floor,
+    rtn_domain (the last is recorded by generation when the builder raises; see
+    ``tests/test_generation.py``). Each pair below is one a real batch can produce.
     """
-    assert R.DROP_STATUSES == ("truth_error", "sgp4_error", "truth_reentry", "sgp4_floor")
+    assert R.DROP_STATUSES == (
+        "truth_error", "sgp4_error", "truth_reentry", "sgp4_floor", "rtn_domain"
+    )
     el = one(elsets, 25544, bstar_per_earth_radii=0.1)
     floored = C.propagate_sgp4_from_epoch(el, grid)[0]
     coded = C.propagate_sgp4_from_epoch(el, grid, floor_km=None)[0]

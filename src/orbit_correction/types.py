@@ -69,6 +69,24 @@ state) provided ``|du| < pi`` and the cheap angular momentum is non-zero. A mode
 that predicts (R, T, N) from features is turned into a corrected position with
 this inverse, using nothing but the cheap state. Velocity residuals are not part
 of the target. Total miss distance in screening stays Cartesian.
+
+Domain limits of the implementation (approved 2026-11-24; documentation only, the
+definition above is unchanged). ``orbit_correction.residuals`` refuses, with
+``RTNDomainError``, rather than wrap or extrapolate:
+
+* ``|du| > pi/2`` (``MAX_ABS_DU_RAD``): an along-track separation of more than a
+  quarter orbit, about 10,500 km at LEO radii. ``du`` is defined modulo a full turn
+  and jumps sign near ``pi``, so larger values are ambiguous. The limit is
+  reachable at the low, high-drag edge of the catalog over 7 days; generation
+  counts such windows as their own drop status (``rtn_domain``).
+* ``|phi_t| > pi/4`` (``MAX_ABS_PHI_RAD``): truth far out of the cheap plane; ``du``
+  is undefined at ``phi_t = +-pi/2`` and badly conditioned near it.
+* ``|r_c x v_c| < 1e-6 |r_c| |v_c|`` (``H_REL_MIN``, a velocity within about 6e-5
+  degrees of radial), or zero or non-finite inputs: the orbit normal ``n`` is
+  undefined.
+
+The inverse accepts one float64 step more than these angle limits, so every
+residual the forward map returns can be inverted.
 """
 
 from __future__ import annotations
