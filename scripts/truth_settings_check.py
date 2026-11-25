@@ -1,13 +1,17 @@
 """Measure two truth settings on the sample objects: the start rule and the step cap.
 
-Part 1, start rule. SGP4 minus truth at 0, 1 h, 1 d and 7 d, with the default
-start rule (``preserve_sgp4_mean_motion``: initial state scaled by
+Part 1, start rule. SGP4 minus truth at 0, 1 h, 1 d and 7 d, with the epoch-state
+start rule (``preserve_sgp4_mean_motion``, the default until 2026-11-25 and named
+explicitly here; initial state scaled by
 ``k = (mu_EIGEN-6S / mu_WGS-72) ** (1/3)``) and without it
 (``sgp4_state_direct``). The rule removes the drift that comes only from the two
 models' different GM (about 1.15 km/day). What remains is the rest of the
 SGP4-truth difference: the zonal and drag models, and SGP4's mean-element theory
 against an osculating start. At t0 the residual is not zero with the rule: the
 scaled state sits ``(k - 1) |r|``, about 2 m, from the SGP4 state.
+
+The fitted start that replaced it as the default is compared with it in
+``scripts/fitted_start_comparison.py``.
 
 Part 2, step cap. The truth setting (``config/truth.toml``: DOP853, 1 m tolerance,
 the configured maximum step, degree 36) against a converged run (1 mm, 30 s, same
@@ -79,7 +83,7 @@ def main() -> None:
     ap.add_argument("--out", type=Path, default=OUT)
     args = ap.parse_args()
 
-    cfg = T.load_truth_config()
+    cfg = dataclasses.replace(T.load_truth_config(), start_rule=T.EPOCH_START_RULE)
     recs = Z.load_records()
     samples = Z.sample_states(recs)
     t0 = samples[0][2].t_tt_s[0]

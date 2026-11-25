@@ -125,7 +125,11 @@ configuration in `config/truth.toml`). The settings below define it; they were d
 - **Zonal degree 36 is a chosen truncation**, part of the truth definition, not a converged
   value. Against a degree-90 reference the omitted zonals move a 7-day trajectory by up to
   about 70 m at 300 km, 18 m at 500 km, 8 m at 800 km and 1 m at 1,200 km
-  (`scripts/zonal_convergence.py`; background, see the changelog).
+  (`scripts/zonal_convergence.py`; background, see the changelog). At the 180 s step that
+  script's own convergence rule (each degree within the truth setting's integration error
+  of the reference) gives degree 48-64 at 800-1,200 km and no degree at 300 and 500 km, so
+  its "chosen degree" is None (rerun 2026-11-24). That is consistent with degree 36 being
+  chosen, not converged.
 - **NRLMSISE-00 conventions.** Mean local solar time (UT + longitude/15) is what pymsis and
   brahe compute, which makes the density cross-checks possible (pymsis to 1.1e-5). The
   reference notes name the input local apparent solar time and call equation-of-time
@@ -135,20 +139,81 @@ configuration in `config/truth.toml`). The settings below define it; they were d
   300 km over 7 days. Switch 9 stays configurable for a labeled daily-Ap sensitivity
   subsample in residual generation.
 - **Initial state and start rule:** the SGP4 state at the element-set epoch, rotated TEME to
-  GCRF by `frames.teme_to_gcrf`, used as an osculating state, then scaled by
-  k = (mu_truth / mu_WGS72)^(1/3) in position and velocity (`preserve_sgp4_mean_motion`).
-  SGP4 states are consistent with the WGS-72 GM (398600.8 km^3/s^2) and truth integrates
-  with EIGEN-6S's (398600.4415); without the rule the GM difference alone makes truth lag
-  SGP4 by about 1.15 km per day, an artefact a model would learn trivially and that tracked
-  orbits wouldn't have. The scaled state keeps the two-body period (each under its own GM),
-  eccentricity and plane, and sits about 2 m from the SGP4 state, so residuals at t0 are
-  about 2 m, not zero. On eight sample objects (300-1,200 km, June 2024 start;
-  `scripts/truth_settings_check.py`) the rule moves the 7-day SGP4-minus-truth along-track
-  difference by about 8 km in every band. What remains at 7 days is the rest of the model
-  difference: 170-970 km at 300 km and 35-86 km at 500 km, where drag dominates, and
-  3-15 km at 800 and 1,200 km, where drag is small and the zonal model, SGP4's theory and
-  the osculating start account for it (not separated here).
-  A start fitted to SGP4 is a later, labeled sensitivity variant.
+  GCRF by `frames.teme_to_gcrf`, is the deliberate conversion from mean elements; the start
+  rule says how truth starts from it. **Since 2026-11-25 the configured rule is the fitted
+  start, `fit_to_sgp4_before_epoch`, with a 0.25-day span at 60 s** (decided by Kaitlin from
+  the comparison below; changelog). It replaced `preserve_sgp4_mean_motion`, which is kept
+  for comparison and is reached only by naming it: a config built without a rule gets the
+  fitted one, a config file without a rule is refused, and a truth job without SGP4 fit
+  samples is refused rather than started from the epoch state (`tests/test_truth_prop.py`).
+  Physics tests, the settings scripts and the brahe cross-check, which start from one shared
+  state, name the epoch-state rule explicitly.
+- **Epoch-state rule (`preserve_sgp4_mean_motion`, the default 2026-11-23 to 2026-11-25).**
+  The SGP4 epoch state, used as an osculating state, scaled by k = (mu_truth / mu_WGS72)^(1/3)
+  in position and velocity. SGP4 states are consistent with the WGS-72 GM
+  (398600.8 km^3/s^2) and truth integrates with EIGEN-6S's (398600.4415); without the
+  scaling the GM difference alone makes truth lag SGP4 by about 1.15 km per day, an artefact
+  a model would learn trivially and that tracked orbits wouldn't have. The scaled state
+  keeps the two-body period (each under its own GM), eccentricity and plane, and sits about
+  2 m from the SGP4 state, so **under this rule** residuals at t0 are about 2 m, not zero.
+  On eight sample objects (300-1,200 km, June 2024 start; `scripts/truth_settings_check.py`)
+  the scaling moves the 7-day SGP4-minus-truth along-track difference by about 8 km in every
+  band. What remains at 7 days under this rule is 170-970 km at 300 km and 35-86 km at
+  500 km, where drag dominates, and 3-15 km at 800 and 1,200 km. The fitted-start
+  comparison below splits the last figure: most of it is the start (the phase artifact)
+  plus the drag-model difference, and only a few hundred metres is SGP4's theory.
+- **Fitted start (`fit_to_sgp4_before_epoch`, the configured rule since 2026-11-25).** An
+  independent review found that a start at one SGP4 state ties the truth orbit's mean
+  motion to where in its orbit the object is at the epoch: SGP4's short-periodic terms
+  make that state's osculating period differ from the period SGP4 keeps, by an amount
+  that depends on the phase. Truth then drifts along-track against SGP4 by a
+  phase-dependent amount that tracked element sets, fitted over a span, would not show,
+  and that a model would learn from its inputs. The fitted rule fits the six-number epoch
+  state by unweighted least squares to SGP4's GCRF positions at 60 s spacing over
+  [epoch - span, epoch] (`truth_prop.fit_start_to_sgp4`). Each Gauss-Newton pass
+  propagates backwards from the epoch with the full truth force model and Orekit's state
+  transition matrix; it stops when the correction is below 1 mm and 1 micrometre/s
+  (typically 3 passes). **Only SGP4 states at or before the epoch enter the fit**, so no
+  information from the prediction window shapes the start; the code refuses later
+  samples and a test runs the whole path under a spy on SGP4. The GM rescale is not
+  needed: the fit finds the state that matches SGP4 under the truth GM. A fit that does
+  not converge is a truth status (`fit_failed`), never a fallback. Project code: the fit,
+  its convergence rule and its record; Orekit's: the integration and the variational
+  equations. Measured with `scripts/fitted_start_comparison.py` (2026-11-24; synthetic
+  phases and moved epochs on real train/dev orbits, details in the changelog; the phase,
+  strata and sample-object parts ran at a 1-day span, the span part at 0.125-2 days):
+  - On the review's gravity-only cases (800 km, B* 1e-7, e 0.001 to 0.07) the epoch-state
+    rule's 7-day T of up to 678 km becomes at most 0.32 km.
+  - On 360 stratified windows with drag (five perigee bands, three eccentricities up to
+    90% of the apogee limit, three solar bins, four phases), the spread of 7-day T across
+    the four phases falls by a factor of 8 to 2,700 per stratum (medians). Above 800 km the
+    fitted start leaves a 7-day T of about 1 km (800-1,200 km) and 0.3 km
+    (1,200-2,000 km), the same in every solar bin.
+  - **Gravity-only split at 800-1,200 km.** On the four truth sample objects there, the
+    epoch-state rule leaves 3-15 km at 7 days. Run gravity-only on both sides (B* 0 in
+    SGP4, no drag in truth), the fitted start leaves 0.18-0.28 km on all four, against
+    3.5-13.3 km under the epoch-state rule: that is SGP4's gravity theory against the
+    degree-36 zonals. With drag, the fitted start leaves 0.5 km on the one with low B*
+    (the stratified windows: 0.69 km median at 800-1,200 km) and 4-11 km on the
+    three whose B* is large for their altitude (6.7e-5 at 800 km, 7.7e-4 to 1.1e-3 at
+    1,200 km), which is the drag-model difference. So the 3-15 km is
+    mostly the start plus the drag-model difference, not SGP4's theory.
+  - Below 600 km, where the drag models differ, the fit also absorbs part of that
+    difference over the span into the start. The 7-day T of near-circular orbits at
+    250-400 km grows by about 2.5% (0.125-day span), 4.6% (0.25 d) and 17% (1 d) against
+    the epoch-state rule, and T at 1 h from about 0.09 km to 0.06, 0.14 and 1.3 km. Shorter
+    spans absorb less; two revolutions already average the short-periodic terms.
+  - **Residuals at t0 under the fitted rule** are the fitted state's offset from the SGP4
+    epoch state, not the epoch-state rule's 2 m. At the configured 0.25-day span: median
+    10 / 21 / 56 m in R / T / N, p95 71 / 137 / 1,006 m (60 span-test windows at solar
+    maximum). At a 1-day span: median 31 / 45 / 21 m, p95 |T| about 1.2 km (360
+    stratified windows). The largest offsets are at 250-400 km.
+  - Truth compute per window, with the rules interleaved on 60 windows at one worker
+    count, is 1.47 times the epoch-state rule's at a 0.25-day span and 2.69 times at
+    1 day (2.57 times at 1 day over the 360 stratified windows).
+  - Why 0.25 days: the phase spread is about 0.9 km (median) against 0.8 km at 1 day,
+    with a quarter of the 1-day span's drag absorption at 250-400 km and just over half of
+    its compute.
 - **Integrator:** DOP853, 1 m position tolerance, 180 s maximum step. At this cap DOP853 runs
   at the step limit, so the step sets the integration error. Against a converged run (1 mm, 30 s) its
   7-day error on the eight sample objects is 0.8-7.3 m at 300 km, 0.12-0.18 m at 500 km,
@@ -186,7 +251,7 @@ configuration in `config/truth.toml`). The settings below define it; they were d
   equal to the energy lost; circular decay under an exponential atmosphere against the
   analytic rate (6e-6); NRLMSISE-00 against pymsis (msis00) to 1.1e-5; Orekit's
   space-weather values against `spaceweather.observed`; Orekit's TEME to GCRF against
-  `frames.teme_to_gcrf` (0.5-1.1 m); the start rule's period in a two-body run; the
+  `frames.teme_to_gcrf` (0.5-1.1 m); the epoch-state start rule's period in a two-body run; the
   integration error of the truth setting per case; the range and margin guards; the
   re-entry outputs; reproducibility to 1 mm across workers and job order. A library check
   compares Orekit's TLEPropagator with the sgp4 package (9 micrometres); the project doesn't
@@ -195,7 +260,7 @@ configuration in `config/truth.toml`). The settings below define it; they were d
   Without drag the two agree to millimetres at 7 days (tolerance 0.1 m). With drag they
   agree once both use the same NRLMSISE-00 conventions (daily Ap, mean solar time), within
   per-band tolerances of 10 m at 300 km, 1 m at 500 km and 0.1 m at 800 km and above.
-  Rerun on all eight sample objects with the start rule and the 180 s setting
+  Rerun on all eight sample objects with the epoch-state start rule and the 180 s setting
   (2026-11-23): no drag at most 5.1 mm; drag with matched conventions at most 4.1 m at
   300 km, 0.058 m at 500 km, 4.8 mm at 800 km and 1.8 mm at 1,200 km. With the project's
   ap-array setting brahe differs by up to 11 km at 300 km, a convention difference.
@@ -256,8 +321,9 @@ horizon grid approved 2026-11-24 for the pilot). Contract: `RESIDUAL_SCHEMA` in 
   199-horizon grid the rule leans on truth, and the time at which SGP4 was cut depends on
   the grid.
 
-Measured on six fixture objects moved to 2024-06-15 (solar maximum): the residual at 60 s
-is 1.8-2.8 m (the start-rule offset), and the 7-day along-track residual runs from 9.7 km
+Measured on six fixture objects moved to 2024-06-15 (solar maximum), with truth under the
+epoch-state start rule (before the fitted start became the default): the residual at 60 s
+is 1.8-2.8 m (that rule's start offset), and the 7-day along-track residual runs from 9.7 km
 (770 km altitude) to 963 km (355 km), with R and N within a few km.
 
 ## Models

@@ -14,8 +14,11 @@ Matched inputs
   ``truth.toml`` zonal_degree, order 0, written to a fully normalised ICGEM file for
   brahe and passed to Orekit as arrays (``GravityFieldFactory.getNormalizedProvider``).
   Same GM and reference radius in both.
-* **Initial state:** the same GCRF state: SGP4 at the shifted epoch with the truth
-  start rule applied (``truth_prop.apply_start_rule``).
+* **Initial state:** the same GCRF state: SGP4 at the shifted epoch with the
+  epoch-state start rule (``preserve_sgp4_mean_motion``) applied
+  (``truth_prop.apply_start_rule``). Named explicitly: the check compares two
+  libraries from one shared state, and the configured fitted start (2026-11-25) is
+  not a single-state rule.
 * **EOP:** the bundle's ``finals2000A.all`` (orekit-data 2d6edc9) in both.
 * **Space weather:** Orekit reads the project's copy; brahe reads CelesTrak's
   ``SW-All.txt`` directly (it parses the published file). Same numbers.
@@ -219,7 +222,7 @@ def main() -> None:
 
     import brahe as bh
 
-    cfg = T.load_truth_config()
+    cfg = dataclasses.replace(T.load_truth_config(), start_rule=T.EPOCH_START_RULE)
     recs = Z.load_records()
     samples = [s for s in Z.sample_states(recs) if not args.quick or s[1] in QUICK]
     t0 = samples[0][2].t_tt_s[0]
