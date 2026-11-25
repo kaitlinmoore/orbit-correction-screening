@@ -267,14 +267,25 @@ def test_bulk_file_quirks_backslash_and_missing_checksum(elsets):
     a1, a2 = _tle_lines(rows[0])
     b1, b2 = _tle_lines(rows[1])
     nochk1, nochk2 = b1[:68], b2[:68]
+    text = [a1 + "\\\n", a2 + "\n", nochk1, nochk2]
     stats = G.TleReadStats()
-    recs = list(G.iter_tle_records([a1 + "\\\n", a2 + "\n", nochk1, nochk2], stats))
+    recs = list(G.iter_tle_records(text, stats))
     assert [r["NORAD_CAT_ID"] for r in recs] == [rows[0]["norad_id"]]
     assert stats.trailing_backslash == 1 and stats.no_checksum == 1 and stats.bad == 0
     assert stats.epoch_days == {a1[18:23]: 1, b1[18:23]: 1} or a1[18:23] == b1[18:23]
     with pytest.raises(G.TleNoChecksumError):
         G.tle_to_record(nochk1, nochk2)
     assert G.tle_to_record(a1 + "\\", a2)["NORAD_CAT_ID"] == rows[0]["norad_id"]
+    # accepted on layout checks when allowed (Space-Track's 2015-2020 files), flagged
+    stats = G.TleReadStats()
+    recs = list(G.iter_tle_records(text, stats, allow_no_checksum=True))
+    assert [r["_checksum"] for r in recs] == [True, False] and stats.no_checksum == 1
+    assert recs[1] == {**G.tle_to_record(b1, b2), "_checksum": False}
+    # a 68-character line whose columns are shifted is bad, not accepted
+    shifted = nochk1[:30] + " " + nochk1[30:67]
+    stats = G.TleReadStats()
+    assert list(G.iter_tle_records([shifted, nochk2], stats, allow_no_checksum=True)) == []
+    assert stats.bad == 1 and "layout" in stats.examples[0]
 
 
 def test_tle_with_mismatched_numbers_is_refused(elsets):

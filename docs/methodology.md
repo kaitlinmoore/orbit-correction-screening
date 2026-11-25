@@ -358,9 +358,14 @@ Code: `src/orbit_correction/generation.py`; scripts `build_candidate_ids.py`,
   for the epoch, which is converted to an ISO string rounded to the microsecond (the TLE
   resolves 0.864 ms). Bad pairs (checksum, layout) and stray lines are counted per file.
   File quirks: the 2015 file ends every line 1 with a backslash (removed and counted) and
-  carries macOS `__MACOSX` members (skipped); 68-character lines without a checksum
-  column (analyst objects and some old sets) are counted and left out. Each file's epoch
-  coverage by day is recorded.
+  carries macOS `__MACOSX` members (skipped). Most of the 2015-2020 files' element sets are
+  68-character lines with no checksum column (19.3 M of the 32.6 M kept from those files;
+  none from 2021 on): they are read when they pass the library reader's column-separator
+  checks and tagged `source = "spacetrack_bulk_tle_nochecksum"` (decided 2026-11-25),
+  since they are not duplicates and sit on the same orbit histories as the checksummed
+  sets. Pairs with a wrong checksum or layout are counted and left out. Each file's epoch
+  coverage by day is recorded: every year is covered through 31 December (31 December
+  2024 at 64% of that year's daily median, since the 2025 file holds 2025 epochs only).
 - **Pool.** Element sets in the span, exact duplicates removed (same object, epoch and
   elements; same-epoch rows that differ are kept and counted), SATCAT attached, the
   catalog filters applied with rows and objects removed reported per rule. The pool is

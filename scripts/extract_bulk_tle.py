@@ -3,26 +3,36 @@
     uv run python scripts/extract_bulk_tle.py \\
         --bulk-dir data/raw/spacetrack/bulk_tle \\
         --ids data/derived/pool/candidate_ids.txt \\
-        --start 2015-01-01 --end 2026-11-24 \\
-        --out-dir data/derived/pool/bulk_extract
+        --start 2015-01-01 --end 2026-01-01 \\
+        --out-dir data/derived/pool/bulk_extract --jobs 6
 
 Reads every ``*.zip`` (each text member streamed, nothing unpacked to disk; macOS
 ``__MACOSX/`` and ``._*`` members skipped), ``*.txt`` and ``*.txt.gz`` file in
-``--bulk-dir``. Files may be grouped by publication date, not epoch (Space-Track's 2015
-file starts with 2014-12-31 epochs), so element sets are kept by their **epoch** and
-never by the file they came in. A trailing backslash on a line (the 2015 file ends
-every line 1 with one) is removed and counted; 68-character lines without a checksum
-column are counted and left out. Two-line and three-line sets are both read
-(``orbit_correction.generation.iter_tle_records``). Keeps element sets of the IDs in
-``--ids`` with epochs in ``[--start, --end)`` and writes them in the catalog schema
-(``source = "spacetrack_bulk_tle"``), split by NORAD ID into ``--buckets`` groups
+``--bulk-dir``, ``--jobs`` files in parallel. Two-line and three-line sets are both
+read (``orbit_correction.generation.iter_tle_records``).
+
+Keeps element sets of the IDs in ``--ids`` with epochs in ``[--start, --end)``. Files may
+be grouped by publication date, not epoch (Space-Track's 2015 file starts with
+2014-12-31 epochs), so element sets are kept by their **epoch**, never by the file
+they came in. File quirks:
+
+* a trailing backslash on a line (the 2015 file ends every line 1 with one) is removed
+  and counted;
+* 68-character lines without a checksum column (most of the 2015-2020 files' element
+  sets) are accepted if they pass the library reader's column-separator checks,
+  counted, and tagged ``source = "spacetrack_bulk_tle_nochecksum"`` (decided
+  2026-11-25); checksummed sets get ``source = "spacetrack_bulk_tle"``;
+* pairs with a wrong checksum or layout are counted and left out.
+
+Output is the catalog schema, split by NORAD ID into ``--buckets`` groups
 (``bucket_NN/<file stem>.parquet``), so later steps can work one group of objects at a
 time: every catalog filter rule is per object.
 
-``extract_manifest.jsonl`` gets one entry per input file: size, SHA-256, members and
-the read counts (lines, TLEs, bad pairs with examples, stray lines, other objects,
-epochs outside the span, kept). An input whose entry matches its current SHA-256 and
-whose outputs exist is skipped, so a rerun only does new files.
+``extract_manifest.jsonl`` gets one entry per input file: size, SHA-256, members, the
+read counts (lines, TLEs, bad pairs with examples, no-checksum pairs, trailing
+backslashes, stray lines, other objects, epochs outside the span, kept) and every
+TLE's epoch coverage by day. An input whose entry matches its current SHA-256 and whose
+outputs exist is skipped, so a rerun only does new files.
 
 Space-Track data stays in ``data/`` (gitignored) and is never committed.
 """
@@ -45,6 +55,9 @@ import pyarrow.parquet as pq
 from orbit_correction import catalog, generation
 
 SOURCE = "spacetrack_bulk_tle"
+#: Element sets published without a checksum column (68-character lines; 2015-2020
+#: files), accepted on layout checks (decided 2026-11-25) and tagged by source.
+SOURCE_NO_CHECKSUM = "spacetrack_bulk_tle_nochecksum"
 BATCH = 250_000
 
 
@@ -84,27 +97,34 @@ def extract_one(path: Path, want: set[int], start: str, end: str, out_dir: Path,
     members, out_of_span, kept = [], 0, 0
     parts: dict[int, list[pa.Table]] = {}
     batch: list[dict] = []
+    kept_no_checksum = 0
 
     def flush():
         nonlocal batch
         if not batch:
             return
-        t = catalog.records_to_table(batch, SOURCE)
-        ids = t.column("norad_id").to_numpy()
-        for b in range(buckets):
-            sel = ids % buckets == b
-            if sel.any():
-                parts.setdefault(b, []).append(t.filter(pa.array(sel)))
+        for source, flag in ((SOURCE, True), (SOURCE_NO_CHECKSUM, False)):
+            recs = [r for r in batch if r["_checksum"] is flag]
+            if not recs:
+                continue
+            t = catalog.records_to_table(recs, source)
+            ids = t.column("norad_id").to_numpy()
+            for b in range(buckets):
+                sel = ids % buckets == b
+                if sel.any():
+                    parts.setdefault(b, []).append(t.filter(pa.array(sel)))
         batch = []
 
     for name, lines in text_streams(path):
         members.append(name)
-        for rec in generation.iter_tle_records(lines, stats, want_ids=want):
+        for rec in generation.iter_tle_records(lines, stats, want_ids=want,
+                                               allow_no_checksum=True):
             if not (start <= rec["EPOCH"] < end):
                 out_of_span += 1
                 continue
             batch.append(rec)
             kept += 1
+            kept_no_checksum += not rec["_checksum"]
             if len(batch) >= BATCH:
                 flush()
     flush()
@@ -122,7 +142,8 @@ def extract_one(path: Path, want: set[int], start: str, end: str, out_dir: Path,
         "lines": stats.lines, "tles": stats.tles, "bad": stats.bad,
         "no_checksum": stats.no_checksum, "trailing_backslash": stats.trailing_backslash,
         "stray_lines": stats.stray_lines, "other_objects": stats.skipped_id,
-        "outside_span": out_of_span, "kept": kept, "bad_examples": stats.examples,
+        "outside_span": out_of_span, "kept": kept, "kept_no_checksum": kept_no_checksum,
+        "bad_examples": stats.examples,
         "members": members, "outputs": written,
         # every TLE's epoch day (YYDDD), wanted or not: the file's coverage by epoch
         "epoch_days_all": dict(sorted(stats.epoch_days.items())),
@@ -176,7 +197,8 @@ def main(argv=None) -> int:
             m.write(json.dumps(entry) + "\n")
         print(json.dumps({k: entry[k] for k in ("file", "tles", "bad", "no_checksum",
                                                 "trailing_backslash", "stray_lines",
-                                                "other_objects", "outside_span", "kept")}),
+                                                "other_objects", "outside_span", "kept",
+                                                "kept_no_checksum")}),
               flush=True)
 
     if args.jobs <= 1:

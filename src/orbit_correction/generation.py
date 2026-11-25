@@ -213,11 +213,23 @@ class TleFormatError(ValueError):
 
 
 class TleNoChecksumError(TleFormatError):
-    """A 68-character line: the checksum column is missing, so the line can't be verified.
+    """A 68-character line (no checksum column) where such lines are not accepted.
 
-    Space-Track's bulk files carry such lines for analyst objects (8xxxx) and some old
-    element sets, written with explicit ``+`` signs. They are counted and left out.
+    Space-Track's 2015-2020 bulk files carry many such element sets (explicit ``+``
+    signs, every field in its standard column, no checksum). They are accepted with
+    ``allow_no_checksum=True`` (decided 2026-11-25), checked by layout instead.
     """
+
+
+#: Column separators of the TLE layout that ``sgp4.io.twoline2rv`` checks (0-based
+#: index -> character). A line without a checksum must pass these instead.
+_LINE1_LAYOUT = {1: " ", 8: " ", 23: ".", 32: " ", 34: ".", 43: " ", 52: " ", 61: " ", 63: " "}
+_LINE2_LAYOUT = {1: " ", 7: " ", 11: ".", 16: " ", 20: ".", 25: " ", 33: " ", 37: ".", 42: " ",
+                 46: ".", 51: " "}
+
+
+def _layout_ok(line: str, layout: dict[int, str]) -> bool:
+    return all(line[i] == c for i, c in layout.items())
 
 
 def _clean(line: str) -> str:
@@ -286,7 +298,8 @@ def tle_norad_id(line1: str) -> int:
     return int(from_alpha5(line1[2:7].strip().rjust(5, "0")))
 
 
-def tle_to_record(line1: str, line2: str, name: str | None = None) -> dict:
+def tle_to_record(line1: str, line2: str, name: str | None = None, *,
+                  allow_no_checksum: bool = False) -> dict:
     """One TLE as an OMM-keyword record (the keys :func:`catalog.records_to_table` reads).
 
     Values are numbers computed exactly as ``sgp4.io.twoline2rv`` computes them, so the
@@ -298,21 +311,34 @@ def tle_to_record(line1: str, line2: str, name: str | None = None) -> dict:
         name: the title line of a three-line set without its ``0 `` prefix, if any.
             Recorded as ``OBJECT_NAME``; the catalog's name rule reads SATCAT names,
             not this.
+        allow_no_checksum: accept 68-character lines with no checksum column, if
+            they pass the library reader's column-separator checks (decided
+            2026-11-25 for Space-Track's bulk files). The record then carries
+            ``"_checksum": False`` (``True`` for verified lines), so the caller can
+            tag its source.
 
     Raises:
+        TleNoChecksumError: a line without a checksum when not allowed.
         TleFormatError: wrong layout, a checksum that doesn't match, or different
             object numbers on the two lines.
     """
     l1, l2 = _clean(line1), _clean(line2)
     if not l1.startswith("1 ") or not l2.startswith("2 "):
         raise TleFormatError(f"not a TLE pair: {l1[:20]!r} / {l2[:20]!r}")
-    if len(l1) == 68 or len(l2) == 68:
-        raise TleNoChecksumError(f"no checksum column: {l1!r} / {l2!r}")
-    if len(l1) < 69 or len(l2) < 69:
-        raise TleFormatError(f"line too short: {l1!r} / {l2!r}")
-    for n, line in ((1, l1), (2, l2)):
-        if not line[68].isdigit() or tle_checksum(line) != int(line[68]):
-            raise TleFormatError(f"line {n} checksum mismatch: {line!r}")
+    no_checksum = len(l1) == 68 or len(l2) == 68
+    if no_checksum:
+        if not allow_no_checksum:
+            raise TleNoChecksumError(f"no checksum column: {l1!r} / {l2!r}")
+        if len(l1) < 68 or len(l2) < 68 or not (
+            _layout_ok(l1, _LINE1_LAYOUT) and _layout_ok(l2, _LINE2_LAYOUT)
+        ):
+            raise TleFormatError(f"no checksum and the layout doesn't match: {l1!r} / {l2!r}")
+    else:
+        if len(l1) < 69 or len(l2) < 69:
+            raise TleFormatError(f"line too short: {l1!r} / {l2!r}")
+        for n, line in ((1, l1), (2, l2)):
+            if not line[68].isdigit() or tle_checksum(line) != int(line[68]):
+                raise TleFormatError(f"line {n} checksum mismatch: {line!r}")
     if l1[2:7] != l2[2:7]:
         raise TleFormatError(f"object numbers differ: {l1[2:7]!r} / {l2[2:7]!r}")
     try:
@@ -335,6 +361,7 @@ def tle_to_record(line1: str, line2: str, name: str | None = None) -> dict:
             "MEAN_ANOMALY": float(l2[43:51]),
             "MEAN_MOTION": float(l2[52:63]),
             "REV_AT_EPOCH": int(l2[63:68]) if l2[63:68].strip() else None,
+            "_checksum": not no_checksum,
         }
     except ValueError as exc:
         raise TleFormatError(f"unreadable field in {l1!r} / {l2!r}: {exc}") from exc
@@ -348,9 +375,10 @@ class TleReadStats:
     Attributes:
         lines: lines read (blank lines included).
         tles: element-line pairs found.
-        bad: wanted pairs that failed :func:`tle_to_record` for a reason other than
-            a missing checksum (with up to 20 examples).
-        no_checksum: wanted pairs with a 68-character line (no checksum column).
+        bad: wanted pairs that failed :func:`tle_to_record` (with up to 20 examples).
+        no_checksum: wanted pairs with a 68-character line (no checksum column):
+            yielded when ``allow_no_checksum`` (and the layout checks pass), else
+            left out; counted either way.
         trailing_backslash: lines that ended in a backslash (removed before parsing).
         stray_lines: lines that belong to no pair (neither a title nor an element line
             in sequence).
@@ -371,14 +399,17 @@ class TleReadStats:
     examples: list[str] = field(default_factory=list)
 
 
-def iter_tle_records(lines: Iterable[str], stats: TleReadStats, want_ids: set[int] | None = None):
+def iter_tle_records(lines: Iterable[str], stats: TleReadStats, want_ids: set[int] | None = None,
+                     *, allow_no_checksum: bool = False):
     """Yield OMM-keyword records from TLE text: two-line or three-line sets, mixed.
 
     A line starting ``1 `` followed by one starting ``2 `` is an element set; a line
     before it that is neither (a ``0 NAME`` or bare ``NAME`` title) is its name.
     ``want_ids``, if given, skips other objects after reading only the ID (counted in
     ``stats.skipped_id``). Bad pairs are counted in ``stats.bad``, never raised, so
-    one damaged line can't stop a year's file; the caller reports the count.
+    one damaged line can't stop a year's file; the caller reports the count. Pairs
+    without a checksum are counted in ``stats.no_checksum`` and yielded only with
+    ``allow_no_checksum`` (see :func:`tle_to_record`).
     """
     name: str | None = None
     pending: str | None = None
@@ -412,10 +443,12 @@ def iter_tle_records(lines: Iterable[str], stats: TleReadStats, want_ids: set[in
             if want_ids is not None and nid is not None and nid not in want_ids:
                 stats.skipped_id += 1
                 continue
-            try:
-                yield tle_to_record(l1, line, nm)
-            except TleNoChecksumError:
+            if len(_clean(l1)) == 68 or len(_clean(line)) == 68:
                 stats.no_checksum += 1
+            try:
+                yield tle_to_record(l1, line, nm, allow_no_checksum=allow_no_checksum)
+            except TleNoChecksumError:
+                pass  # counted above, left out
             except TleFormatError as exc:
                 stats.bad += 1
                 if len(stats.examples) < 20:
