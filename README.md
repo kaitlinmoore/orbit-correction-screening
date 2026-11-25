@@ -2,7 +2,7 @@
 
 A PhysicsNeMo model that learns the error of SGP4 against a high-fidelity numerical propagator, tested on whether corrected predictions screen low-Earth-orbit conjunctions better than uncorrected SGP4 and classical geometric filters.
 
-Status: core modules only (contracts, frames and time scales, catalog loading and filters, space weather, splits). No propagation, model or results yet.
+Status: data pipeline built (catalog, splits, SGP4 and Orekit truth propagators, curvilinear RTN residuals, the screening engine with classical filters, and residual-dataset generation); a generation pilot on real historical element sets is in progress. No model and no model results yet.
 
 ## Question
 
@@ -17,10 +17,16 @@ Data is gitignored and never committed. Downloads go under `data/raw/`.
 | CelesTrak GP element sets (OMM JSON) | https://celestrak.org/NORAD/elements/gp.php (e.g. `?CATNR=26998&FORMAT=json`, `?GROUP=active&FORMAT=json`) | live data; epochs as of the access date | 2026-11-23 | Free, no account. Small extracts are committed as test fixtures (`tests/fixtures/README.md`) |
 | CelesTrak SATCAT | https://celestrak.org/pub/satcat.csv | live data | 2026-11-23 | Free, no account |
 | CelesTrak space weather (F10.7, Kp, Ap) | https://celestrak.org/SpaceData/SW-All.txt (format: https://celestrak.org/SpaceData/SpaceWx-format.php) | file header `UPDATED 2026 Nov 23 10:32:51 UTC` | 2026-11-23 | Free, no account |
-| Space-Track `gp_history` (historical element sets) | https://www.space-track.org (`basicspacedata/query/class/gp_history`) | per download, recorded in `data/raw/spacetrack/manifest.jsonl` | not yet downloaded | Free account; Space-Track User Agreement. This project never commits or redistributes Space-Track data |
+| Space-Track yearly bulk TLE files (historical element sets, training history) | https://www.space-track.org/documentation (API Use Guidelines, `GP_HISTORY` row: "For queries of many objects or large date ranges, download TLEs bundled as zip files by year from our cloud storage site instead") | per file, name, size and SHA-256 recorded in `data/derived/pool/bulk_extract/extract_manifest.jsonl` | not yet downloaded | Free account; Space-Track User Agreement. This project never commits or redistributes Space-Track data |
+| Space-Track `gp_history` (validation-case objects only) | https://www.space-track.org (`basicspacedata/query/class/gp_history`) | per download, recorded in `data/raw/spacetrack/gp_history/manifest.jsonl` | not yet downloaded | As above. Space-Track asks for each object's history once ("1 / lifetime") |
 | IERS Earth orientation data and leap seconds, via `astropy-iers-data` | https://pypi.org/project/astropy-iers-data/ (data from https://www.iers.org) | 0.2026.11.23.0.35.53, pinned in `uv.lock` | 2026-11-23 | Package BSD-3-Clause; IERS data freely available |
 | Conjunction-assessment verification test set (The Aerospace Corporation with the Department of Commerce; Auman, Murphy and George, user's guide "Conjunction Assessment Verification Data and Process") | Dataset page https://space.commerce.gov/?p=13145; user's guide https://space.commerce.gov/wp-content/uploads/2026/03/Conjunction_Screening_Testset_Users_Guide.pdf | Released March 2026. Ephemerides `AerospaceIVVDataset_20251009a.tar.gz` (22,255,966,812 bytes, SHA-256 `0e990091659c9c564c731882eb213938d32455d4d294995b6fec22e405e13d66`); 10 km spherical answer key `IVV_Releasable_Dataset_Spherical_DefaultHBR.csv.gz` (SHA-256 `3cb76041785ab0302589a7331823fc0e902a825573a8d97a5291232258d755dd`). The SFSH-volume key and volume mappings were not downloaded | 2026-11-23 | CC0-1.0. Not redistributed here: the files stay in `data/` (gitignored); used only for the external check of the screening engine (`scripts/compare_aerospace_testset.py`) |
-| Orekit data bundle (`orekit-data`) | https://gitlab.orekit.org/orekit/orekit-data | git commit `2d6edc9118983d95c51303df05db16ada90b7ee2`, installed by uv from that commit (`orekitdata` in `uv.lock`, `datagen` group) | 2026-11-23 | The bundle has no license file of its own; each file stays under its producer's terms. The truth propagator reads the EIGEN-6S gravity field (GFZ, via ICGEM), JPL DE-440 ephemerides, IERS Earth orientation parameters and the leap-second table; it does not read the bundle's CSSI space-weather file (it reads the project's own copy of CelesTrak's file). Per-source terms not yet checked file by file |
+| Orekit data bundle (`orekit-data`) | https://gitlab.orekit.org/orekit/orekit-data | git commit `2d6edc9118983d95c51303df05db16ada90b7ee2`, installed by uv from that commit (`orekitdata` in `uv.lock`, `datagen` group) | 2026-11-23 | The bundle has no license file of its own; each file stays under its producer's terms (rows below). Not redistributed here: uv fetches it from the pinned commit. The truth propagator does not read the bundle's CSSI space-weather, MSAFE, JB2008 (`Space-Environment-Data`) or FES 2004 files |
+| ↳ `Earth-Orientation-Parameters/IAU-2000/finals2000A.all` (Earth orientation) | IERS Rapid Service/Prediction Center at USNO, https://maia.usno.navy.mil/ser7/readme | as in the bundle commit | checked 2026-11-25 | The data.gov record for these products lists its license as U.S. Government Works (https://www.usa.gov/government-works); USNO's own pages state no terms |
+| ↳ `tai-utc.dat` (leap seconds) | USNO, https://maia.usno.navy.mil/ser7/tai-utc.dat | as in the bundle commit | checked 2026-11-25 | No terms stated by the source (the file and USNO's readme carry none) |
+| ↳ `DE-440-ephemerides/lnxp1990.440` (Sun and Moon positions) | JPL Solar System Dynamics, https://ssd.jpl.nasa.gov/planets/eph_export.html; Park et al. (2021), AJ 161, 105, https://doi.org/10.3847/1538-3881/abd414 | DE440 | checked 2026-11-25 | No license or usage statement found on JPL's export page or FTP README; cited by the paper above |
+| ↳ `Potential/eigen-6s.gfc` (gravity field) | GFZ Potsdam and GRGS Toulouse, distributed by ICGEM (https://icgem.gfz.de/tom_longtime); Förste et al. (2011), EGU2011-3242-2 (from the file header) | EIGEN-6S (2011) | checked 2026-11-25 | No license or DOI found for this model; ICGEM's imprint says data from other sources is under its owner's terms ("please contact the owner of the data for the terms of use"). Not yet asked |
+| ↳ `itrf-versions.conf` | Orekit team, in the bundle | as in the bundle commit | checked 2026-11-25 | Configuration file of the bundle; no separate terms |
 
 Software that produces or checks data (installed by uv from `uv.lock`; nothing is redistributed here):
 
@@ -71,9 +77,45 @@ uv run python scripts/download_spacetrack.py --ids 26998,22236 --start 2024-02-1
 uv run python scripts/make_fixtures.py
 ```
 
+Residual-dataset generation (data paths are arguments; outputs stay in `data/`):
+
+```bash
+# 1. Download lists from SATCAT (the superset of objects the filters can keep)
+uv run python scripts/build_candidate_ids.py --satcat data/raw/celestrak/satcat.csv \
+    --out-dir data/derived/pool --start 2015-01-01 --end 2026-11-24
+# 2. Validation objects' histories through the API; everything else from the yearly
+#    bulk TLE files saved under data/raw/spacetrack/bulk_tle/
+uv run python scripts/download_spacetrack.py --ids-file data/derived/pool/ids_validation.txt \
+    --start 2004-01-01 --end 2026-11-24 --batch-size 2 --out-dir data/raw/spacetrack/gp_history
+uv run python scripts/extract_bulk_tle.py --bulk-dir data/raw/spacetrack/bulk_tle \
+    --ids data/derived/pool/candidate_ids.txt --start 2015-01-01 --end 2026-11-24 \
+    --out-dir data/derived/pool/bulk_extract
+# 3. Pool (filters) and split labels; window sample for a stage
+uv run python scripts/build_pool.py --extract-dir data/derived/pool/bulk_extract \
+    --validation-json 'data/raw/spacetrack/gp_history/*.json.gz' \
+    --satcat data/raw/celestrak/satcat.csv --space-weather data/raw/celestrak/SW-All.txt \
+    --start 2015-01-01 --end 2026-11-24 --out-dir data/derived/pool/pool_v1
+uv run python scripts/sample_windows.py --pool-dir data/derived/pool/pool_v1 --stage pilot \
+    --space-weather data/raw/celestrak/SW-All.txt --out data/derived/windows/pilot
+# 4. Generation (spawned Orekit workers; resumable), the daily-Ap sensitivity run, report
+uv run --group datagen python scripts/generate_residuals.py \
+    --windows data/derived/windows/pilot/windows.parquet \
+    --space-weather data/raw/celestrak/SW-All.txt --out-root data/derived/residuals \
+    --run-id pilot_baseline
+uv run --group datagen python scripts/generate_residuals.py --daily-ap \
+    --windows data/derived/windows/pilot/windows_dailyap.parquet \
+    --space-weather data/raw/celestrak/SW-All.txt --out-root data/derived/residuals \
+    --run-id pilot_dailyap
+uv run python scripts/pilot_report.py --run data/derived/residuals/pilot_baseline \
+    --dailyap-run data/derived/residuals/pilot_dailyap \
+    --out data/derived/residuals/pilot_baseline/report
+```
+
 ## Results
 
-None yet.
+No model results yet.
+
+Engine verification (not a model result): engine check against the Aerospace/DoC 10 km key on a 727-file subset: 4,163 of 4,163 events, none extra, miss agreement 0.7 mm median (`scripts/compare_aerospace_testset.py`).
 
 ## Methodology
 
@@ -86,6 +128,7 @@ What is implemented here and what is library behaviour:
 - SGP4 is the `sgp4` package (Vallado's implementation). TEME to GCRF rotations and time-scale arithmetic are astropy and ERFA. This project adds the conventions and wrappers, EOP pinning and range checks, and tests against the Vallado et al. (2006) reference examples.
 - The space-weather parser, the leak-free as-of lookup, the Orekit-compatible writer, the catalog loaders and filters, and the split logic are this project's own code.
 - The curvilinear RTN residual, its inverse and the residual-row builder (`residuals.py`), and SGP4's 120 km altitude floor (`cheap_prop.py`, geodetic altitude from ERFA's `gc2gd`), are this project's own code.
+- Residual-dataset generation (`generation.py` and its scripts: the candidate rule, the TLE reader for Space-Track's bulk files, the pool, window sampling, the chunked and resumable runs, the generation log and manifests) is this project's own code. The TLE column layout, its number arithmetic and the Alpha-5 decoding follow the `sgp4` package's reader (`sgp4.io.twoline2rv`, `sgp4.alpha5`), and the tests check the result against that reader.
 
 ## Limitations and scope
 
