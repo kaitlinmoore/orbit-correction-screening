@@ -7,10 +7,11 @@
 # project's space-weather copy, Cd 2.2 with area-to-mass from B*, DOP853 at about 1 m
 # position tolerance. The truth-definition settings below (zonal degree, NRLMSISE-00
 # local solar time and switch 9, maximum step, start rule, re-entry) were decided by
-# Kaitlin on 2026-11-23 after review.
+# Kaitlin on 2026-11-23 after review; the start rule was changed by her on 2026-11-25
+# (see [truth.start]).
 
 [truth]
-status = "exploratory 2026-11-23 (truth settings decided 2026-11-23)"
+status = "exploratory 2026-11-23 (truth settings decided 2026-11-23; start rule changed 2026-11-25)"
 
 [truth.data]
 # orekit-data bundle (EOP, leap seconds, EIGEN-6S, DE-440). Must match the commit
@@ -83,30 +84,44 @@ min_step_s = 0.001
 max_step_s = 180.0
 
 [truth.start]
-# Start rule (decided 2026-11-23). The initial state is the SGP4 state at the
-# element-set epoch rotated TEME -> GCRF (frames.teme_to_gcrf). SGP4 states are
-# consistent with the WGS-72 GM; truth integrates with the EIGEN-6S GM, which alone
-# would make truth lag SGP4 by about 1.15 km per day.
+# Start rule. Decided by Kaitlin on 2026-11-25: "fit_to_sgp4_before_epoch" with a
+# 0.25-day span at 60 s, replacing "preserve_sgp4_mean_motion" (decided 2026-11-23).
+# Evidence (scripts/fitted_start_comparison.py, 2026-11-24): a start at the SGP4 epoch
+# state leaves a phase-dependent along-track drift that a model would learn (spread of
+# 7-day T across four phases 19-1,890 km per stratum, median); the 0.25-day fit cuts it
+# to about 0.9 km, absorbs little of the drag-model difference at 250-400 km (+4.6% in
+# near-circular 7-day T, against +17% at a 1-day span) and costs 1.47x the truth
+# compute per window (2.69x at 1 day).
+# "fit_to_sgp4_before_epoch": the truth state at the epoch is fitted by least squares
+#   to SGP4's GCRF positions over [epoch - fit_span_days, epoch], propagating backwards
+#   with this file's full force model; only SGP4 states at or before the epoch enter
+#   the fit. Needs the SGP4 samples (truth_prop.fit_samples_from_elsets) and a
+#   space-weather copy that covers the fit span; a fit that doesn't converge gives
+#   status "fit_failed", and a job without samples is refused, never started from the
+#   epoch state instead.
+# Epoch-state rules, kept for comparison (callers must name them explicitly). The
+# initial state is the SGP4 state at the element-set epoch rotated TEME -> GCRF
+# (frames.teme_to_gcrf). SGP4 states are consistent with the WGS-72 GM; truth
+# integrates with the EIGEN-6S GM, which alone would make truth lag SGP4 by about
+# 1.15 km per day.
 # "preserve_sgp4_mean_motion": position and velocity both multiplied by
 #   k = (mu_truth / sgp4_mu) ** (1/3), which keeps the two-body period (under each
 #   model's own GM), eccentricity and orientation; the state moves by about 2 m.
-# "sgp4_state_direct": k = 1, the SGP4 state as is (kept for comparison).
-# "fit_to_sgp4_before_epoch": labeled sensitivity variant (2026-11-24), not the default.
-#   The truth state at the epoch is fitted by least squares to SGP4's GCRF positions
-#   over [epoch - fit_span_days, epoch], propagating backwards with this file's full
-#   force model; only SGP4 states at or before the epoch enter the fit. It removes the
-#   phase-dependent drift of a start at one SGP4 state. Needs the SGP4 samples
-#   (truth_prop.fit_samples_from_elsets) and a space-weather copy that covers the fit
-#   span; a fit that doesn't converge gives status "fit_failed".
-rule = "preserve_sgp4_mean_motion"
+#   Keeps the phase-dependent drift.
+# "sgp4_state_direct": k = 1, the SGP4 state as is.
+rule = "fit_to_sgp4_before_epoch"
 # GM SGP4 works with: WGS-72, km^3/s^2 (sgp4.earth_gravity.wgs72.mu; cheap_prop uses
-# WGS-72). The truth GM is read from the gravity field (EIGEN-6S: 398600.4415).
+# WGS-72). The truth GM is read from the gravity field (EIGEN-6S: 398600.4415). Used by
+# the epoch-state rules and for the fitted rule's initial guess.
 sgp4_mu_km3_s2 = 398600.8
-# Fitted start only (ignored by the other rules). Span before the epoch, days.
-fit_span_days = 1.0
+# Fitted start only (ignored by the other rules). Span before the epoch, days
+# (decided 2026-11-25; the comparison also ran 0.125, 0.5, 1 and 2 days). About four
+# LEO revolutions: enough to average SGP4's short-periodic terms, short enough that
+# little of the drag-model difference is absorbed into the start.
+fit_span_days = 0.25
 # Spacing of the SGP4 samples, s (backwards from the epoch, so the last is the epoch).
-# 60 s gives about 100 samples per LEO revolution; the cost is the backward
-# integration, not the number of samples.
+# 60 s gives about 100 samples per LEO revolution (361 over 0.25 days); the cost is
+# the backward integration, not the number of samples.
 fit_step_s = 60.0
 # Gauss-Newton passes (each one backward integration with the state transition
 # matrix). The fit typically converges in 3.

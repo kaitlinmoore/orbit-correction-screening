@@ -3,7 +3,11 @@
 Evidence for decision 3 (catalog subset size). Uses the project code end to end:
 ``truth_prop.propagate_batch`` (spawned workers, one JVM each, the configured
 ``-XX:ActiveProcessorCount``), the configured force model and zonal degree, and
-7-day windows at 60 s output, as data generation will run them.
+7-day windows at 60 s output. Truth starts under the epoch-state rule
+(``preserve_sgp4_mean_motion``), named explicitly: the configured fitted start
+(2026-11-25) needs SGP4 samples before the epoch, which this script doesn't build.
+The fitted start's cost relative to this, 1.47x per window at a 0.25-day span, is
+measured by ``scripts/fitted_start_comparison.py --part cost``.
 
 Protocol, per worker count:
 1. Start the pool; each worker starts its JVM and loads Orekit in its initializer.
@@ -25,6 +29,7 @@ Usage (needs the datagen group):
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import multiprocessing as mp
 import os
@@ -103,7 +108,7 @@ def main() -> None:
     ap.add_argument("--out", type=Path, default=OUT)
     args = ap.parse_args()
 
-    cfg = T.load_truth_config()
+    cfg = dataclasses.replace(T.load_truth_config(), start_rule=T.EPOCH_START_RULE)
     recs = Z.load_records()
     samples = Z.sample_states(recs)
     jobs = [

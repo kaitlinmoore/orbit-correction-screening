@@ -12,6 +12,11 @@ Two kinds of test live here:
 * **``crosscheck``** (brahe): only with ``ORBIT_CROSSCHECK_TESTS=1`` and the
   ``crosscheck`` group installed.
 
+The configured start rule is the fitted one (``fit_to_sgp4_before_epoch``), which needs
+SGP4 samples before the epoch. Tests that start truth from a single state (physics,
+guards, determinism) name the epoch-state rule explicitly (``epoch_cfg``, the ``cfg``
+fixture); nothing here relies on a fallback to it.
+
 Synthetic states use epochs where the fixture space-weather file
 (``tests/fixtures/sw_celestrak_2024_extract.txt``) is fully observed, or the
 J2000 epoch when no space weather is needed.
@@ -52,6 +57,16 @@ SW_FIXTURE = FIXTURES / "sw_celestrak_2024_extract.txt"
 #: Window of the fixture space-weather copy used by the drag tests.
 SW_FIRST_UTC, SW_LAST_UTC = "2024-02-01T00:00:00", "2024-11-15T00:00:00"
 MU_KM = 398600.4415  # only for building synthetic states; tests use Orekit's mu in checks
+EPOCH = T.EPOCH_START_RULE
+
+
+def epoch_cfg(**changes):
+    """The configured truth model under the epoch-state rule, named explicitly.
+
+    For tests that start truth from one state with no SGP4 fit samples; under the
+    configured (fitted) rule such a call is refused.
+    """
+    return dataclasses.replace(T.load_truth_config(), start_rule=EPOCH, **changes)
 
 
 def circular_state(alt_km: float, inc_deg: float, t0: float, raan_deg: float = 0.0, nid=1):
@@ -157,7 +172,7 @@ def test_start_jvm_refuses_a_process_that_imported_torch():
 
 
 def test_config_loads_with_decided_values():
-    """Decision 1 plus the truth settings decided on 2026-11-23."""
+    """Decision 1 plus the truth settings decided on 2026-11-23 (start rule: 2026-11-25)."""
     cfg = T.load_truth_config()
     assert cfg.gravity_field_file == "eigen-6s.gfc" and cfg.zonal_order == 0
     assert cfg.zonal_degree == 36
@@ -165,7 +180,7 @@ def test_config_loads_with_decided_values():
     assert cfg.msis_local_solar_time == "MEAN" and cfg.msis_ap_switch == -1
     assert cfg.integrator == "DOP853"
     assert cfg.position_tolerance_m == 1.0 and cfg.max_step_s == 180.0
-    assert cfg.start_rule == "preserve_sgp4_mean_motion"
+    assert cfg.start_rule == T.FIT_START_RULE  # changed 2026-11-25 (fitted-start tests below)
     assert cfg.reentry_altitude_km == 120.0
     assert cfg.output_step_s == 60.0
     assert cfg.iers_conventions == "IERS_2010"
@@ -216,7 +231,7 @@ MU_TRUTH_M3 = 3.986004415e14  # EIGEN-6S GM, as Orekit reads it from the bundle
 
 def test_start_rule_preserves_two_body_period_and_shape():
     """k = (mu_truth / mu_WGS72)^(1/3): same period, eccentricity vector and plane."""
-    cfg = T.load_truth_config()
+    cfg = epoch_cfg()
     mu72 = cfg.sgp4_mu_km3_s2
     mu_t = MU_TRUTH_M3 / 1e9
     k = T.start_rule_scale(MU_TRUTH_M3, cfg)
@@ -274,7 +289,7 @@ def test_window_outside_the_copys_range_is_refused(tmp_path):
     """A copy checked for June refuses an August window and one starting before it."""
     t0, copy = _june_copy(tmp_path)
     init = circular_state(500.0, 51.6, t0)
-    cfg = T.load_truth_config()
+    cfg = epoch_cfg()
     late = circular_state(500.0, 51.6, utc_to_tt_seconds("2024-08-10T00:00:00"))
     with pytest.raises(T.SpaceWeatherRangeError, match="outside"):
         T.propagate_truth(late, 1e-4, T.output_grid(late.t_tt_s[0], DAY, 60.0), cfg, copy)
@@ -294,7 +309,7 @@ def test_window_outside_the_copys_range_is_refused(tmp_path):
 def test_bare_path_is_refused_when_drag_is_on(tmp_path):
     t0, copy = _june_copy(tmp_path)
     init = circular_state(500.0, 51.6, t0)
-    cfg = T.load_truth_config()
+    cfg = epoch_cfg()
     with pytest.raises(TypeError, match="SpaceWeatherCopy"):
         T.propagate_truth(init, 1e-4, T.output_grid(t0, DAY, 60.0), cfg, copy.path)
     with pytest.raises(TypeError, match="SpaceWeatherCopy"):
@@ -322,7 +337,7 @@ def test_data_end_margin_enforced_where_copies_are_written_and_windows_run(tmp_p
     init = circular_state(500.0, 51.6, limit - 7 * DAY)
     grid = T.output_grid(limit - 7 * DAY, 7 * DAY + 60.0, 60.0)
     with pytest.raises(T.SpaceWeatherRangeError):
-        T.propagate_truth(init, 1e-4, grid, T.load_truth_config(), copy)
+        T.propagate_truth(init, 1e-4, grid, epoch_cfg(), copy)
 
 
 def test_output_grid():
@@ -429,18 +444,25 @@ def _gp_record(norad):
     raise KeyError(norad)
 
 
-def test_fitted_rule_is_selectable_but_not_the_default(tmp_path):
+def test_default_is_the_fitted_rule_with_a_quarter_day_span(tmp_path):
+    """Decided 2026-11-25: the fitted rule, 0.25-day span, 60 s samples."""
     cfg = T.load_truth_config()
-    assert cfg.start_rule == "preserve_sgp4_mean_motion"
     assert FIT == "fit_to_sgp4_before_epoch" and FIT in T.START_RULES
-    assert (cfg.fit_span_s, cfg.fit_step_s, cfg.fit_max_iterations) == (DAY, 60.0, 8)
+    assert cfg.start_rule == FIT
+    assert (cfg.fit_span_s, cfg.fit_step_s, cfg.fit_max_iterations) == (0.25 * DAY, 60.0, 8)
     assert (cfg.fit_tolerance_m, cfg.fit_tolerance_m_s) == (1e-3, 1e-6)
-    assert dataclasses.replace(cfg, start_rule=FIT).start_rule == FIT
-    # a config file written before the fitted rule (no fit_* keys) still loads
+    # the epoch-state rules stay selectable, by name
+    assert T.EPOCH_START_RULE == "preserve_sgp4_mean_motion"
+    for rule in (T.EPOCH_START_RULE, "sgp4_state_direct"):
+        assert dataclasses.replace(cfg, start_rule=rule).start_rule == rule
+    # a config file written before the fitted rule (epoch rule, no fit_* keys) still
+    # loads, with its own rule
     text = (REPO / "config" / "truth.toml").read_text()
+    assert 'rule = "fit_to_sgp4_before_epoch"' in text
     old = "\n".join(line for line in text.splitlines() if not line.startswith("fit_"))
+    old = old.replace('rule = "fit_to_sgp4_before_epoch"', 'rule = "preserve_sgp4_mean_motion"')
     (tmp_path / "old.toml").write_text(old)
-    assert T.load_truth_config(tmp_path / "old.toml") == cfg
+    assert T.load_truth_config(tmp_path / "old.toml") == epoch_cfg()
     for bad in (
         dict(fit_span_s=0.0),
         dict(fit_step_s=-60.0),
@@ -453,9 +475,41 @@ def test_fitted_rule_is_selectable_but_not_the_default(tmp_path):
             dataclasses.replace(cfg, **bad)
 
 
+def test_no_path_reaches_the_epoch_rule_by_default_or_by_fallback(tmp_path):
+    """The epoch-state rule is reached only by naming it.
+
+    A config built without a rule gets the fitted one; a config file without a rule
+    is refused; and under the configured rule a job without SGP4 fit samples is
+    refused by every entry point (before any space-weather check or JVM), never
+    started from the epoch state.
+    """
+    cfg = T.load_truth_config()
+    fields = dataclasses.asdict(cfg)
+    for name in ("start_rule", "fit_span_s", "fit_step_s"):
+        del fields[name]
+    assert T.TruthConfig(**fields) == cfg  # the dataclass defaults are the configured rule
+    text = (REPO / "config" / "truth.toml").read_text()
+    no_rule = "\n".join(ln for ln in text.splitlines() if not ln.startswith("rule ="))
+    (tmp_path / "no_rule.toml").write_text(no_rule)
+    with pytest.raises(KeyError, match="rule"):
+        T.load_truth_config(tmp_path / "no_rule.toml")
+
+    t0 = utc_to_tt_seconds("2024-06-15T00:00:00")
+    init = circular_state(500.0, 51.6, t0)
+    grid = T.output_grid(t0, DAY, 60.0)
+    # drag on and no space-weather copy: reaching the copy check would raise TypeError,
+    # so the ValueError shows the samples are checked first
+    with pytest.raises(ValueError, match="needs fit_samples"):
+        T.propagate_truth(init, 1e-4, grid, cfg, None)
+    with pytest.raises(ValueError, match="job 0 .*needs fit_samples"):
+        T.propagate_batch([T.TruthJob(init, 1e-4, grid)], cfg, None, 1)
+    with pytest.raises(ValueError, match="fit_start_to_sgp4"):
+        T.apply_start_rule(init, MU_TRUTH_M3, cfg)
+
+
 def test_fit_sample_offsets_end_exactly_at_the_epoch():
     off = T.fit_sample_offsets_s(_fit_cfg())
-    assert off.size == 1441 and off[0] == -DAY and off[-1] == 0.0
+    assert off.size == 361 and off[0] == -0.25 * DAY and off[-1] == 0.0
     assert np.all(off <= 0.0) and np.all(np.diff(off) == 60.0)
     off = T.fit_sample_offsets_s(_fit_cfg(fit_span_s=1000.0, fit_step_s=300.0))
     np.testing.assert_array_equal(off, [-900.0, -600.0, -300.0, 0.0])
@@ -476,9 +530,10 @@ def test_fit_samples_ask_sgp4_for_nothing_after_the_epoch(monkeypatch):
     el = _gravity_elset(_gp_record(25544), "2024-06-15T00:00:00")
     res = T.fit_samples_from_elsets(el, _fit_cfg())[0]
     epoch = el.column("epoch_tt_s")[0].as_py()
-    assert res.status.ok and len(res.trajectory) == 1441
+    assert res.status.ok and len(res.trajectory) == 361
     assert len(asked) == 1 and asked[0][1] is True and asked[0][0].max() == 0.0
-    assert res.trajectory.t_tt_s.max() == epoch and res.trajectory.t_tt_s.min() == epoch - DAY
+    assert res.trajectory.t_tt_s.max() == epoch
+    assert res.trajectory.t_tt_s.min() == epoch - 0.25 * DAY
 
 
 def test_fit_samples_after_the_epoch_are_refused():
@@ -524,9 +579,9 @@ def test_space_weather_guard_covers_the_fit_span(tmp_path):
     t0, june = _june_copy(tmp_path)  # checked from 2024-06-15T00:00
     init = circular_state(500.0, 51.6, t0 + 3600.0)
     grid = T.output_grid(t0 + 3600.0, DAY, 60.0)
-    fit_s = Trajectory(1, t0 + 3600.0 + T.fit_sample_offsets_s(_fit_cfg()),
-                       np.tile(init.r_gcrf_km, (1441, 1)), np.tile(init.v_gcrf_km_s, (1441, 1)),
-                       "sgp4")
+    off = T.fit_sample_offsets_s(_fit_cfg())  # 0.25 d: the first sample is 5 h before t0
+    fit_s = Trajectory(1, t0 + 3600.0 + off, np.tile(init.r_gcrf_km, (off.size, 1)),
+                       np.tile(init.v_gcrf_km_s, (off.size, 1)), "sgp4")
     cfg = _fit_cfg()
     with pytest.raises(T.SpaceWeatherRangeError, match="outside"):
         T.propagate_truth(init, 1e-4, grid, cfg, june, fit_samples=fit_s)
@@ -544,7 +599,12 @@ def test_space_weather_guard_covers_the_fit_span(tmp_path):
 
 @pytest.fixture(scope="session")
 def cfg():
-    return T.load_truth_config()
+    """The configured truth model under the epoch-state rule (named, not defaulted).
+
+    The physics, determinism and guard tests start from one state; the fitted rule's
+    tests replace ``start_rule`` and pass SGP4 samples.
+    """
+    return epoch_cfg()
 
 
 @pytest.fixture(scope="session")
@@ -1165,13 +1225,13 @@ def test_rejects_bad_grids(cfg, ctx, sw_copy):
 
 
 _POOL_SCRIPT = """
-import pickle, sys, json, numpy as np
+import dataclasses, pickle, sys, json, numpy as np
 from orbit_correction import truth_prop as T
 
 def main():
     sw = pickle.loads(open(sys.argv[1], "rb").read())
     out, recs = sys.argv[2], json.loads(open(sys.argv[3]).read())
-    cfg = T.load_truth_config()
+    cfg = dataclasses.replace(T.load_truth_config(), start_rule=T.EPOCH_START_RULE)
     jobs = []
     for rec, epoch in recs:
         init, bstar = T.initial_state_from_omm(rec, epoch)
@@ -1335,7 +1395,7 @@ def test_a_fit_that_does_not_converge_is_a_status(ctx, sw_copy):
     assert res.status == "fit_failed" and res.trajectory is None
     f = res.start_fit
     assert f.status == "not_converged" and f.iterations == 1 and not f.converged
-    assert f.n_samples == 1441 and f.n_evaluations > 0 and "not_converged" in res.message
+    assert f.n_samples == 361 and f.n_evaluations > 0 and "not_converged" in res.message
     assert f.status in T.FIT_STATUSES
 
 
@@ -1355,14 +1415,14 @@ def test_fitted_start_removes_the_phase_drift(ctx, sw_copy):
         grid = T.output_grid(row["epoch_tt_s"], 7 * DAY, 3600.0)
         sg = propagate_sgp4(el, grid)[0].trajectory
         samples = T.fit_samples_from_elsets(el, _fit_cfg())[0].trajectory
-        for rule in ("preserve_sgp4_mean_motion", FIT):
+        for rule in (EPOCH, FIT):
             cfg = dataclasses.replace(T.load_truth_config(), start_rule=rule)
             kw = {"fit_samples": samples} if rule == FIT else {}
             tr = T.propagate_truth(init, row["bstar_per_earth_radii"], grid, cfg, sw_copy, **kw)
             rtn = rtn_from_states(sg.r_gcrf_km, sg.v_gcrf_km_s, tr.trajectory.r_gcrf_km)
             t7[(ma, rule)] = rtn[-1, 1]
-    assert t7[(90.0, "preserve_sgp4_mean_motion")] > 50.0, t7
-    assert t7[(270.0, "preserve_sgp4_mean_motion")] < -50.0, t7
+    assert t7[(90.0, EPOCH)] > 50.0, t7
+    assert t7[(270.0, EPOCH)] < -50.0, t7
     assert abs(t7[(90.0, FIT)]) < 2.0 and abs(t7[(270.0, FIT)]) < 2.0, t7
 
 

@@ -1,11 +1,14 @@
 """Compare the truth start rules: the current epoch start and the fitted start.
 
-The current default, ``preserve_sgp4_mean_motion``, starts truth from SGP4's state at
-the element-set epoch (scaled for the GM difference). That ties the truth orbit's
-mean motion to where in its orbit the object is at the epoch. The labeled variant,
-``fit_to_sgp4_before_epoch``, fits the epoch state to SGP4 positions over a span
-*before* the epoch (``truth_prop.fit_start_to_sgp4``). This script measures both on
-the same windows. It decides nothing; the numbers go to the start-rule decision.
+The epoch start, ``preserve_sgp4_mean_motion`` (the default until 2026-11-25, called
+"current" in the outputs), starts truth from SGP4's state at the element-set epoch
+(scaled for the GM difference). That ties the truth orbit's mean motion to where in
+its orbit the object is at the epoch. The fitted start, ``fit_to_sgp4_before_epoch``,
+fits the epoch state to SGP4 positions over a span *before* the epoch
+(``truth_prop.fit_start_to_sgp4``). This script measures both on the same windows,
+naming each rule and span explicitly, so its results don't depend on the configured
+default. Its 2026-11-24 outputs informed the decision of 2026-11-25 (fitted rule,
+0.25-day span).
 
 Parts (``--part``; ``all`` runs them in order):
 
@@ -79,7 +82,7 @@ HORIZON_S = 7 * DAY
 RE72, MU72 = 6378.135, 398600.8  # WGS-72: what SGP4's mean elements are expressed in
 RE_WGS84 = 6378.137
 APOGEE_MAX_KM = 2000.0
-CURRENT, FITTED = "preserve_sgp4_mean_motion", T.FIT_START_RULE
+CURRENT, FITTED = T.EPOCH_START_RULE, T.FIT_START_RULE
 RULES = (CURRENT, FITTED)
 HORIZONS = {"1 h": 3600.0, "1 d": DAY, "3 d": 3 * DAY, "7 d": 7 * DAY}
 PHASES_DEG = (0.0, 90.0, 180.0, 270.0)
@@ -199,7 +202,13 @@ class Window:
 
 
 def fit_cfg(span_s: float) -> T.TruthConfig:
+    """The configured truth model under the fitted rule with this span."""
     return dataclasses.replace(T.load_truth_config(), start_rule=FITTED, fit_span_s=span_s)
+
+
+def current_cfg() -> T.TruthConfig:
+    """The configured truth model under the epoch-state rule, named explicitly."""
+    return dataclasses.replace(T.load_truth_config(), start_rule=CURRENT)
 
 
 def run_rule(windows, key, cfg, copies, workers, *, span_s=None):
@@ -399,8 +408,7 @@ def part_phase(args, out_dir: Path) -> dict:
     copies = {"phase": T.write_space_weather_copy(
         FIXTURES / "sw_celestrak_2024_extract.txt", out_dir / "sw_orekit_phase_2024-06-14_7d.txt",
         t0 - DAY, t0 + HORIZON_S)}
-    base = T.load_truth_config()
-    walls = {CURRENT: run_rule(windows, CURRENT, base, copies, args.workers),
+    walls = {CURRENT: run_rule(windows, CURRENT, current_cfg(), copies, args.workers),
              FITTED: run_rule(windows, FITTED, fit_cfg(DAY), copies, args.workers, span_s=DAY)}
     records = [window_record(w, k) for w in windows for k in RULES]
     lines = ["| Case | e | MA | argp | T 1 d current | T 7 d current | T 1 d fitted | "
@@ -443,8 +451,7 @@ def part_strata(args, out_dir: Path) -> dict:
                     windows.append(w)
     print(f"strata: {len(windows)} windows from {len(bases)} base objects", flush=True)
     copies = write_copies(sw, out_dir, SOLAR_EPOCHS, before_days=max(SPANS_DAYS))
-    base_cfg = T.load_truth_config()
-    walls = {CURRENT: run_rule(windows, CURRENT, base_cfg, copies, args.workers),
+    walls = {CURRENT: run_rule(windows, CURRENT, current_cfg(), copies, args.workers),
              FITTED: run_rule(windows, FITTED, fit_cfg(DAY), copies, args.workers, span_s=DAY)}
     records = [window_record(w, k) for w in windows for k in RULES]
     # residual series for the notebook
@@ -575,7 +582,7 @@ def part_span(args, out_dir: Path) -> dict:
                 windows.append(w)
     print(f"span: {len(windows)} windows x {len(spans)} spans", flush=True)
     copies = write_copies(sw, out_dir, {"high": epoch}, before_days=max(SPANS_DAYS))
-    walls = {CURRENT: run_rule(windows, CURRENT, T.load_truth_config(), copies, args.workers)}
+    walls = {CURRENT: run_rule(windows, CURRENT, current_cfg(), copies, args.workers)}
     keys = [CURRENT]
     for s in spans:
         k = f"span_{s / DAY:g}d"
@@ -646,7 +653,7 @@ def part_samples(args, out_dir: Path) -> dict:
             windows.append(w)
     sw = parse_spaceweather(args.data_root / "raw" / "celestrak" / "SW-All.txt")
     copies = write_copies(sw, out_dir, {"s": Z.EPOCH_UTC}, before_days=1.0)
-    walls = {CURRENT: run_rule(windows, CURRENT, T.load_truth_config(), copies, args.workers)}
+    walls = {CURRENT: run_rule(windows, CURRENT, current_cfg(), copies, args.workers)}
     keys = [CURRENT]
     for sp in spans:
         k = f"span_{sp / DAY:g}d"
@@ -690,7 +697,7 @@ def part_cost(args, out_dir: Path) -> dict:
     copies = write_copies(sw, out_dir, {"high": epoch}, before_days=1.0)
     runs = []
     for rep in (1, 2):
-        for key, cfg, span in ((CURRENT, T.load_truth_config(), None),
+        for key, cfg, span in ((CURRENT, current_cfg(), None),
                                ("fit_1d", fit_cfg(DAY), DAY),
                                ("fit_0.25d", fit_cfg(0.25 * DAY), 0.25 * DAY)):
             k = f"{key}#{rep}"

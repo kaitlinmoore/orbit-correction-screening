@@ -45,32 +45,23 @@ restarted inside a process, and forking a process that holds one is unsafe. So:
 
 Initial state and the start rule
 --------------------------------
-The initial state is the SGP4 state at the element-set epoch, rotated TEME ->
-GCRF. That is the deliberate, logged conversion from SGP4 mean elements
-(CLAUDE.md). SGP4 states are consistent with the WGS-72 GM (398600.8 km^3/s^2);
-truth integrates with the EIGEN-6S GM (398600.4415), so the same position and
-velocity would have a slightly longer two-body period under truth and drift
-behind SGP4 by about 1.15 km per day for that reason alone. The default start
-rule, ``preserve_sgp4_mean_motion`` (decided 2026-11-23), removes that
-artefact: position and velocity are both multiplied by
-``k = (mu_truth / mu_WGS72) ** (1/3)`` (:func:`apply_start_rule`). Under
-``mu_truth`` the scaled state has the original state's two-body period under
-``mu_WGS72``, the same eccentricity vector and the same orbit plane; it sits
-about 2 m from the SGP4 state. ``sgp4_state_direct`` (k = 1) is kept for
-comparison.
+The SGP4 state at the element-set epoch, rotated TEME -> GCRF, is the deliberate,
+logged conversion from SGP4 mean elements (CLAUDE.md). How truth starts from it is
+the start rule, ``[truth.start] rule``. There is no default that skips the choice:
+the config file must name a rule, and :class:`TruthConfig`'s own default is the
+configured one.
 
-The fitted start, ``fit_to_sgp4_before_epoch``
-----------------------------------------------
-A labeled variant, not the default. Starting from SGP4's state at one instant
-ties the truth orbit's mean motion to where in its orbit the object is at the
-epoch: SGP4's short-periodic terms make that state's osculating period differ
-from the period SGP4 itself keeps, by an amount that depends on the orbital
-phase. Truth then drifts along-track against SGP4 by a phase-dependent amount
-(about +-13 km over 7 days at 800 km near-circular, hundreds of km at
-e = 0.07, with no drag). Element sets fitted to tracking over a span don't
-carry that artifact.
+**Default since 2026-11-25: ``fit_to_sgp4_before_epoch``, 0.25-day span**
+(decided by Kaitlin from the fitted-start comparison; see the changelog). Starting
+from SGP4's state at one instant ties the truth orbit's mean motion to where in
+its orbit the object is at the epoch: SGP4's short-periodic terms make that
+state's osculating period differ from the period SGP4 itself keeps, by an amount
+that depends on the orbital phase. Truth then drifts along-track against SGP4 by
+a phase-dependent amount (about +-13 km over 7 days at 800 km near-circular,
+hundreds of km at e = 0.07, with no drag) that a model would learn from its
+inputs. Element sets fitted to tracking over a span don't carry that artifact.
 
-The variant fits the truth state at the epoch (position and velocity, six
+The fitted rule fits the truth state at the epoch (position and velocity, six
 numbers) by least squares to SGP4's GCRF positions at times in
 ``[epoch - span, epoch]`` (:func:`fit_start_to_sgp4`). Each pass propagates
 backwards from the epoch with the full truth force model (the same
@@ -81,6 +72,28 @@ Gauss-Newton step. **Only SGP4 states at or before the epoch enter the fit**;
 prediction window can shape the start. The GM rescale is not needed: the fit
 finds whatever state matches SGP4 under the truth GM. A fit that does not
 converge returns ``TruthResult(status="fit_failed")``, never a fallback start.
+Without fit samples, :func:`propagate_truth` and :func:`propagate_batch` refuse
+the job rather than start from the epoch state. The fitted state sits tens of
+metres from the SGP4 epoch state, so residuals at t0 are that offset, not zero:
+at a 0.25-day span, median 10 / 21 / 56 m in R / T / N and p95 71 / 137 /
+1,006 m (60 span-test windows, June 2024); at a 1-day span, median 31 / 45 /
+21 m and p95 |T| about 1.2 km (360 stratified windows). The largest are at
+250-400 km, where the fit absorbs part of the drag-model difference.
+
+**Epoch-state rules, kept for comparison.** ``preserve_sgp4_mean_motion`` (the
+default from 2026-11-23 to 2026-11-25) starts at the SGP4 epoch state with one
+correction. SGP4 states are consistent with the WGS-72 GM (398600.8 km^3/s^2);
+truth integrates with the EIGEN-6S GM (398600.4415), so the same position and
+velocity would have a slightly longer two-body period under truth and drift
+behind SGP4 by about 1.15 km per day for that reason alone. The rule multiplies
+position and velocity by ``k = (mu_truth / mu_WGS72) ** (1/3)``
+(:func:`apply_start_rule`). Under ``mu_truth`` the scaled state has the original
+state's two-body period under ``mu_WGS72``, the same eccentricity vector and the
+same orbit plane; it sits about 2 m from the SGP4 state, so under this rule
+residuals at t0 are about 2 m. It keeps the phase-dependent drift above.
+``sgp4_state_direct`` (k = 1) is the SGP4 state as is. Callers that start from
+one state with no SGP4 samples (physics tests, the settings scripts, the brahe
+cross-check) name one of these rules explicitly.
 
 Reproducibility
 ---------------
@@ -117,10 +130,12 @@ REPO = Path(__file__).resolve().parents[2]
 CONFIG_PATH = REPO / "config" / "truth.toml"
 #: Source of the truth data-end margin (``truth_data_end_margin_days``).
 SPLITS_CONFIG_PATH = REPO / "config" / "splits.toml"
-#: The fitted start rule (a labeled sensitivity variant; see the module docstring).
+#: The fitted start rule, the configured default since 2026-11-25 (module docstring).
 FIT_START_RULE = "fit_to_sgp4_before_epoch"
+#: The epoch-state rule that was the default before it, kept for comparison.
+EPOCH_START_RULE = "preserve_sgp4_mean_motion"
 #: Start rules accepted in ``[truth.start] rule``.
-START_RULES = ("preserve_sgp4_mean_motion", "sgp4_state_direct", FIT_START_RULE)
+START_RULES = (EPOCH_START_RULE, "sgp4_state_direct", FIT_START_RULE)
 #: Outcomes of a fitted start (:class:`StartFit`); only ``converged`` gives a trajectory.
 FIT_STATUSES = ("converged", "not_converged", "diverged")
 
@@ -163,10 +178,12 @@ class TruthConfig:
     reentry_altitude_km: float
     reentry_max_check_s: float
     jvm_active_processor_count: int
-    start_rule: str = "preserve_sgp4_mean_motion"
+    # The configured default (2026-11-25), so a config built here without naming a
+    # rule doesn't reach the epoch-state rule.
+    start_rule: str = FIT_START_RULE
     sgp4_mu_km3_s2: float = 398600.8
     # Fitted start (used only when start_rule == FIT_START_RULE; see [truth.start]).
-    fit_span_s: float = 86400.0
+    fit_span_s: float = 0.25 * 86400.0
     fit_step_s: float = 60.0
     fit_max_iterations: int = 8
     fit_tolerance_m: float = 1.0e-3
@@ -221,14 +238,16 @@ def load_truth_config(path: str | Path = CONFIG_PATH) -> TruthConfig:
     with open(path, "rb") as f:
         t = tomllib.load(f)["truth"]
     start = t["start"]
-    # The fit settings are optional, so files written before the fitted rule still load.
-    fit = {
-        "fit_span_s": float(start.get("fit_span_days", 1.0)) * _DAY_S,
-        "fit_step_s": float(start.get("fit_step_s", 60.0)),
-        "fit_max_iterations": int(start.get("fit_max_iterations", 8)),
-        "fit_tolerance_m": float(start.get("fit_tolerance_m", 1.0e-3)),
-        "fit_tolerance_m_s": float(start.get("fit_tolerance_m_s", 1.0e-6)),
-    }
+    # The fit settings are optional, so files written before the fitted rule still
+    # load; a missing one takes TruthConfig's default. The rule itself is required:
+    # a file that names none is refused (KeyError), never given a rule.
+    fit = {}
+    if "fit_span_days" in start:
+        fit["fit_span_s"] = float(start["fit_span_days"]) * _DAY_S
+    for key, typ in (("fit_step_s", float), ("fit_max_iterations", int),
+                     ("fit_tolerance_m", float), ("fit_tolerance_m_s", float)):
+        if key in start:
+            fit[key] = typ(start[key])
     return TruthConfig(
         status=t["status"],
         orekit_data_commit=t["data"]["orekit_data_commit"],
@@ -1492,6 +1511,7 @@ def propagate_batch(
 
 __all__ = [
     "CONFIG_PATH",
+    "EPOCH_START_RULE",
     "FIT_START_RULE",
     "FIT_STATUSES",
     "START_RULES",

@@ -24,7 +24,15 @@ effect; at the step cap DOP853 runs at the same evaluation count at both toleran
 so that difference measures a shift in step phase, not the integration error. Both
 are reported; this script uses the integration error.
 
-Every run has drag (NRLMSISE-00), as truth does.
+Every run has drag (NRLMSISE-00), as truth does. Every run starts under the
+epoch-state rule (``preserve_sgp4_mean_motion``), named explicitly: the comparison is
+between zonal degrees from one shared start, and the configured fitted start
+(2026-11-25) needs SGP4 samples before the epoch.
+
+At the 180 s step the threshold is 50-200 times smaller than at 300 s. In the rerun
+of 2026-11-24 this script's convergence rule gave degree 48-64 at 800-1,200 km and no
+degree at 300 and 500 km, so its "chosen degree" is None. That is consistent with
+degree 36 being a chosen truncation rather than a converged value.
 
 Sample objects (``SAMPLES``): two per band from CelesTrak's active catalogue
 (``data/raw/celestrak/gp_active.json``, accessed 2026-11-23), chosen by
@@ -140,7 +148,7 @@ def main() -> None:
     args = ap.parse_args()
     degrees, reference = args.degrees, args.reference
 
-    cfg = T.load_truth_config()
+    cfg = dataclasses.replace(T.load_truth_config(), start_rule=T.EPOCH_START_RULE)
     recs = load_records()
     reselected = select_samples(list(recs.values()))
     samples = sample_states(recs)

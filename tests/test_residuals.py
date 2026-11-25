@@ -558,13 +558,15 @@ def test_end_to_end_with_the_truth_propagator(elsets, sw, cfg, tmp_path):
     """SGP4 and real truth on the same grid -> rows that pass the contract.
 
     Starlink-1008 (~355 km) moved to 2024-06-15, the first day of the horizon grid.
-    At 60 s the residual is the start-rule offset (about 2 m) plus a minute of
-    divergence; over a day the along-track error grows to kilometres while R and N
-    stay small, which is the shape the curvilinear frame is meant to show.
+    Truth starts under the epoch-state rule, named explicitly (the configured fitted
+    rule needs SGP4 samples before the epoch, which this test of the residual rows
+    doesn't build). At 60 s the residual is that rule's start offset (about 2 m) plus a
+    minute of divergence; over a day the along-track error grows to kilometres while R
+    and N stay small, which is the shape the curvilinear frame is meant to show.
     """
     from orbit_correction import truth_prop as T
 
-    tcfg = T.load_truth_config()
+    tcfg = dataclasses.replace(T.load_truth_config(), start_rule=T.EPOCH_START_RULE)
     copy = T.write_space_weather_copy(
         FIXTURES / "sw_celestrak_2024_extract.txt",
         tmp_path / "sw_orekit_2024-02-01_2024-11-15.txt",
