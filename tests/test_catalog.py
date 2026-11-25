@@ -114,7 +114,7 @@ def test_config_file_matches_code_defaults():
     for name in ("perigee_min_km", "apogee_max_km", "bstar_min_exclusive", "bstar_max",
                  "ephemeris_types", "object_types", "exclude_ops_status",
                  "sma_increase_max_km", "sma_drop_drag_multiple", "sma_drop_floor_km",
-                 "inclination_jump_max_deg"):
+                 "inclination_jump_max_deg", "name_rule_column", "name_rule_object_types"):
         assert getattr(cfg, name) == getattr(default, name), name
     assert cfg.status == "approved 2026-11-23"
     assert {"STARLINK", "FLOCK", "LEMUR"} <= set(cfg.exclude_name_patterns)
@@ -127,14 +127,44 @@ def test_approved_values():
     assert cfg.object_types == ("PAY", "R/B", "DEB") and cfg.ephemeris_types == (0,)
 
 
+def _with(t, **cols):
+    for name, values in cols.items():
+        t = t.set_column(t.column_names.index(name), name, pa.array(values))
+    return t
+
+
 def test_name_rule_catches_flock_and_lemur(gp_sat):
     cfg = C.load_filter_config(REPO / "config" / "catalog_filters.toml")
     names = ["FLOCK 4P-1", "LEMUR-2-JOHANLORAN", "Lemur-2-x", "SYNTH FLOCKISH"]
-    t = gp_sat.slice(0, 4)
-    i = t.column_names.index("object_name")
-    t = t.set_column(i, "object_name", pa.array(names))
+    t = _with(gp_sat.slice(0, 4), satcat_name=names, object_type=["PAY"] * 4)
     rule = next(r for r in C.DEFAULT_RULES if r.name == "not_maneuvering_constellation")
     assert rule.keep(t, cfg).tolist() == [False, False, False, True]
+
+
+def test_name_rule_reads_satcat_names_of_payloads_only(gp_sat):
+    """Decided 2026-11-24: SATCAT names, payloads only; constellation debris is kept."""
+    cfg = C.load_filter_config(REPO / "config" / "catalog_filters.toml")
+    assert cfg.name_rule_column == "satcat_name" and cfg.name_rule_object_types == ("PAY",)
+    rule = next(r for r in C.DEFAULT_RULES if r.name == "not_maneuvering_constellation")
+    t = _with(
+        gp_sat.slice(0, 5),
+        satcat_name=["IRIDIUM 33 DEB", "STARLINK-1008", "ORBCOMM FM5 R/B", "OBJECT A",
+                     "STARLINK-30000"],
+        object_name=["IRIDIUM 33 DEB", "STARLINK-1008", "ORBCOMM FM5 R/B", "OBJECT A",
+                     "TBA - TO BE ASSIGNED"],
+        object_type=["DEB", "PAY", "R/B", "PAY", "PAY"],
+    )
+    # debris and rocket bodies kept; payloads go by their SATCAT name, so an early
+    # element set still named "TBA" goes when the object is now STARLINK-30000
+    assert rule.keep(t, cfg).tolist() == [True, False, True, True, False]
+    # the element set's own name and every type: the earlier behaviour
+    old = C.CatalogFilterConfig(
+        exclude_name_patterns=cfg.exclude_name_patterns, name_rule_column="object_name",
+        name_rule_object_types=("PAY", "R/B", "DEB"),
+    )
+    assert rule.keep(t, old).tolist() == [False, False, False, True, True]
+    with pytest.raises(ValueError, match="name_rule_column"):
+        rule.keep(t, C.CatalogFilterConfig(exclude_name_patterns=("X",), name_rule_column="x"))
 
 
 def test_default_filters_on_fixture(gp_sat):
@@ -242,7 +272,7 @@ def _synthetic_history(
             "MEAN_MOTION_DDOT": 0.0, "EPHEMERIS_TYPE": 0,
         })
         a -= rate
-    return C._records_to_table(recs, "synthetic")
+    return C.records_to_table(recs, "synthetic")
 
 
 def _history_flags(table):

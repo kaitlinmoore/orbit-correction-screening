@@ -42,6 +42,14 @@ exclude_name_patterns = [
     "STARLINK", "ONEWEB", "KUIPER", "IRIDIUM", "GLOBALSTAR", "ORBCOMM",
     "QIANFAN", "GUOWANG", "FLOCK", "LEMUR",
 ]
+# Which name the patterns are tested on (decided 2026-11-24): "satcat_name", the
+# object's current CelesTrak SATCAT name, one name per object over its whole history.
+# Bulk TLE histories carry no names, and an element set's own name ("object_name")
+# can differ from the name the object got later.
+name_rule_column = "satcat_name"
+# Object types the name rule applies to (decided 2026-11-24): payloads only. Debris and
+# rocket bodies named after a constellation (for example IRIDIUM 33 DEB) can't maneuver.
+name_rule_object_types = ["PAY"]
 
 # Part 3 (element histories). Consecutive element sets of one object, by epoch;
 # any flag drops the whole object.

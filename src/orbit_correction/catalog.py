@@ -143,8 +143,14 @@ class CatalogFormatError(ValueError):
     """A record could not be read as an OMM element set."""
 
 
-def _records_to_table(records: Iterable[Mapping[str, Any]], source: str) -> pa.Table:
+def records_to_table(records: Iterable[Mapping[str, Any]], source: str) -> pa.Table:
     """Convert OMM-keyword records to :data:`ELEMENT_SET_SCHEMA`.
+
+    The one conversion every loader goes through (CelesTrak OMM, Space-Track
+    ``gp_history``, single records built by scripts and tests), so an element set
+    gives the same row whichever way it arrives. ``source`` fills the ``source``
+    column. Records are mappings from OMM keywords (``NORAD_CAT_ID``, ``EPOCH``,
+    ``MEAN_MOTION``...) to values, as strings or numbers; extra keywords are ignored.
 
     Any record missing a required element raises (with its position): an
     element set that cannot be read is an error to look at, not a row to drop.
@@ -181,6 +187,11 @@ def _records_to_table(records: Iterable[Mapping[str, Any]], source: str) -> pa.T
     )
 
 
+#: Former private name, kept as an alias for callers not yet moved
+#: (``truth_prop._omm_record_elset``). New code calls :func:`records_to_table`.
+_records_to_table = records_to_table
+
+
 def _read_json_records(path: Path) -> list[dict[str, Any]]:
     opener = gzip.open if path.suffix == ".gz" else open
     with opener(path, "rt", encoding="utf-8") as f:
@@ -202,7 +213,7 @@ def load_celestrak_omm(path: str | Path) -> pa.Table:
             records: list[dict[str, Any]] = list(csv.DictReader(f))
     else:
         records = _read_json_records(path)
-    return _records_to_table(records, "celestrak_omm")
+    return records_to_table(records, "celestrak_omm")
 
 
 def load_spacetrack_gp_history(paths: str | Path | Iterable[str | Path]) -> pa.Table:
@@ -215,7 +226,7 @@ def load_spacetrack_gp_history(paths: str | Path | Iterable[str | Path]) -> pa.T
     if isinstance(paths, (str, Path)):
         paths = [paths]
     tables = [
-        _records_to_table(_read_json_records(Path(p)), "spacetrack_gp_history") for p in paths
+        records_to_table(_read_json_records(Path(p)), "spacetrack_gp_history") for p in paths
     ]
     if not tables:
         return ELEMENT_SET_SCHEMA.empty_table()
@@ -302,6 +313,15 @@ class CatalogFilterConfig:
             treated as able to maneuver and removed.
         exclude_name_patterns: regular expressions (case-insensitive, matched at
             the start of the name) for constellations known to maneuver.
+        name_rule_column: the name the pattern rule reads: ``"satcat_name"`` (the
+            object's current CelesTrak SATCAT name, from :func:`attach_satcat`;
+            decided 2026-11-24) or ``"object_name"`` (the element set's own name,
+            the earlier behaviour). Bulk TLE histories carry no names, and an
+            element set's name can differ from the object's later name, so the
+            SATCAT name gives one name per object across its whole history.
+        name_rule_object_types: object types the name rule applies to (decided
+            2026-11-24: payloads only). Debris and rocket bodies named after a
+            constellation (``IRIDIUM 33 DEB``) cannot maneuver and are kept.
         sma_increase_max_km: across an object's element history, a rise in mean
             semimajor axis larger than this between consecutive element sets
             flags a maneuver (drag only lowers it); the whole object is dropped.
@@ -324,6 +344,8 @@ class CatalogFilterConfig:
     object_types: tuple[str, ...] = ("PAY", "R/B", "DEB")
     exclude_ops_status: tuple[str, ...] = ("+", "P", "B", "S", "X")
     exclude_name_patterns: tuple[str, ...] = ()
+    name_rule_column: str = "satcat_name"
+    name_rule_object_types: tuple[str, ...] = ("PAY",)
     sma_increase_max_km: float = 1.0
     sma_drop_drag_multiple: float = 3.0
     sma_drop_floor_km: float = 1.0
@@ -364,12 +386,36 @@ def _col(table: pa.Table, name: str) -> np.ndarray:
     return table.column(name).to_numpy(zero_copy_only=False)
 
 
-def _keep_constellation(table: pa.Table, cfg: CatalogFilterConfig) -> np.ndarray:
+def name_rule_matches(
+    names: Iterable[str | None],
+    object_types: Iterable[str | None],
+    cfg: CatalogFilterConfig,
+) -> np.ndarray:
+    """True where the constellation name rule removes a row (or SATCAT entry).
+
+    A row is removed when its object type is in ``cfg.name_rule_object_types`` and
+    its name starts with one of ``cfg.exclude_name_patterns`` (case-insensitive).
+    Shared by the catalog filter and the download's candidate rule, so both apply
+    exactly the same test.
+    """
+    names, types = list(names), list(object_types)
     if not cfg.exclude_name_patterns:
-        return np.ones(table.num_rows, dtype=bool)
+        return np.zeros(len(names), dtype=bool)
     pattern = re.compile("|".join(f"(?:{p})" for p in cfg.exclude_name_patterns), re.IGNORECASE)
-    names = table.column("object_name").to_pylist()
-    return np.array([not (n and pattern.match(n)) for n in names], dtype=bool)
+    applies = set(cfg.name_rule_object_types)
+    return np.array(
+        [bool(t in applies and n and pattern.match(n)) for n, t in zip(names, types, strict=True)],
+        dtype=bool,
+    )
+
+
+def _keep_constellation(table: pa.Table, cfg: CatalogFilterConfig) -> np.ndarray:
+    if cfg.name_rule_column not in ("satcat_name", "object_name"):
+        raise ValueError(
+            f"name_rule_column must be 'satcat_name' or 'object_name', got {cfg.name_rule_column!r}"
+        )
+    names = table.column(cfg.name_rule_column).to_pylist()
+    return ~name_rule_matches(names, table.column("object_type").to_pylist(), cfg)
 
 
 def _keep_not_operational_payload(table: pa.Table, cfg: CatalogFilterConfig) -> np.ndarray:
@@ -536,8 +582,11 @@ DEFAULT_RULES: tuple[FilterRule, ...] = (
         _keep_not_operational_payload, ("object_type", "ops_status"),
     ),
     FilterRule(
-        "not_maneuvering_constellation", "name matches none of exclude_name_patterns",
-        _keep_constellation, ("object_name",),
+        "not_maneuvering_constellation",
+        "not an object of a type in name_rule_object_types whose name (name_rule_column) "
+        "starts with one of exclude_name_patterns",
+        # needs both name columns so a config switch can't hit a missing column late
+        _keep_constellation, ("object_name", "satcat_name", "object_type"),
     ),
     FilterRule(
         "no_sma_increase",
