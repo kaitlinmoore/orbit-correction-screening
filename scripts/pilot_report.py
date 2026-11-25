@@ -20,7 +20,8 @@ Writes ``report.json`` and ``report.md``:
   to first order);
 * throughput (windows per second at the worker count used, from the manifest), bytes
   per window on disk, and projections for the larger stages as ratios and totals of
-  disk and of truth work (worker-seconds and integrator evaluations), not durations.
+  disk and of truth work (worker-seconds and integrator evaluations, forward run plus the
+  fitted start's passes), not durations.
 """
 
 from __future__ import annotations
@@ -177,7 +178,9 @@ def main(argv=None) -> int:
     # throughput, disk and projections
     n_ok = man["status"].get("ok", 0)
     truth_s = [r["truth_wall_s"] for r in log if r["truth_wall_s"]]
-    evals = [r["truth_n_evaluations"] for r in log if r["truth_n_evaluations"]]
+    # integrator evaluations per window: the forward run plus the fitted start's passes
+    evals = [(r["truth_n_evaluations"] or 0) + (r.get("fit_n_evaluations") or 0)
+             for r in log if r["truth_n_evaluations"] or r.get("fit_n_evaluations")]
     per_window_bytes = man["parquet_bytes"] / max(n_ok, 1)
     per_sampled_bytes = man["parquet_bytes"] / max(len(log), 1)
     proj = {}
@@ -198,6 +201,7 @@ def main(argv=None) -> int:
         "truth_job_s_p95": float(np.percentile(truth_s, 95)) if truth_s else None,
         "truth_worker_seconds_total": float(np.sum(truth_s)),
         "integrator_evaluations_per_window_median": float(np.median(evals)) if evals else None,
+        "fit_status": dict(Counter(str(r.get("fit_status")) for r in log)),
         "bytes_per_ok_window": per_window_bytes,
         "bytes_per_sampled_window": per_sampled_bytes,
         "parquet_bytes": man["parquet_bytes"], "n_rows": man["n_rows"],
@@ -227,7 +231,7 @@ def main(argv=None) -> int:
         md += md_error_table("By altitude band (km)", d["by_band"], hz)
     t = report["throughput"]
     md += ["## Throughput and projections", "",
-           f"- {t['windows_per_s']} windows/s with {t['workers']} workers; truth job median "
+           f"- {fmt(t['windows_per_s'])} windows/s with {t['workers']} workers; truth job median "
            f"{fmt(t['truth_job_s_median'])} s, p95 {fmt(t['truth_job_s_p95'])} s.",
            f"- {fmt(t['bytes_per_sampled_window'])} bytes per sampled window on disk "
            f"({fmt(t['bytes_per_ok_window'])} per ok window).", ""]

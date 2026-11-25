@@ -409,6 +409,21 @@ Code: `src/orbit_correction/generation.py`; scripts `build_candidate_ids.py`,
   subsample of the same windows and labels every output `dailyap`; `config/truth.toml`
   is not changed.
 
+**Pilot (exploratory, 2026-11-25; train and dev rows only).**
+- **Pool and split:**
+  - 75.3 M element sets of the candidate objects in the span, 8.05 M exact duplicates removed; the filters keep 54.4 M sets of 17,565 objects.
+  - The SMA-rise rule removes the most objects (1,594), often on a single rise of a few km between sets seconds apart.
+  - Train has 32.8 M rows on 11,821 objects; dev 5.8 M rows on 2,099 objects.
+- **Sample:** 5,000 windows, one each on 5,000 objects, from 2015 to 2024.
+- **Window fates:**
+  - 4,934 `ok`;
+  - 51 `rtn_domain`, all in the 250-400 km band: 11% of that band's windows, its largest errors;
+  - 10 `truth_reentry` and 5 `sgp4_floor`;
+  - every fitted start converged.
+- **SGP4 minus truth, median |T| at 7 days by band:** 2,216 km (250-400 km, p95 8,313 km), 264 km (400-600), 28 km (600-800), 8.8 km (800-1,200) and 0.82 km (1,200-2,000). |R| and |N| stay within a few km.
+- **Daily-Ap (switch 9 = +1) minus 3-hour ap truth** on 198 windows: median |T| at 7 days 3 m overall; 5.8 km median (p95 42 km) at 250-400 km; 0.38 km (p95 19 km) at 400-600 km.
+- **Cost and size:** 5,602 bytes per window on disk; 4.9 windows/s on 22 workers. A truth job (fit included) takes 4.1 s median.
+
 ## Models
 
 _To be written (build steps 4 and 7)._
