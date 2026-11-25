@@ -261,6 +261,22 @@ def test_tle_reader_two_and_three_line_sets_bad_and_stray_lines(elsets):
     assert stats.skipped_id == 3 and stats.bad == 0
 
 
+def test_bulk_file_quirks_backslash_and_missing_checksum(elsets):
+    """Line 1s ending in a backslash are read; 68-character lines are counted, not read."""
+    rows = elsets.to_pylist()
+    a1, a2 = _tle_lines(rows[0])
+    b1, b2 = _tle_lines(rows[1])
+    nochk1, nochk2 = b1[:68], b2[:68]
+    stats = G.TleReadStats()
+    recs = list(G.iter_tle_records([a1 + "\\\n", a2 + "\n", nochk1, nochk2], stats))
+    assert [r["NORAD_CAT_ID"] for r in recs] == [rows[0]["norad_id"]]
+    assert stats.trailing_backslash == 1 and stats.no_checksum == 1 and stats.bad == 0
+    assert stats.epoch_days == {a1[18:23]: 1, b1[18:23]: 1} or a1[18:23] == b1[18:23]
+    with pytest.raises(G.TleNoChecksumError):
+        G.tle_to_record(nochk1, nochk2)
+    assert G.tle_to_record(a1 + "\\", a2)["NORAD_CAT_ID"] == rows[0]["norad_id"]
+
+
 def test_tle_with_mismatched_numbers_is_refused(elsets):
     rows = elsets.to_pylist()
     a1, _ = _tle_lines(rows[0])
@@ -317,11 +333,30 @@ def test_label_pool_counts_by_label():
                   "epoch_tt_s": [F.utc_to_tt_seconds(x) for x in
                                  ("2020-03-01T00:00:00", "2026-06-01T00:00:00",
                                   "2020-03-01T00:00:00")]})
-    labeled, summary = G.label_pool(t, cfg, last_observed_date_utc="2026-11-22")
+    labeled, summary, moved = G.label_pool(t, cfg, last_observed_date_utc="2026-11-22")
     lab = labeled.column("split").to_pylist()
     assert lab[2] == "reserved_object"  # Iridium 33 is forced held out
     assert lab[1] in ("reserved_time", "test")
-    assert sum(v["rows"] for v in summary.values()) == 3
+    assert sum(v["rows"] for v in summary.values()) == 3 and moved == {}
+
+
+def test_windows_must_end_within_the_downloaded_history():
+    """History ends 2026-01-01: a 2025-12-28 start (ends 2026-01-04) is excluded, any role."""
+    cfg = load_split_config(REPO / "config" / "splits.toml")
+    starts = ("2025-06-01T00:00:00", "2025-12-24T23:59:59", "2025-12-28T00:00:00",
+              "2025-12-28T00:00:00")
+    t = pa.table({"norad_id": [90001, 90001, 90001, 24946],
+                  "epoch_tt_s": [F.utc_to_tt_seconds(x) for x in starts]})
+    plain, _, _ = G.label_pool(t, cfg, "2026-11-22")
+    labeled, summary, moved = G.label_pool(t, cfg, "2026-11-22",
+                                           history_end_utc="2026-01-01T00:00:00")
+    before, after = plain.column("split").to_pylist(), labeled.column("split").to_pylist()
+    assert after[:2] == before[:2] and before[2] != "excluded"
+    assert after[2] == after[3] == "excluded"
+    # 24946 is forced held out: its 2025 start is a test row before the rule
+    assert before[3] == "test"
+    want = {"test": 2} if before[2] == "test" else {before[2]: 1, "test": 1}
+    assert moved == want
 
 
 # ----------------------------------------------------------------- sampling
@@ -461,12 +496,20 @@ class FakeTruth:
             key = (job.initial.norad_id, float(job.initial.t_tt_s[0]))
             row = self.rows[key]
             assert np.array_equal(job.t_out_tt_s, row["epoch_tt_s"] + self.dt)
+            # fitted start (the default): SGP4 samples over [epoch - 0.25 d, epoch]
+            fs = job.fit_samples
+            assert fs is not None and fs.norad_id == key[0]
+            assert fs.t_tt_s[-1] == key[1] and fs.t_tt_s[0] == key[1] - 0.25 * DAY
             el = pa.Table.from_pylist([{c: row[c] for c in C.REQUIRED_COLUMNS}],
                                       schema=self.schema)
             sg = C.propagate_sgp4_from_epoch(el, self.dt)[0]
             kind = self.fail.get(key[1])
             if kind == "error":
                 out.append(TruthResult(norad_id=key[0], status="error", message="boom"))
+                continue
+            if kind == "fit_failed":
+                out.append(TruthResult(norad_id=key[0], status="fit_failed",
+                                       message="not_converged"))
                 continue
             rtn = np.column_stack([np.full(self.dt.size, 0.01), self.dt / DAY,
                                    np.zeros(self.dt.size)])
@@ -479,7 +522,17 @@ class FakeTruth:
         return out
 
 
-def _run(tmp_path, elsets, sw, rcfg, gcfg, runner=None, chunk=3, windows=None):
+@pytest.fixture(scope="module")
+def tcfg():
+    from orbit_correction import truth_prop as T
+
+    return T.load_truth_config()  # no JVM: reading the config only
+
+
+def _run(tmp_path, elsets, sw, rcfg, gcfg, runner=None, chunk=3, windows=None, restart=None,
+         truth_cfg=None):
+    from orbit_correction import truth_prop as T
+
     w = windows if windows is not None else _windows(elsets, gcfg)
     dt = R.horizon_grid(rcfg)
     dt = dt[dt <= DAY]
@@ -488,7 +541,8 @@ def _run(tmp_path, elsets, sw, rcfg, gcfg, runner=None, chunk=3, windows=None):
     settings = G.RunSettings(run_id="test", label="baseline", chunk_windows=chunk, n_workers=1)
     man = G.run_generation(w, tmp_path / "run", settings, dt_s=dt, residual_cfg=rcfg,
                            space_weather=sw, strata=strata, truth_runner=runner,
-                           manifest_extra={"inputs": {"x": 1}})
+                           truth_cfg=truth_cfg or T.load_truth_config(),
+                           restart_runner=restart, manifest_extra={"inputs": {"x": 1}})
     return w, dt, runner, man
 
 
@@ -496,7 +550,8 @@ def test_run_writes_chunks_log_and_manifest(tmp_path, elsets, sw, rcfg, gcfg):
     w = _windows(elsets, gcfg)
     dt = R.horizon_grid(rcfg)
     dt = dt[dt <= DAY]
-    fail = {w.column("epoch_tt_s")[2].as_py(): "error", w.column("epoch_tt_s")[5].as_py(): "far"}
+    fail = {w.column("epoch_tt_s")[2].as_py(): "error", w.column("epoch_tt_s")[5].as_py(): "far",
+            w.column("epoch_tt_s")[7].as_py(): "fit_failed"}
     runner = FakeTruth(w, dt, fail)
     _, _, _, man = _run(tmp_path, elsets, sw, rcfg, gcfg, runner=runner, windows=w)
     out = tmp_path / "run"
@@ -505,16 +560,18 @@ def test_run_writes_chunks_log_and_manifest(tmp_path, elsets, sw, rcfg, gcfg):
     log = G.read_logs(out)
     assert [r["window_index"] for r in log] == list(range(8))  # every window, once
     st = {r["window_index"]: r["status"] for r in log}
-    assert st[2] == "truth_error" and st[5] == "rtn_domain"
-    assert all(st[i] == "ok" for i in (0, 1, 3, 4, 6, 7))
+    assert st[2] == "truth_error" and st[5] == "rtn_domain" and st[7] == "truth_fit_failed"
+    assert all(st[i] == "ok" for i in (0, 1, 3, 4, 6))
     assert all(r["label"] == "baseline" and r["chunk_file"].startswith("chunk_") for r in log)
     # rows: only ok windows, contract-valid, labeled in the file metadata
     tables = [pq.read_table(p) for p in sorted(out.glob("chunk_*.parquet"))]
     for t in tables:
         validate_residual_table(t)
         assert t.schema.metadata[b"label"] == b"baseline"
-    assert sum(t.num_rows for t in tables) == 6 * dt.size == man["n_rows"]
-    assert man["status"] == {"ok": 6, "rtn_domain": 1, "truth_error": 1}
+    assert sum(t.num_rows for t in tables) == 5 * dt.size == man["n_rows"]
+    assert man["status"] == {"ok": 5, "rtn_domain": 1, "truth_error": 1, "truth_fit_failed": 1}
+    assert man["plan"]["start_rule"] == "fit_to_sgp4_before_epoch"
+    assert man["worker_pool_crashes"] == 0
     assert sum(man["counts_by_status_band_bin"].values()) == 8
     assert man["n_chunks"] == 3 and man["chunks_written_this_call"] == [0, 1, 2]
     assert man["inputs"] == {"x": 1} and "commit" in man["code"]
@@ -563,6 +620,87 @@ def test_below_floor_start_makes_no_truth_job(tmp_path, elsets, sw, rcfg, gcfg):
     assert rec["truth_status"] == "not_run" and rec["truth_wall_s"] is None
 
 
+def test_missing_fit_samples_make_no_truth_job(tmp_path, elsets, sw, rcfg, gcfg):
+    """Start above 120 km, but the 0.25 days before it dip below: no job, no other start."""
+    w = _windows(elsets, gcfg)
+    rows = w.to_pylist()
+    # eccentric orbit, epoch at apogee (about 750 km), perigee about 70 km
+    rows[3].update(eccentricity=0.05, mean_anomaly_deg=180.0, mean_motion_rev_per_day=15.5)
+    from orbit_correction import truth_prop as T
+
+    fit = T.fit_samples_from_elsets(pa.Table.from_pylist(rows[3:4], schema=w.schema),
+                                    T.load_truth_config())[0]
+    assert not fit.status.ok
+    w = pa.Table.from_pylist(rows, schema=w.schema)
+    one = w.slice(3, 1)
+    assert C.sgp4_epoch_states(one)[0].trajectory is not None
+    _, _, runner, man = _run(tmp_path, elsets, sw, rcfg, gcfg, windows=w)
+    assert runner.jobs == 7 and man["status"]["fit_samples_unavailable"] == 1
+    rec = [r for r in G.read_logs(tmp_path / "run") if r["window_index"] == 3][0]
+    assert rec["truth_status"] == "not_run" and rec["status"] == "fit_samples_unavailable"
+
+
+def test_epoch_state_rule_passes_no_fit_samples(tmp_path, elsets, sw, rcfg, gcfg, tcfg):
+    w = _windows(elsets, gcfg)
+    dt = R.horizon_grid(rcfg)
+    dt = dt[dt <= DAY]
+    seen = []
+
+    def runner(jobs):
+        seen.extend(j.fit_samples for j in jobs)
+        fake = FakeTruth(w, dt)
+        out = []
+        for j in jobs:
+            row = fake.rows[(j.initial.norad_id, float(j.initial.t_tt_s[0]))]
+            el = pa.Table.from_pylist([{c: row[c] for c in C.REQUIRED_COLUMNS}],
+                                      schema=fake.schema)
+            sg = C.propagate_sgp4_from_epoch(el, dt)[0]
+            out.append(_truth_with(sg, np.zeros((dt.size, 3))))
+        return out
+
+    old_rule = dataclasses.replace(tcfg, start_rule="preserve_sgp4_mean_motion")
+    _, _, _, man = _run(tmp_path, elsets, sw, rcfg, gcfg, runner=runner, truth_cfg=old_rule)
+    assert seen and all(f is None for f in seen) and man["status"] == {"ok": 8}
+
+
+class CrashingRunner(FakeTruth):
+    """Raises BrokenProcessPool on the first ``n_crash`` calls for chunk 1's windows."""
+
+    def __init__(self, windows, dt, n_crash):
+        super().__init__(windows, dt)
+        self.n_crash = n_crash
+        self.restarts = 0
+        self.crash_epochs = {r["epoch_tt_s"] for r in windows.to_pylist()[3:6]}
+
+    def restart(self):
+        self.restarts += 1
+
+    def __call__(self, jobs):
+        from concurrent.futures.process import BrokenProcessPool
+
+        if self.n_crash and float(jobs[0].initial.t_tt_s[0]) in self.crash_epochs:
+            self.n_crash -= 1
+            raise BrokenProcessPool("a worker died")
+        return super().__call__(jobs)
+
+
+def test_broken_pool_retries_the_chunk_and_counts_the_crash(tmp_path, elsets, sw, rcfg, gcfg):
+    w = _windows(elsets, gcfg)
+    dt = R.horizon_grid(rcfg)
+    dt = dt[dt <= DAY]
+    runner = CrashingRunner(w, dt, n_crash=1)
+    _, _, _, man = _run(tmp_path, elsets, sw, rcfg, gcfg, runner=runner, restart=runner.restart)
+    assert runner.restarts == 1 and man["worker_pool_crashes"] == 1
+    assert man["worker_pool_crash_records"][0]["chunk"] == 1
+    assert man["status"]["ok"] == 8 and len(G.read_logs(tmp_path / "run")) == 8
+    # a chunk that keeps breaking stops the run after three attempts, all counted
+    stuck = CrashingRunner(w, dt, n_crash=10)
+    with pytest.raises(RuntimeError, match="3 attempts"):
+        _run(tmp_path / "b", elsets, sw, rcfg, gcfg, runner=stuck, restart=stuck.restart)
+    crashes = (tmp_path / "b" / "run" / "crashes.jsonl").read_text().splitlines()
+    assert len(crashes) == 3 and stuck.restarts == 2
+
+
 # ----------------------------------------------------------------- real truth (datagen)
 
 
@@ -591,8 +729,10 @@ def test_reachable_along_track_limit_is_counted_as_rtn_domain(elsets, sw, rcfg, 
     grid = R.horizon_grid(rcfg)
     sg = C.propagate_sgp4_from_epoch(el, grid)[0]
     start = C.sgp4_epoch_states(el)[0].trajectory
-    tr = T.propagate_truth(start, 0.01, el["epoch_tt_s"][0].as_py() + grid,
-                           T.load_truth_config(), sw_copy)
+    tcfg = T.load_truth_config()
+    fit = T.fit_samples_from_elsets(el, tcfg)[0].trajectory
+    tr = T.propagate_truth(start, 0.01, el["epoch_tt_s"][0].as_py() + grid, tcfg, sw_copy,
+                           fit_samples=fit)
     assert sg.status.ok and tr.status == "ok"
     res = G.window_result(el.to_pylist()[0], sg, tr, sw, "train", grid, rcfg)
     assert res.status == "rtn_domain" and res.altitude_band == "250-400"
@@ -614,8 +754,11 @@ def test_run_with_spawned_truth_workers(tmp_path, elsets, sw, rcfg, gcfg, sw_cop
         strata = G.window_strata(w, sw, rcfg, gcfg)
         settings = G.RunSettings(run_id="real", label="baseline", chunk_windows=2, n_workers=2)
         man = G.run_generation(w, tmp_path / "real", settings, dt_s=dt, residual_cfg=rcfg,
-                               space_weather=sw, strata=strata, truth_runner=pool.run)
+                               space_weather=sw, strata=strata, truth_runner=pool.run,
+                               truth_cfg=tcfg, restart_runner=pool.restart)
     assert man["status"] == {"ok": 3} and man["n_rows"] == 3 * dt.size
     assert T.jvm_started() == before  # the workers' JVMs are theirs, not this process's
     log = G.read_logs(tmp_path / "real")
-    assert all(r["truth_wall_s"] > 0 and r["truth_start_scale"] != 1.0 for r in log)
+    # the default fitted start: every job fitted and converged
+    assert all(r["truth_wall_s"] > 0 and r["fit_status"] == "converged" for r in log)
+    assert man["fit_status"] == {"converged": 3} and man["worker_pool_crashes"] == 0

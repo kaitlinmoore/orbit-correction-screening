@@ -13,9 +13,14 @@ not tracked positions.
 ## Data
 
 - Element sets: CelesTrak GP (development, tests); Space-Track's yearly bulk TLE files for
-  training and test epochs, 2015-01-01 through 2026-11-23 (decided 2026-11-24, following
-  Space-Track's guidance to use the bulk files for many objects or long date ranges); and
-  Space-Track `gp_history` from 2004-01-01 for the ten validation-case objects only.
+  training and test epochs (decided 2026-11-24, following Space-Track's guidance to use the
+  bulk files for many objects or long date ranges): the 2015 to 2025 files, element sets
+  kept by epoch from 2015-01-01 to 2026-01-01 (the files are grouped by publication date,
+  not epoch); and Space-Track `gp_history` from 2004-01-01 to 2026-11-23 for the ten
+  validation-case objects only (one download, 148,602 element sets). **The test period is
+  2025 for now**: windows of any role must end within the downloaded history (before
+  2026-01-01). 2026 will be added when Space-Track publishes its 2026 file, as a
+  test-period extension only (training epochs end at the 2025-01-01 cutoff either way).
   Loading and filtering: `src/orbit_correction/catalog.py`; the bulk TLE reader and the
   download list: `src/orbit_correction/generation.py`.
 - Space weather: CelesTrak `SW-All.txt`, read by `src/orbit_correction/spaceweather.py`.
@@ -352,13 +357,20 @@ Code: `src/orbit_correction/generation.py`; scripts `build_candidate_ids.py`,
   arithmetic, so each element set gives the same `Satrec` as the library's reader except
   for the epoch, which is converted to an ISO string rounded to the microsecond (the TLE
   resolves 0.864 ms). Bad pairs (checksum, layout) and stray lines are counted per file.
+  File quirks: the 2015 file ends every line 1 with a backslash (removed and counted) and
+  carries macOS `__MACOSX` members (skipped); 68-character lines without a checksum
+  column (analyst objects and some old sets) are counted and left out. Each file's epoch
+  coverage by day is recorded.
 - **Pool.** Element sets in the span, exact duplicates removed (same object, epoch and
   elements; same-epoch rows that differ are kept and counted), SATCAT attached, the
   catalog filters applied with rows and objects removed reported per rule. The pool is
   built per group of NORAD IDs, which changes nothing because every rule is per object.
 - **Split.** Every pool element set is labeled as a window start with
   `splits.assign_split_labels`; the last fully observed space-weather day, the seed and
-  the config hashes are recorded with it. Only counts per label are reported.
+  the config hashes are recorded with it. Then one rule of the download (decided
+  2026-11-25): a window of any role ending after the end of the downloaded history
+  (2026-01-01 today) is labeled `excluded`, counted by its original label. Only counts per
+  label are reported.
 - **Window sampling (proposed).** Starts at element-set epochs, train and dev rows only.
   Per object, its eligible epochs are tried in a seeded random order and a start is kept
   if it is at least 7 days from the object's other starts, up to a cap. Across objects,
@@ -366,16 +378,25 @@ Code: `src/orbit_correction/generation.py`; scripts `build_candidate_ids.py`,
   has one start before any has two, and a smaller stage is the first part of a larger one.
   Uniform over element sets means better-tracked periods get more starts; coverage is
   reported by year, altitude band, solar bin, eccentricity bin and split.
-- **Runs.** Chunks of windows: SGP4 and its epoch states in the parent process (no JVM),
-  truth in spawned workers that keep their JVM for the whole run, rows from
+- **Runs.** Chunks of windows: SGP4, its epoch states and, under the fitted start, the SGP4
+  samples over the 0.25 days before each epoch (`truth_prop.fit_samples_from_elsets`) in
+  the parent process (no JVM), passed to each truth job; truth in spawned workers that
+  keep their JVM for the whole run, rows from
   `build_window_rows`, one zstd Parquet file per chunk. A chunk is done when its marker,
   written last, names the same windows and both of its files still hash to what the
   marker recorded; a rerun skips done chunks and redoes the rest. One space-weather copy
-  covers the run, checked by the existing range and 41-day margin guards.
+  covers the run from the earliest epoch minus the fit span to the latest window end,
+  checked by the existing range and 41-day margin guards (from each job's first fit
+  sample). A worker that dies breaks the pool (`BrokenProcessPool`): nothing of that chunk
+  has been written, the chunk is retried on a fresh pool up to three attempts, and every
+  crash is recorded (`crashes.jsonl`, counted in the manifest).
 - **Window fates.** Every sampled window gets one log record and one status: `ok`, the
-  row builder's drops (`truth_error`, `sgp4_error`, `truth_reentry`, `sgp4_floor`), the
-  conversion's refusal (`rtn_domain`), or one of two statuses for a start with no SGP4
-  state (`start_below_floor`, `start_sgp4_error`; no truth job is made). Counts by
+  row builder's drops (`truth_error`, `truth_fit_failed` for a fitted start that did not
+  converge, `sgp4_error`, `truth_reentry`, `sgp4_floor`), the conversion's refusal
+  (`rtn_domain`), or one of three statuses for windows that get no truth job: no SGP4
+  state at the epoch (`start_below_floor`, `start_sgp4_error`), or no usable SGP4 samples
+  over the fit span (`fit_samples_unavailable`). A window without fit samples is never
+  started some other way. The log also carries each fit's status, passes and misfit. Counts by
   status, altitude band and solar bin go into the run manifest, with the code commit,
   config hashes, orekit-data commit, the space-weather copy's hash and range, the last
   observed day and the seed.

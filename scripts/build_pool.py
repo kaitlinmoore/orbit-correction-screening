@@ -19,7 +19,8 @@ Per NORAD-ID bucket (``bulk_extract/bucket_NN``, from ``extract_bulk_tle.py``):
    in rows and objects).
 3. :func:`orbit_correction.generation.label_pool`: every kept element set labeled as a
    window start with ``splits.assign_split_labels``, using the space-weather file's
-   last fully observed day at labeling time.
+   last fully observed day at labeling time; windows ending after ``--end`` (the end
+   of the downloaded history) are labeled ``excluded``, counted by original label.
 
 Writes ``pool_bucket_NN.parquet`` (catalog columns, SATCAT columns, ``split``) and
 ``pool_manifest.json`` (inputs and their hashes, config hashes, the last observed day,
@@ -79,7 +80,7 @@ def main(argv=None) -> int:
     args.out_dir.mkdir(parents=True, exist_ok=True)
     totals: dict[str, Counter] = {k: Counter() for k in (
         "dropped_at_rule", "rejected_by_rule", "objects_dropped_at_rule", "dedupe", "split_rows",
-        "split_objects", "rows")}
+        "split_objects", "rows", "history_end_excluded")}
     outputs = []
     for d in bucket_dirs:
         b = int(d.name.split("_")[1])
@@ -96,7 +97,9 @@ def main(argv=None) -> int:
             parts.append(validation.filter(pa.array(ids % n_buckets == b)))
         elsets = pa.concat_tables(parts, promote_options="none")
         res = generation.build_pool(elsets, satcat, filters, args.start, args.end)
-        labeled, summary = generation.label_pool(res.table, split_cfg, last_obs)
+        labeled, summary, moved = generation.label_pool(
+            res.table, split_cfg, last_obs, history_end_utc=f"{args.end}T00:00:00")
+        totals["history_end_excluded"].update(moved)
         out = args.out_dir / f"pool_bucket_{b:02d}.parquet"
         pq.write_table(labeled, out, compression="zstd")
         outputs.append(out.name)
@@ -137,9 +140,11 @@ def main(argv=None) -> int:
             "last_fully_observed_date_utc": last_obs,
             "rows_by_label": dict(sorted(totals["split_rows"].items())),
             "objects_by_label": dict(sorted(totals["split_objects"].items())),
+            "history_end_utc": f"{args.end}T00:00:00",
+            "history_end_excluded_by_original_label": dict(totals["history_end_excluded"]),
         },
         "counts": {k: dict(v) for k, v in totals.items()
-                   if k not in ("split_rows", "split_objects")},
+                   if k not in ("split_rows", "split_objects", "history_end_excluded")},
         "buckets": n_buckets,
         "outputs": outputs,
     }

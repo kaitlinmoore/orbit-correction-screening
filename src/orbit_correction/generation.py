@@ -212,6 +212,24 @@ class TleFormatError(ValueError):
     """Two lines that are not a valid TLE (layout, checksum or matching numbers)."""
 
 
+class TleNoChecksumError(TleFormatError):
+    """A 68-character line: the checksum column is missing, so the line can't be verified.
+
+    Space-Track's bulk files carry such lines for analyst objects (8xxxx) and some old
+    element sets, written with explicit ``+`` signs. They are counted and left out.
+    """
+
+
+def _clean(line: str) -> str:
+    """A TLE line without its line ending or one trailing backslash.
+
+    Some bulk files end every line 1 with ``\\`` (the 2015 file); the backslash is
+    not part of the format (column 70 would be past the checksum).
+    """
+    line = line.rstrip("\r\n")
+    return line[:-1] if line.endswith("\\") else line
+
+
 def tle_checksum(line: str) -> int:
     """TLE checksum of a line's first 68 characters: digits summed, ``-`` counts 1, mod 10."""
     total = 0
@@ -285,9 +303,13 @@ def tle_to_record(line1: str, line2: str, name: str | None = None) -> dict:
         TleFormatError: wrong layout, a checksum that doesn't match, or different
             object numbers on the two lines.
     """
-    l1, l2 = line1.rstrip("\r\n"), line2.rstrip("\r\n")
-    if len(l1) < 69 or len(l2) < 69 or not l1.startswith("1 ") or not l2.startswith("2 "):
+    l1, l2 = _clean(line1), _clean(line2)
+    if not l1.startswith("1 ") or not l2.startswith("2 "):
         raise TleFormatError(f"not a TLE pair: {l1[:20]!r} / {l2[:20]!r}")
+    if len(l1) == 68 or len(l2) == 68:
+        raise TleNoChecksumError(f"no checksum column: {l1!r} / {l2!r}")
+    if len(l1) < 69 or len(l2) < 69:
+        raise TleFormatError(f"line too short: {l1!r} / {l2!r}")
     for n, line in ((1, l1), (2, l2)):
         if not line[68].isdigit() or tle_checksum(line) != int(line[68]):
             raise TleFormatError(f"line {n} checksum mismatch: {line!r}")
@@ -326,18 +348,26 @@ class TleReadStats:
     Attributes:
         lines: lines read (blank lines included).
         tles: element-line pairs found.
-        bad: pairs that failed :func:`tle_to_record` (with up to 20 examples).
+        bad: wanted pairs that failed :func:`tle_to_record` for a reason other than
+            a missing checksum (with up to 20 examples).
+        no_checksum: wanted pairs with a 68-character line (no checksum column).
+        trailing_backslash: lines that ended in a backslash (removed before parsing).
         stray_lines: lines that belong to no pair (neither a title nor an element line
             in sequence).
         skipped_id: well-formed pairs whose ID was not wanted (not fully parsed).
+        epoch_days: ``YYDDD`` of every pair's epoch (wanted or not) -> count, so a
+            file's coverage by epoch can be checked.
         examples: messages of the first bad pairs.
     """
 
     lines: int = 0
     tles: int = 0
     bad: int = 0
+    no_checksum: int = 0
+    trailing_backslash: int = 0
     stray_lines: int = 0
     skipped_id: int = 0
+    epoch_days: dict[str, int] = field(default_factory=dict)
     examples: list[str] = field(default_factory=list)
 
 
@@ -355,6 +385,9 @@ def iter_tle_records(lines: Iterable[str], stats: TleReadStats, want_ids: set[in
     for raw in lines:
         stats.lines += 1
         line = raw.rstrip("\r\n")
+        if line.endswith("\\"):
+            stats.trailing_backslash += 1
+            line = line[:-1]
         if not line.strip():
             continue
         if line.startswith("1 "):
@@ -370,6 +403,8 @@ def iter_tle_records(lines: Iterable[str], stats: TleReadStats, want_ids: set[in
             stats.tles += 1
             l1, pending = pending, None
             nm, name = name, None
+            day = l1[18:23]
+            stats.epoch_days[day] = stats.epoch_days.get(day, 0) + 1
             try:
                 nid = tle_norad_id(l1)
             except ValueError:
@@ -379,6 +414,8 @@ def iter_tle_records(lines: Iterable[str], stats: TleReadStats, want_ids: set[in
                 continue
             try:
                 yield tle_to_record(l1, line, nm)
+            except TleNoChecksumError:
+                stats.no_checksum += 1
             except TleFormatError as exc:
                 stats.bad += 1
                 if len(stats.examples) < 20:
@@ -638,26 +675,45 @@ def build_pool(elsets, satcat, filters: CatalogFilterConfig, span_start_utc: str
 # --------------------------------------------------------------------------------------
 
 
-def label_pool(pool, split_cfg, last_observed_date_utc: str):
+def label_pool(pool, split_cfg, last_observed_date_utc: str, history_end_utc: str | None = None):
     """The pool with a ``split`` column: every element set labeled as a window start.
 
     Thin wrapper over :func:`orbit_correction.splits.assign_split_labels` (seeded
     object draws, the time cutoff, the event exclusion and the 41-day data-end margin
-    measured from ``last_observed_date_utc``). Returns ``(table, summary)`` where
-    ``summary`` is :func:`splits.split_summary` (row and object counts per label).
-    Counts only: nothing about residuals or targets exists at this point.
+    measured from ``last_observed_date_utc``), plus one rule of the downloaded data:
+
+    * ``history_end_utc`` (ISO UTC, exclusive end of the element-set history; decided
+      2026-11-25): a window of **any** role whose end (start + ``max_horizon_days``)
+      is later than this is labeled ``excluded``. Windows must end within the data
+      that was downloaded. Today that is 2026-01-01T00:00:00: the 2025 bulk file is
+      the last one, so the test period is 2025; 2026 is added as a test-period
+      extension when Space-Track publishes it.
+
+    Returns:
+        ``(table, summary, history_end_excluded)``: the labeled table,
+        :func:`splits.split_summary` (row and object counts per label) and, per
+        original label, the rows the history-end rule relabeled. Counts only:
+        nothing about residuals or targets exists at this point.
     """
     import pyarrow as pa
 
     from orbit_correction import splits
+    from orbit_correction.frames import utc_to_tt_seconds
 
     ids = pool.column("norad_id").to_numpy()
+    start = pool.column("epoch_tt_s").to_numpy()
     labels = splits.assign_split_labels(
-        ids, pool.column("epoch_tt_s").to_numpy(), split_cfg,
-        last_observed_date_utc=last_observed_date_utc,
+        ids, start, split_cfg, last_observed_date_utc=last_observed_date_utc,
     )
+    relabeled: dict[str, int] = {}
+    if history_end_utc is not None:
+        end = start + split_cfg.max_horizon_days * _DAY_S
+        late = (end > float(utc_to_tt_seconds(history_end_utc))) & (labels != "excluded")
+        for lab in np.unique(labels[late]):
+            relabeled[str(lab)] = int(np.sum(labels[late] == lab))
+        labels[late] = "excluded"
     table = pool.append_column("split", pa.array(labels.tolist(), type=pa.string()))
-    return table, splits.split_summary(labels, ids)
+    return table, splits.split_summary(labels, ids), relabeled
 
 
 # --------------------------------------------------------------------------------------
@@ -810,7 +866,10 @@ def coverage(strata: dict[str, list], roles: Iterable[str]) -> dict[str, dict[st
 #: start_below_floor: the SGP4 state at the element-set epoch is already below the 120 km
 #:   floor (``cheap_prop.sgp4_epoch_states`` gives no state), so there is no truth job.
 #: start_sgp4_error: SGP4 flags an error code at the epoch itself; no state, no job.
-PRE_TRUTH_STATUSES = ("start_below_floor", "start_sgp4_error")
+#: fit_samples_unavailable: under the fitted start rule, SGP4 can't give the samples
+#:   before the epoch the fit needs (an SGP4 error code or the 120 km floor somewhere in
+#:   ``[epoch - fit span, epoch]``). No job is made and no other start is used.
+PRE_TRUTH_STATUSES = ("start_below_floor", "start_sgp4_error", "fit_samples_unavailable")
 
 
 def generation_statuses() -> tuple[str, ...]:
@@ -852,11 +911,24 @@ def window_result(elset_row, sgp4, truth, space_weather, split, dt_s, residual_c
         )
 
 
-def pre_truth_result(elset_row, start, space_weather, split, residual_cfg):
-    """WindowResult for a window whose start has no SGP4 state (no truth job is made)."""
+def pre_truth_result(elset_row, start, space_weather, split, residual_cfg, *,
+                     fit_samples=None):
+    """WindowResult for a window that gets no truth job.
+
+    Either its start has no SGP4 state (``start``'s status: ``start_below_floor`` or
+    ``start_sgp4_error``), or the start exists but the fitted rule's SGP4 samples before
+    the epoch don't (``fit_samples`` given with a status that isn't ok:
+    ``fit_samples_unavailable``). The start is tested first.
+    """
     from orbit_correction import residuals as R
 
-    status = "start_below_floor" if start.status.below_floor else "start_sgp4_error"
+    if start.trajectory is None:
+        status = "start_below_floor" if start.status.below_floor else "start_sgp4_error"
+        detail = start.status
+    elif fit_samples is not None and not fit_samples.status.ok:
+        status, detail = "fit_samples_unavailable", fit_samples.status
+    else:
+        raise ValueError("the window has a start state and usable fit samples")
     asof = space_weather.as_of(float(elset_row["epoch_tt_s"]))
     return R.WindowResult(
         norad_id=int(elset_row["norad_id"]),
@@ -867,9 +939,9 @@ def pre_truth_result(elset_row, start, space_weather, split, residual_cfg):
         altitude_band=R.altitude_band(float(elset_row["perigee_alt_km"]), residual_cfg),
         solar_activity_bin=R.solar_activity_bin(asof.f107_obs_trailing81_sfu, residual_cfg),
         table=None,
-        sgp4_code=int(start.status.code),
+        sgp4_code=int(detail.code),
         truth_status="not_run",
-        message=start.status.message,
+        message=detail.message,
     )
 
 
@@ -895,7 +967,7 @@ def _gen_worker_run(job):
     try:
         return truth_prop.propagate_truth(
             job.initial, job.bstar_per_er, job.t_out_tt_s, _GEN_WORKER["cfg"], _GEN_WORKER["sw"],
-            area_to_mass_m2_per_kg=job.area_to_mass_m2_per_kg,
+            area_to_mass_m2_per_kg=job.area_to_mass_m2_per_kg, fit_samples=job.fit_samples,
         )
     except Exception as exc:  # noqa: BLE001  (reported per window; the run continues)
         return truth_prop.TruthResult(
@@ -940,14 +1012,36 @@ class TruthWorkerPool:
             self._pool.shutdown(wait=True, cancel_futures=True)
             self._pool = None
 
-    def run(self, jobs):
-        from orbit_correction.truth_prop import SpaceWeatherRangeError
+    def restart(self) -> None:
+        """Replace a broken pool (a worker died) with a fresh one: new workers, new JVMs."""
+        if self._pool is not None:
+            self._pool.shutdown(wait=False, cancel_futures=True)
+            self._pool = None
+        self.__enter__()
 
-        if self.truth_cfg.atmosphere != "none":
-            for i, job in enumerate(jobs):
+    def run(self, jobs):
+        """Run jobs in the workers; results in job order.
+
+        Every job is checked first, as ``truth_prop.propagate_batch`` checks: fit samples
+        present under the fitted start rule and absent under any other, and the window,
+        from the first fit sample under the fitted rule, inside the space-weather copy.
+        One failing job refuses the chunk. A worker that dies raises
+        ``concurrent.futures.process.BrokenProcessPool`` (handled by the caller).
+        """
+        from orbit_correction.truth_prop import FIT_START_RULE, SpaceWeatherRangeError
+
+        fitted = self.truth_cfg.start_rule == FIT_START_RULE
+        for i, job in enumerate(jobs):
+            if fitted and job.fit_samples is None:
+                raise ValueError(f"job {i} (NORAD {job.initial.norad_id}): the fitted start "
+                                 "rule needs fit_samples")
+            if not fitted and job.fit_samples is not None:
+                raise ValueError(f"job {i}: fit_samples given but the start rule is "
+                                 f"{self.truth_cfg.start_rule!r}")
+            if self.truth_cfg.atmosphere != "none":
+                first = float(job.fit_samples.t_tt_s[0]) if fitted else float(job.initial.t_tt_s[0])
                 try:
-                    self.sw_copy.check_window(float(job.initial.t_tt_s[0]),
-                                              float(np.asarray(job.t_out_tt_s)[-1]))
+                    self.sw_copy.check_window(first, float(np.asarray(job.t_out_tt_s)[-1]))
                 except SpaceWeatherRangeError as exc:
                     raise SpaceWeatherRangeError(
                         f"job {i} (NORAD {job.initial.norad_id}): {exc}") from None
@@ -1037,12 +1131,15 @@ def _atomic_write_text(path: Path, text: str) -> None:
 
 
 def run_chunk(windows, k: int, out_dir: Path, settings: RunSettings, dt_s, residual_cfg,
-              space_weather, strata, truth_runner) -> dict:
+              space_weather, strata, truth_runner, truth_cfg) -> dict:
     """Generate one chunk: SGP4 here, truth through ``truth_runner``, rows, files, marker.
 
-    Steps: SGP4 on the horizon grid and the epoch states (this process, no JVM); a
-    truth job for every window with a start state (``start_below_floor`` and
-    ``start_sgp4_error`` windows get none); truth results; one :class:`WindowResult`
+    Steps: SGP4 on the horizon grid, the epoch states and, under the fitted start rule,
+    the fit samples before each epoch (``truth_prop.fit_samples_from_elsets``), all in
+    this process with no JVM; a truth job for every window with a start state and,
+    under the fitted rule, usable fit samples (``start_below_floor``,
+    ``start_sgp4_error`` and ``fit_samples_unavailable`` windows get none, and no
+    other start is tried); truth results; one :class:`WindowResult`
     per window (``rtn_domain`` caught); ``ok`` rows written as one zstd Parquet file;
     one log record per window; then the marker with both files' hashes. Files are
     written to temporary names and renamed, so a crash leaves no file that looks done.
@@ -1054,6 +1151,8 @@ def run_chunk(windows, k: int, out_dir: Path, settings: RunSettings, dt_s, resid
         strata: :func:`window_strata` for these rows (the log carries the labels).
         truth_runner: callable ``jobs -> [TruthResult]`` in job order
             (:meth:`TruthWorkerPool.run`, or a stand-in in tests).
+        truth_cfg: the truth configuration the runner uses (its start rule decides
+            whether fit samples are built and passed).
 
     Returns:
         The marker's content (counts, hashes, timings).
@@ -1065,7 +1164,7 @@ def run_chunk(windows, k: int, out_dir: Path, settings: RunSettings, dt_s, resid
     import pyarrow.parquet as pq
 
     from orbit_correction import cheap_prop
-    from orbit_correction.truth_prop import TruthJob
+    from orbit_correction.truth_prop import FIT_START_RULE, TruthJob, fit_samples_from_elsets
     from orbit_correction.types import RESIDUAL_SCHEMA
 
     parquet, log, done = _chunk_paths(out_dir, k)
@@ -1074,16 +1173,19 @@ def run_chunk(windows, k: int, out_dir: Path, settings: RunSettings, dt_s, resid
     t0 = time.perf_counter()
     sgp4 = cheap_prop.propagate_sgp4_from_epoch(windows, dt)
     starts = cheap_prop.sgp4_epoch_states(windows)
+    fitted = truth_cfg.start_rule == FIT_START_RULE
+    fits = fit_samples_from_elsets(windows, truth_cfg) if fitted else [None] * len(rows)
     t_sgp4 = time.perf_counter() - t0
 
     jobs, job_of = [], {}
-    for i, (row, st) in enumerate(zip(rows, starts, strict=True)):
-        if st.trajectory is None:
+    for i, (row, st, fit) in enumerate(zip(rows, starts, fits, strict=True)):
+        if st.trajectory is None or (fit is not None and not fit.status.ok):
             continue
         job_of[i] = len(jobs)
         jobs.append(TruthJob(initial=st.trajectory,
                              bstar_per_er=float(row["bstar_per_earth_radii"]),
-                             t_out_tt_s=float(row["epoch_tt_s"]) + dt))
+                             t_out_tt_s=float(row["epoch_tt_s"]) + dt,
+                             fit_samples=None if fit is None else fit.trajectory))
     t1 = time.perf_counter()
     truths = truth_runner(jobs) if jobs else []
     t_truth = time.perf_counter() - t1
@@ -1100,7 +1202,8 @@ def run_chunk(windows, k: int, out_dir: Path, settings: RunSettings, dt_s, resid
             res = window_result(row, sgp4[i], truth, space_weather, row["split"], dt,
                                 residual_cfg, include_observed=settings.include_observed)
         else:
-            res = pre_truth_result(row, starts[i], space_weather, row["split"], residual_cfg)
+            res = pre_truth_result(row, starts[i], space_weather, row["split"], residual_cfg,
+                                   fit_samples=fits[i])
         if res.table is not None:
             tables.append(res.table)
         results.append(res)
@@ -1116,6 +1219,7 @@ def run_chunk(windows, k: int, out_dir: Path, settings: RunSettings, dt_s, resid
             truth_wall_s=None if truth is None else truth.wall_s,
             truth_n_evaluations=None if truth is None else truth.n_evaluations,
             truth_start_scale=None if truth is None else truth.start_scale,
+            **_fit_fields(truth),
             rows_s=time.perf_counter() - tw,
             n_rows=res.n_rows, chunk=k, chunk_file=parquet.name,
         )
@@ -1155,6 +1259,17 @@ def run_chunk(windows, k: int, out_dir: Path, settings: RunSettings, dt_s, resid
     }
     _atomic_write_text(done, json.dumps(marker, indent=1) + "\n")
     return marker
+
+
+def _fit_fields(truth) -> dict:
+    """The fitted start's record for the log (all None without a fit)."""
+    fit = None if truth is None else getattr(truth, "start_fit", None)
+    if fit is None:
+        return {"fit_status": None, "fit_iterations": None, "fit_rms_m": None,
+                "fit_max_m": None, "fit_wall_s": None, "fit_n_evaluations": None}
+    return {"fit_status": fit.status, "fit_iterations": fit.iterations, "fit_rms_m": fit.rms_m,
+            "fit_max_m": fit.max_m, "fit_wall_s": fit.wall_s,
+            "fit_n_evaluations": fit.n_evaluations}
 
 
 def read_logs(out_dir: str | Path) -> list[dict]:
@@ -1197,7 +1312,8 @@ def code_provenance(repo: str | Path = REPO) -> dict:
 
 
 def run_generation(windows, out_dir: str | Path, settings: RunSettings, *, dt_s, residual_cfg,
-                   space_weather, strata, truth_runner, manifest_extra: dict | None = None,
+                   space_weather, strata, truth_runner, truth_cfg, restart_runner=None,
+                   max_chunk_attempts: int = 3, manifest_extra: dict | None = None,
                    progress=None) -> dict:
     """Run (or resume) a chunked generation over a window table and write its manifest.
 
@@ -1215,22 +1331,37 @@ def run_generation(windows, out_dir: str | Path, settings: RunSettings, *, dt_s,
         residual_cfg, space_weather: for the row builder.
         strata: :func:`window_strata` of ``windows`` (all rows).
         truth_runner: ``jobs -> [TruthResult]``.
+        truth_cfg: the truth configuration the runner uses. Its settings are part of
+            the plan, so a resume with other truth settings is refused.
+        restart_runner: called after the worker pool breaks (a worker process died:
+            ``BrokenProcessPool``), before the chunk is retried; for
+            :class:`TruthWorkerPool`, its ``restart``. Nothing of a crashed chunk is
+            kept (files are written only after truth returns). Each crash is appended
+            to ``crashes.jsonl`` and counted in the manifest; after
+            ``max_chunk_attempts`` failed attempts on one chunk the run stops.
         manifest_extra: recorded in the manifest (configs, inputs, space-weather copy).
         progress: optional callable(marker) after each new chunk.
 
     Returns:
         The manifest written to ``run_manifest.json``.
     """
+    import dataclasses
+    import datetime as dt_mod
+    import hashlib
     import json
+    from concurrent.futures.process import BrokenProcessPool
 
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     digest = _ids_digest(windows)
+    truth_json = json.dumps(dataclasses.asdict(truth_cfg), sort_keys=True)
     plan = {
         "run_id": settings.run_id, "label": settings.label,
         "chunk_windows": settings.chunk_windows, "include_observed": settings.include_observed,
         "n_windows": windows.num_rows, "windows_sha256": digest,
         "horizons": int(np.asarray(dt_s).size),
+        "truth_settings_sha256": hashlib.sha256(truth_json.encode()).hexdigest(),
+        "start_rule": truth_cfg.start_rule, "msis_ap_switch": truth_cfg.msis_ap_switch,
     }
     plan_path = out / "run_plan.json"
     if plan_path.exists():
@@ -1249,8 +1380,25 @@ def run_generation(windows, out_dir: str | Path, settings: RunSettings, *, dt_s,
             skipped.append(k)
             continue
         part_strata = {key: v[a:b] for key, v in strata.items()}
-        marker = run_chunk(part, k, out, settings, dt_s, residual_cfg, space_weather,
-                           part_strata, truth_runner)
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                marker = run_chunk(part, k, out, settings, dt_s, residual_cfg, space_weather,
+                                   part_strata, truth_runner, truth_cfg)
+                break
+            except BrokenProcessPool as exc:
+                crash = {"chunk": k, "attempt": attempt,
+                         "utc": dt_mod.datetime.now(dt_mod.UTC).isoformat(timespec="seconds"),
+                         "error": f"{type(exc).__name__}: {exc}"}
+                with open(out / "crashes.jsonl", "a", encoding="utf-8") as f:
+                    f.write(json.dumps(crash) + "\n")
+                if attempt >= max_chunk_attempts:
+                    raise RuntimeError(
+                        f"chunk {k}: the worker pool broke on {attempt} attempts; stopping"
+                    ) from exc
+                if restart_runner is not None:
+                    restart_runner()
         new.append(k)
         if progress is not None:
             progress(marker)
@@ -1261,6 +1409,9 @@ def run_generation(windows, out_dir: str | Path, settings: RunSettings, *, dt_s,
         raise RuntimeError(f"log has {len(records)} records for {windows.num_rows} windows")
     from collections import Counter
 
+    crash_path = out / "crashes.jsonl"
+    crashes = ([json.loads(x) for x in crash_path.read_text().splitlines() if x]
+               if crash_path.exists() else [])
     manifest = {
         "plan": plan,
         "code": code_provenance(),
@@ -1284,6 +1435,9 @@ def run_generation(windows, out_dir: str | Path, settings: RunSettings, *, dt_s,
             "truth_job_wall_sum": sum(r["truth_wall_s"] or 0.0 for r in records),
         },
         "n_workers": settings.n_workers,
+        "worker_pool_crashes": len(crashes),
+        "worker_pool_crash_records": crashes,
+        "fit_status": dict(sorted(Counter(str(r.get("fit_status")) for r in records).items())),
         **(manifest_extra or {}),
     }
     _atomic_write_text(out / "run_manifest.json", json.dumps(manifest, indent=1) + "\n")
@@ -1321,6 +1475,7 @@ __all__ = [
     "CandidateResult",
     "candidate_ids_from_satcat",
     "TleFormatError",
+    "TleNoChecksumError",
     "TleReadStats",
     "download_sample_ids",
     "iter_tle_records",

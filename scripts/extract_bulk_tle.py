@@ -6,8 +6,13 @@
         --start 2015-01-01 --end 2026-11-24 \\
         --out-dir data/derived/pool/bulk_extract
 
-Reads every ``*.zip`` (each text member streamed, nothing unpacked to disk), ``*.txt``
-and ``*.txt.gz`` file in ``--bulk-dir``. Two-line and three-line sets are both read
+Reads every ``*.zip`` (each text member streamed, nothing unpacked to disk; macOS
+``__MACOSX/`` and ``._*`` members skipped), ``*.txt`` and ``*.txt.gz`` file in
+``--bulk-dir``. Files may be grouped by publication date, not epoch (Space-Track's 2015
+file starts with 2014-12-31 epochs), so element sets are kept by their **epoch** and
+never by the file they came in. A trailing backslash on a line (the 2015 file ends
+every line 1 with one) is removed and counted; 68-character lines without a checksum
+column are counted and left out. Two-line and three-line sets are both read
 (``orbit_correction.generation.iter_tle_records``). Keeps element sets of the IDs in
 ``--ids`` with epochs in ``[--start, --end)`` and writes them in the catalog schema
 (``source = "spacetrack_bulk_tle"``), split by NORAD ID into ``--buckets`` groups
@@ -57,8 +62,9 @@ def text_streams(path: Path) -> Iterator[tuple[str, Iterator[str]]]:
     if path.suffix == ".zip":
         with zipfile.ZipFile(path) as z:
             for info in z.infolist():
-                if info.is_dir():
-                    continue
+                base = info.filename.rsplit("/", 1)[-1]
+                if info.is_dir() or info.filename.startswith("__MACOSX/") or base.startswith("._"):
+                    continue  # macOS resource forks, not data
                 with z.open(info) as raw:
                     if info.filename.endswith(".gz"):
                         raw = gzip.GzipFile(fileobj=raw)
@@ -114,9 +120,12 @@ def extract_one(path: Path, want: set[int], start: str, end: str, out_dir: Path,
         written.append(str(f.relative_to(out_dir)))
     return {
         "lines": stats.lines, "tles": stats.tles, "bad": stats.bad,
+        "no_checksum": stats.no_checksum, "trailing_backslash": stats.trailing_backslash,
         "stray_lines": stats.stray_lines, "other_objects": stats.skipped_id,
         "outside_span": out_of_span, "kept": kept, "bad_examples": stats.examples,
         "members": members, "outputs": written,
+        # every TLE's epoch day (YYDDD), wanted or not: the file's coverage by epoch
+        "epoch_days_all": dict(sorted(stats.epoch_days.items())),
     }
 
 
@@ -128,6 +137,7 @@ def main(argv=None) -> int:
     p.add_argument("--end", required=True, help="end day, YYYY-MM-DD (exclusive)")
     p.add_argument("--out-dir", type=Path, required=True)
     p.add_argument("--buckets", type=int, default=16)
+    p.add_argument("--jobs", type=int, default=1, help="files read in parallel (one process each)")
     args = p.parse_args(argv)
 
     want = read_ids(args.ids)
@@ -144,6 +154,7 @@ def main(argv=None) -> int:
         for line in manifest.read_text().splitlines():
             e = json.loads(line)
             done[e["file"]] = e
+    todo = []
     for path in inputs:
         sha = generation.file_sha256(path)
         prev = done.get(path.name)
@@ -152,8 +163,9 @@ def main(argv=None) -> int:
                 and all((args.out_dir / o).exists() for o in prev["outputs"])):
             print(f"skip (done) {path.name}")
             continue
-        print(f"reading {path.name} ({path.stat().st_size:,} bytes)", flush=True)
-        res = extract_one(path, want, args.start, args.end, args.out_dir, args.buckets)
+        todo.append((path, sha))
+
+    def record(path, sha, res):
         entry = {
             "file": path.name, "bytes": path.stat().st_size, "sha256": sha,
             "extracted_utc": dt.datetime.now(dt.UTC).isoformat(timespec="seconds"),
@@ -162,8 +174,25 @@ def main(argv=None) -> int:
         }
         with open(manifest, "a", encoding="utf-8") as m:
             m.write(json.dumps(entry) + "\n")
-        print(json.dumps({k: entry[k] for k in ("file", "tles", "bad", "stray_lines",
-                                                "other_objects", "outside_span", "kept")}))
+        print(json.dumps({k: entry[k] for k in ("file", "tles", "bad", "no_checksum",
+                                                "trailing_backslash", "stray_lines",
+                                                "other_objects", "outside_span", "kept")}),
+              flush=True)
+
+    if args.jobs <= 1:
+        for path, sha in todo:
+            print(f"reading {path.name} ({path.stat().st_size:,} bytes)", flush=True)
+            record(path, sha, extract_one(path, want, args.start, args.end, args.out_dir,
+                                          args.buckets))
+    else:
+        from concurrent.futures import ProcessPoolExecutor, as_completed
+
+        with ProcessPoolExecutor(max_workers=args.jobs) as pool:
+            futs = {pool.submit(extract_one, path, want, args.start, args.end, args.out_dir,
+                                args.buckets): (path, sha) for path, sha in todo}
+            for f in as_completed(futs):
+                path, sha = futs[f]
+                record(path, sha, f.result())
     return 0
 
 

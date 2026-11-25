@@ -78,7 +78,8 @@ Row builder and the drop rule
 -----------------------------
 :func:`build_window_rows` produces one row per horizon of a window, or no rows and a
 status (:class:`WindowResult`). The drop rule (approved shared 120 km rule): a window
-gives no rows if truth returned ``reentry`` (or ``error``), or SGP4 truncated or
+gives no rows if truth returned ``reentry`` (or ``error``, or ``fit_failed`` under the
+fitted start rule), or SGP4 truncated or
 failed anywhere in it, either from one of SGP4's own error codes or at the 120 km
 altitude floor (:data:`orbit_correction.cheap_prop.ALTITUDE_FLOOR_CODE`). Dropped
 windows keep their altitude band and solar-activity bin so the caller can count
@@ -458,6 +459,8 @@ def solar_activity_bin(f107_trailing81_sfu: float, cfg: ResidualConfig) -> str:
 #: Statuses of a window that gives no rows, in the order used to pick
 #: :attr:`WindowResult.status` when several apply (all are in ``causes``).
 #: truth_error: the truth job raised (``propagate_batch``'s ``"error"``).
+#: truth_fit_failed: under the fitted start rule, the fit of the truth start to SGP4
+#:   did not converge (truth status ``"fit_failed"``; no trajectory, no fallback start).
 #: sgp4_error: SGP4 flagged an error code (1-6) inside the window.
 #: truth_reentry: truth fell below 120 km (or started below it).
 #: sgp4_floor: SGP4 fell below the 120 km floor (``cheap_prop``).
@@ -467,7 +470,9 @@ def solar_activity_bin(f107_trailing81_sfu: float, cfg: ResidualConfig) -> str:
 #:   generation catches the error per window and records this status
 #:   (``generation.window_result``). Lowest priority, and in practice never combined
 #:   with another cause: the residual is computed only when nothing else applies.
-DROP_STATUSES = ("truth_error", "sgp4_error", "truth_reentry", "sgp4_floor", "rtn_domain")
+DROP_STATUSES = (
+    "truth_error", "truth_fit_failed", "sgp4_error", "truth_reentry", "sgp4_floor", "rtn_domain",
+)
 WINDOW_STATUSES = ("ok", *DROP_STATUSES)
 
 #: Element-set columns the row builder reads.
@@ -668,6 +673,8 @@ def build_window_rows(
     causes = []
     if truth.status == "error":
         causes.append("truth_error")
+    elif truth.status == "fit_failed":
+        causes.append("truth_fit_failed")
     elif truth.status not in ("ok", "reentry"):
         raise ValueError(f"unknown truth status {truth.status!r}")
     if not sgp4.status.ok:

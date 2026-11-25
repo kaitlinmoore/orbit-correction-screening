@@ -11,7 +11,9 @@
         --space-weather data/raw/celestrak/SW-All.txt \\
         --out-root data/derived/residuals --run-id pilot_dailyap
 
-What runs where: SGP4, the rows and the files in this process (no JVM); truth in
+What runs where: SGP4 (the window grid, the epoch state and, under the fitted start
+rule, the SGP4 samples over the fit span before the epoch), the rows and the files in
+this process (no JVM); truth in
 ``--workers`` spawned processes, one JVM each, kept for the whole run
 (:class:`orbit_correction.generation.TruthWorkerPool`). The training process never
 runs this: generation is its own process.
@@ -25,7 +27,9 @@ and solar bin). Rerunning the same command skips chunks already written and veri
 
 ``--daily-ap`` runs truth with NRLMSISE-00 switch 9 = +1 (daily Ap) instead of the
 configured -1 (3-hour ap array), labels every output ``dailyap`` and leaves
-``config/truth.toml`` unchanged. ``--truth-config`` takes another truth configuration
+``config/truth.toml`` unchanged. A worker that dies breaks the pool: the chunk is
+retried on a fresh pool (up to three attempts) and the crash is counted in the
+manifest. ``--truth-config`` takes another truth configuration
 (for example a variant start rule); its hash and start rule go into the manifest.
 """
 
@@ -83,7 +87,9 @@ def main(argv=None) -> int:
     dt_s = residuals.horizon_grid(rcfg)
     sw = parse_spaceweather(args.space_weather)
     epochs = windows.column("epoch_tt_s").to_numpy()
-    first, last = float(epochs.min()), float(epochs.max() + dt_s[-1])
+    # under the fitted start, truth also integrates over [epoch - fit span, epoch]
+    lead = tcfg.fit_span_s if tcfg.start_rule == truth_prop.FIT_START_RULE else 0.0
+    first, last = float(epochs.min() - lead), float(epochs.max() + dt_s[-1])
 
     run_dir = args.out_root / args.run_id
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -116,6 +122,7 @@ def main(argv=None) -> int:
             "config_path": str(args.truth_config.resolve()),
             "settings": dataclasses.asdict(tcfg),
             "start_rule": tcfg.start_rule,
+            "fit_span_s": tcfg.fit_span_s if lead else None,
             "msis_ap_switch": tcfg.msis_ap_switch,
             "overridden_at_run_time": {"msis_ap_switch": 1} if args.daily_ap else {},
             "orekit_data_commit": tcfg.orekit_data_commit,
@@ -141,7 +148,8 @@ def main(argv=None) -> int:
     with generation.TruthWorkerPool(tcfg, copy, workers) as pool:
         man = generation.run_generation(
             windows, run_dir, settings, dt_s=dt_s, residual_cfg=rcfg, space_weather=sw,
-            strata=strata, truth_runner=pool.run, manifest_extra=extra, progress=progress)
+            strata=strata, truth_runner=pool.run, truth_cfg=tcfg,
+            restart_runner=pool.restart, manifest_extra=extra, progress=progress)
     wall = time.perf_counter() - start
     new = len(man["chunks_written_this_call"])
     # the call's wall time (worker start-up included) goes into the manifest too
