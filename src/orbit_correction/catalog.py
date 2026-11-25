@@ -187,11 +187,6 @@ def records_to_table(records: Iterable[Mapping[str, Any]], source: str) -> pa.Ta
     )
 
 
-#: Former private name, kept as an alias for callers not yet moved
-#: (``truth_prop._omm_record_elset``). New code calls :func:`records_to_table`.
-_records_to_table = records_to_table
-
-
 def _read_json_records(path: Path) -> list[dict[str, Any]]:
     opener = gzip.open if path.suffix == ".gz" else open
     with opener(path, "rt", encoding="utf-8") as f:

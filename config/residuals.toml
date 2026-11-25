@@ -35,6 +35,9 @@ missing_label = "unknown"
 # each rounded to a multiple of round_to_s, duplicates removed. With the values
 # below: 199 horizons from 60 s to 7 days (7 days is in both parts). dt = 0 is
 # not included (the start-rule offset of about 2 m is the only residual there).
+# "About 2 m" is the figure for the earlier epoch-state rule (preserve_sgp4_mean_motion);
+# under the fitted start (default since 2026-11-25) the residual at dt = 0 is the fit's
+# misfit to SGP4 at the epoch instead.
 [residuals.horizon_grid]
 max_horizon_s = 604800.0
 log_first_s = 60.0
