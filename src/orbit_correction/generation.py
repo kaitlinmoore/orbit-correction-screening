@@ -489,6 +489,8 @@ class GenerationConfig:
         n_workers: truth worker processes (one JVM each).
         dailyap_windows: size of the daily-Ap sensitivity subsample of a stage.
         eccentricity_edges: reporting bins of the element set's eccentricity.
+        fit_rms_flag_m: a window whose fitted start's RMS misfit is above this gets
+            the log flag ``fit_rms_above_threshold`` (a flag, not a drop).
     """
 
     status: str
@@ -501,6 +503,7 @@ class GenerationConfig:
     n_workers: int
     dailyap_windows: int
     eccentricity_edges: tuple[float, ...]
+    fit_rms_flag_m: float = 1000.0
 
     def __post_init__(self) -> None:
         bad = set(self.roles) - {"train", "dev"}
@@ -513,6 +516,8 @@ class GenerationConfig:
         e = np.asarray(self.eccentricity_edges, dtype=np.float64)
         if e.size == 0 or np.any(np.diff(e) <= 0):
             raise ValueError("eccentricity_edges must be strictly increasing")
+        if not self.fit_rms_flag_m > 0:
+            raise ValueError("fit_rms_flag_m must be positive")
 
 
 def load_generation_config(path: str | Path = CONFIG_PATH) -> GenerationConfig:
@@ -522,6 +527,7 @@ def load_generation_config(path: str | Path = CONFIG_PATH) -> GenerationConfig:
     with open(path, "rb") as f:
         g = tomllib.load(f)["generation"]
     s, r, c = g["sampling"], g["run"], g["coverage"]
+    flags = g.get("flags", {})
     return GenerationConfig(
         status=str(g["status"]),
         seed=int(s["seed"]),
@@ -533,6 +539,7 @@ def load_generation_config(path: str | Path = CONFIG_PATH) -> GenerationConfig:
         n_workers=int(r["n_workers"]),
         dailyap_windows=int(r["dailyap_windows"]),
         eccentricity_edges=tuple(float(x) for x in c["eccentricity_edges"]),
+        fit_rms_flag_m=float(flags.get("fit_rms_flag_m", 1000.0)),
     )
 
 
@@ -550,6 +557,10 @@ def file_sha256(path: str | Path) -> str:
 # --------------------------------------------------------------------------------------
 # Training pool
 # --------------------------------------------------------------------------------------
+
+#: Which forward RTN conversion built a run's targets (recorded in its plan, so a
+#: resume can't mix two): ``residuals.rtn_from_window``, du unwrapped along the window.
+RTN_CONVERSION = "window_unwrapped_du_v1"
 
 #: Element columns that identify an element set's content (duplicates are rows that
 #: agree on all of them). ``epoch_tt_s`` stands for the epoch: it is computed from the
@@ -590,7 +601,8 @@ class DedupeStats:
         exact_duplicates: rows removed because an earlier row had the same object,
             epoch and elements (the same element set read twice).
         same_epoch_different: rows kept that share object and epoch with another row
-            but differ in some element (corrections or reissues; not decided here).
+            but differ in some element (corrections or reissues; collapsed next by
+            :func:`collapse_reissues`).
     """
 
     n_input: int
@@ -604,8 +616,8 @@ def drop_exact_duplicates(elsets):
     Bulk files and API downloads can carry the same element set more than once.
     Identical copies add nothing and, in the element-history rules, form a pair with a
     zero gap and no change, which no rule flags, so removing them changes no filter
-    outcome. Rows that share object and epoch but differ are kept and counted: which
-    one to trust is a decision, not a cleaning step.
+    outcome. Rows that share object and epoch but differ are kept here and counted;
+    :func:`collapse_reissues` then keeps one of each group (decided 2026-11-25).
 
     Returns:
         ``(table, DedupeStats)``; the table keeps the first copy of each, in input order.
@@ -625,6 +637,117 @@ def drop_exact_duplicates(elsets):
     return out, DedupeStats(n, int((~keep).sum()), int(same_epoch_different))
 
 
+#: Element sets of one object whose epochs are at most this far apart are one
+#: element set issued more than once (decided 2026-11-25): collapsed to one by
+#: :func:`collapse_reissues` before the element-history rules.
+REISSUE_MAX_GAP_S = 60.0
+
+
+@dataclass(frozen=True)
+class ReissueStats:
+    """What :func:`collapse_reissues` found.
+
+    Attributes:
+        n_input: rows in.
+        groups: groups of two or more element sets of one object, chained by
+            consecutive epoch gaps of at most ``max_gap_s``.
+        rows_removed: rows dropped (every member of a group but the one kept).
+        same_epoch_groups: groups whose members all share one epoch.
+        near_simultaneous_groups: groups spanning more than 0 s (up to the gap
+            limit per step).
+        max_group_span_s: the widest group's first-to-last epoch span.
+        tie_groups: groups where the highest element-set number was shared (or
+            every number missing), settled by read order.
+        removed_by_source: ``source`` tag -> rows removed.
+        max_gap_s: the gap limit used.
+    """
+
+    n_input: int
+    groups: int
+    rows_removed: int
+    same_epoch_groups: int
+    near_simultaneous_groups: int
+    max_group_span_s: float
+    tie_groups: int
+    removed_by_source: dict[str, int]
+    max_gap_s: float
+
+
+def collapse_reissues(elsets, max_gap_s: float = REISSUE_MAX_GAP_S):
+    """Keep one element set per reissue group: the highest element-set number.
+
+    Space-Track can publish an object's element set more than once at the same
+    epoch, or at epochs a few seconds apart, with slightly different elements (a
+    correction or a reissue). Fed to the element-history rules as consecutive sets,
+    two such copies form a pair with a near-zero gap whose difference is fit noise,
+    and the semimajor-axis and inclination rules can flag it as a maneuver. Decided
+    2026-11-25: such a group is collapsed to one set before the history rules.
+
+    Grouping: per object, element sets in epoch order; a set joins the previous
+    set's group when its epoch is at most ``max_gap_s`` later (single linkage, so a
+    group's span can exceed ``max_gap_s``; the stats record the widest).
+    Kept: the highest ``element_set_no`` (a missing number counts lowest); a tie
+    goes to the set read last (highest row position in the input). Run after
+    :func:`drop_exact_duplicates`, so the members differ in some element.
+
+    Returns:
+        ``(table, ReissueStats)``; the table keeps input order of the kept rows.
+    """
+    import pyarrow as pa
+
+    n = elsets.num_rows
+    if n == 0:
+        return elsets, ReissueStats(0, 0, 0, 0, 0, 0.0, 0, {}, float(max_gap_s))
+    ids = elsets.column("norad_id").to_numpy()
+    t = elsets.column("epoch_tt_s").to_numpy()
+    num_col = elsets.column("element_set_no")
+    num = num_col.to_numpy(zero_copy_only=False).astype(np.float64)
+    if num_col.null_count:
+        num[np.asarray(num_col.is_null())] = -np.inf
+    pos = np.arange(n)
+    order = np.lexsort((pos, t, ids))  # by object, epoch, then read order
+    ids_o, t_o, num_o = ids[order], t[order], num[order]
+    new_group = np.ones(n, dtype=bool)
+    new_group[1:] = (ids_o[1:] != ids_o[:-1]) | ((t_o[1:] - t_o[:-1]) > max_gap_s)
+    gid = np.cumsum(new_group) - 1
+    sizes = np.bincount(gid)
+    # best per group: highest number, then last read (order already sorts read order
+    # within an epoch, but a group spans epochs, so compare positions explicitly)
+    rank = np.lexsort((order, num_o, gid))  # within each gid, best is last
+    last_of_gid = np.ones(n, dtype=bool)
+    last_of_gid[:-1] = gid[rank][1:] != gid[rank][:-1]
+    best_sorted = rank[last_of_gid]  # indices into the sorted arrays, one per group
+    keep_sorted = np.zeros(n, dtype=bool)
+    keep_sorted[best_sorted] = True
+    keep = np.zeros(n, dtype=bool)
+    keep[order[keep_sorted]] = True
+
+    multi = sizes > 1
+    first_t = np.full(sizes.size, np.inf)
+    last_t = np.full(sizes.size, -np.inf)
+    np.minimum.at(first_t, gid, t_o)
+    np.maximum.at(last_t, gid, t_o)
+    span = last_t - first_t
+    best_num = num_o[best_sorted]
+    n_at_best = np.bincount(gid, weights=(num_o == best_num[gid]).astype(np.float64))
+    src = np.asarray(elsets.column("source").to_pylist(), dtype=object)
+    removed_src: dict[str, int] = {}
+    for s in src[~keep]:
+        removed_src[s] = removed_src.get(s, 0) + 1
+    stats = ReissueStats(
+        n_input=n,
+        groups=int(multi.sum()),
+        rows_removed=int((~keep).sum()),
+        same_epoch_groups=int((multi & (span == 0.0)).sum()),
+        near_simultaneous_groups=int((multi & (span > 0.0)).sum()),
+        max_group_span_s=float(span[multi].max()) if multi.any() else 0.0,
+        tie_groups=int((multi & (n_at_best > 1)).sum()),
+        removed_by_source=dict(sorted(removed_src.items())),
+        max_gap_s=float(max_gap_s),
+    )
+    return elsets.filter(pa.array(keep)), stats
+
+
 @dataclass(frozen=True)
 class PoolResult:
     """The training pool and how it was made.
@@ -634,6 +757,8 @@ class PoolResult:
         n_loaded: element sets read.
         n_in_span: of those, epochs inside ``[span_start, span_end)``.
         dedupe: :class:`DedupeStats`.
+        reissues: :class:`ReissueStats` (reissue groups collapsed after duplicate
+            removal, before the filters).
         dropped_at_rule, rejected_by_rule: from :func:`catalog.apply_filters`.
         objects_dropped_at_rule: rule name -> objects whose last remaining element
             sets that rule removed (rules applied in order; sums to the objects lost).
@@ -644,6 +769,7 @@ class PoolResult:
     n_loaded: int
     n_in_span: int
     dedupe: DedupeStats
+    reissues: ReissueStats
     dropped_at_rule: dict[str, int]
     rejected_by_rule: dict[str, int]
     objects_dropped_at_rule: dict[str, int]
@@ -653,11 +779,11 @@ class PoolResult:
 
 def build_pool(elsets, satcat, filters: CatalogFilterConfig, span_start_utc: str,
                span_end_utc: str) -> PoolResult:
-    """Element sets in the span -> duplicates removed -> SATCAT attached -> filters applied.
+    """Span -> duplicates removed -> reissues collapsed -> SATCAT attached -> filters.
 
     The element-history rules see every element set of an object inside the span
-    (after duplicate removal, before any other rule), as :func:`catalog.apply_filters`
-    evaluates each rule on the whole input.
+    (after duplicate removal and the reissue collapse, before any other rule), as
+    :func:`catalog.apply_filters` evaluates each rule on the whole input.
 
     Args:
         elsets: element sets (``catalog.ELEMENT_SET_SCHEMA``), any sources.
@@ -675,7 +801,8 @@ def build_pool(elsets, satcat, filters: CatalogFilterConfig, span_start_utc: str
     t = elsets.column("epoch_tt_s")
     in_span = elsets.filter(pc.and_(pc.greater_equal(t, lo), pc.less(t, hi)))
     deduped, stats = drop_exact_duplicates(in_span)
-    joined = catalog.attach_satcat(deduped, satcat)
+    collapsed, reissues = collapse_reissues(deduped)
+    joined = catalog.attach_satcat(collapsed, satcat)
     res = catalog.apply_filters(joined, filters)
     kept = res.kept
     # objects lost at each rule, applying the same masks in the same order
@@ -695,6 +822,7 @@ def build_pool(elsets, satcat, filters: CatalogFilterConfig, span_start_utc: str
         n_loaded=elsets.num_rows,
         n_in_span=in_span.num_rows,
         dedupe=stats,
+        reissues=reissues,
         dropped_at_rule=res.dropped_at_rule,
         rejected_by_rule=res.rejected_by_rule,
         objects_dropped_at_rule=objects_at,
@@ -768,7 +896,7 @@ def _draws(seed: int, salt: str, keys) -> np.ndarray:
 def sample_windows(labeled, cfg: GenerationConfig, n_windows: int | None = None):
     """Choose window starts from a labeled pool (v1: starts at element-set epochs).
 
-    Proposed rule (pending approval, ``config/generation.toml``):
+    The rule (approved 2026-11-25, ``config/generation.toml``):
 
     1. **Eligible starts**: element sets whose split label is in ``cfg.roles`` (train,
        dev). Test-role and reserved rows are never drawn.
@@ -917,8 +1045,10 @@ def window_result(elset_row, sgp4, truth, space_weather, split, dt_s, residual_c
     """:func:`residuals.build_window_rows`, with a domain refusal counted as ``rtn_domain``.
 
     The row builder raises :class:`residuals.RTNDomainError` when a residual is outside
-    the conversion's domain (the pi/2 along-track limit is reachable at the low,
-    high-drag edge). Here that becomes a dropped window with status ``rtn_domain``,
+    the window-level conversion's domain (a continuity break in the unwrapped
+    along-track angle, an out-of-plane angle beyond its limit, or degenerate geometry;
+    see :func:`residuals.rtn_from_window`). Here that becomes a dropped window with
+    status ``rtn_domain``,
     in the window's stratum, with the error message kept, so it is counted like every
     other drop. Any other exception propagates (it is a bug, not a data outcome).
     """
@@ -1103,6 +1233,8 @@ class RunSettings:
         chunk_windows: windows per chunk.
         n_workers: truth workers.
         include_observed: fill the ``obs_*`` columns.
+        fit_rms_flag_m: fitted-start RMS misfit above which a window's log record
+            carries the flag ``fit_rms_above_threshold`` (not a drop).
     """
 
     run_id: str
@@ -1110,6 +1242,7 @@ class RunSettings:
     chunk_windows: int
     n_workers: int
     include_observed: bool = False
+    fit_rms_flag_m: float = 1000.0
 
 
 def chunk_bounds(n_windows: int, chunk_windows: int) -> list[tuple[int, int]]:
@@ -1253,6 +1386,8 @@ def run_chunk(windows, k: int, out_dir: Path, settings: RunSettings, dt_s, resid
             truth_n_evaluations=None if truth is None else truth.n_evaluations,
             truth_start_scale=None if truth is None else truth.start_scale,
             **_fit_fields(truth),
+            **_du_fields(res.table, sgp4[i]),
+            flags=_flags(truth, settings.fit_rms_flag_m),
             rows_s=time.perf_counter() - tw,
             n_rows=res.n_rows, chunk=k, chunk_file=parquet.name,
         )
@@ -1303,6 +1438,31 @@ def _fit_fields(truth) -> dict:
     return {"fit_status": fit.status, "fit_iterations": fit.iterations, "fit_rms_m": fit.rms_m,
             "fit_max_m": fit.max_m, "fit_wall_s": fit.wall_s,
             "fit_n_evaluations": fit.n_evaluations}
+
+
+def _du_fields(table, sgp4) -> dict:
+    """The window's unwrapped along-track angle, for the log (None for a dropped window).
+
+    ``du = T / |r_c|`` per horizon (``|r_c|`` from the SGP4 trajectory the targets were
+    built on): its largest magnitude and its largest change between consecutive
+    horizons, which :func:`residuals.rtn_from_window` caps at ``MAX_DU_STEP_RAD``.
+    """
+    if table is None:
+        return {"du_max_abs_rad": None, "du_max_step_rad": None}
+    t = table.column("target_t_km").to_numpy()
+    rc = np.linalg.norm(sgp4.trajectory.r_gcrf_km, axis=1)
+    du = t / rc
+    step = float(np.abs(np.diff(du)).max()) if du.size > 1 else 0.0
+    return {"du_max_abs_rad": float(np.abs(du).max()), "du_max_step_rad": step}
+
+
+def _flags(truth, fit_rms_flag_m: float) -> list[str]:
+    """Flags of a window's log record (information, never a drop)."""
+    fit = None if truth is None else getattr(truth, "start_fit", None)
+    out = []
+    if fit is not None and fit.rms_m is not None and fit.rms_m > fit_rms_flag_m:
+        out.append("fit_rms_above_threshold")
+    return out
 
 
 def read_logs(out_dir: str | Path) -> list[dict]:
@@ -1395,6 +1555,9 @@ def run_generation(windows, out_dir: str | Path, settings: RunSettings, *, dt_s,
         "horizons": int(np.asarray(dt_s).size),
         "truth_settings_sha256": hashlib.sha256(truth_json.encode()).hexdigest(),
         "start_rule": truth_cfg.start_rule, "msis_ap_switch": truth_cfg.msis_ap_switch,
+        # the targets' along-track angle: unwrapped along each window (2026-11-25)
+        "rtn_conversion": RTN_CONVERSION,
+        "fit_rms_flag_m": settings.fit_rms_flag_m,
     }
     plan_path = out / "run_plan.json"
     if plan_path.exists():
@@ -1471,6 +1634,7 @@ def run_generation(windows, out_dir: str | Path, settings: RunSettings, *, dt_s,
         "worker_pool_crashes": len(crashes),
         "worker_pool_crash_records": crashes,
         "fit_status": dict(sorted(Counter(str(r.get("fit_status")) for r in records).items())),
+        "flags": dict(sorted(Counter(f for r in records for f in r.get("flags", [])).items())),
         **(manifest_extra or {}),
     }
     _atomic_write_text(out / "run_manifest.json", json.dumps(manifest, indent=1) + "\n")
@@ -1484,6 +1648,9 @@ __all__ = [
     "DedupeStats",
     "GenerationConfig",
     "PoolResult",
+    "REISSUE_MAX_GAP_S",
+    "RTN_CONVERSION",
+    "ReissueStats",
     "RunSettings",
     "TruthWorkerPool",
     "build_pool",
@@ -1492,6 +1659,7 @@ __all__ = [
     "code_provenance",
     "coverage",
     "dailyap_subsample",
+    "collapse_reissues",
     "drop_exact_duplicates",
     "file_sha256",
     "generation_statuses",

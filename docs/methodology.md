@@ -342,7 +342,7 @@ is 1.8-2.8 m (that rule's start offset), and the 7-day along-track residual runs
 
 Code: `src/orbit_correction/generation.py`; scripts `build_candidate_ids.py`,
 `extract_bulk_tle.py`, `build_pool.py`, `sample_windows.py`, `generate_residuals.py`,
-`pilot_report.py`; settings in `config/generation.toml` (pending approval).
+`pilot_report.py`; settings in `config/generation.toml` (approved 2026-11-25).
 
 - **Download list.** A superset of the objects the filters can keep, from SATCAT alone:
   allowed object types and not an operational payload (both exact, the filter reads the

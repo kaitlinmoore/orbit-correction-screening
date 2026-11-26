@@ -2,12 +2,14 @@
 # (read by orbit_correction.generation.load_generation_config).
 # Every value here is an instrument: log changes in docs/changelog.md.
 #
-# Status: PENDING APPROVAL (proposed 2026-11-24). The stage sizes and the start-spacing
-# rule come from decision 3(c) (approved 2026-11-24); the sampling rule, the cap, the run
-# settings and the eccentricity bins are proposals.
+# Status: approved 2026-11-25 (proposed 2026-11-24). The stage sizes and the
+# start-spacing rule come from decision 3(c) (approved 2026-11-24); the sampling rule
+# (uniform over an object's eligible element sets, in rounds), the cap, the run
+# settings and the eccentricity bins were approved 2026-11-25, and the fit-misfit flag
+# added then.
 
 [generation]
-status = "pending approval"
+status = "approved 2026-11-25"
 
 [generation.sampling]
 # Seed of every draw: the order in which an object's eligible epochs are tried, the
@@ -46,3 +48,9 @@ dailyap_windows = 200
 # "<0.001", "0.001-0.005", "0.005-0.02", ">=0.02"). Not a model input; coverage and
 # error reports only.
 eccentricity_edges = [0.001, 0.005, 0.02]
+
+[generation.flags]
+# A window whose fitted truth start misfits SGP4 by more than this RMS over the fit
+# span gets the log flag "fit_rms_above_threshold" (decided 2026-11-25: a flag, not a
+# drop; the window is kept). The first pilot's fits: 34 m median RMS, 3.7 km maximum.
+fit_rms_flag_m = 1000.0

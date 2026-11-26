@@ -14,7 +14,10 @@ docstring). Checks:
   curvilinear residual doesn't;
 * errors for degenerate inputs, including a velocity a hair off radial;
 * forward and inverse agreeing at the angle limits: every residual the forward map
-  returns, the inverse accepts.
+  returns, the inverse accepts;
+* the window-level path (``rtn_from_window``): round trips with the along-track angle
+  unwrapped beyond pi/2, pi and 2 pi, exact agreement with the single-state path
+  inside (-pi, pi], continuity breaks refused, and the other limits kept.
 
 All states are synthetic (two-body Keplerian), so no fixture files are needed.
 """
@@ -329,11 +332,15 @@ def test_inverse_accepts_every_residual_at_the_forward_limits(sign):
         r_t = R.states_from_rtn(r_c, v_c, rtn)  # must not raise
         assert np.all(np.isfinite(r_t))
         np.testing.assert_allclose(np.linalg.norm(r_t, axis=1), rc, rtol=1e-13)
-        # still a limit: a part in 1e12 beyond it (0.01 mm of arc) is refused
         beyond = rtn.copy()
         beyond[:, column] *= 1.0 + 1e-12
-        with pytest.raises(R.RTNDomainError):
-            R.states_from_rtn(r_c, v_c, beyond)
+        if column == 2:
+            # phi is still a limit: a part in 1e12 beyond it (0.01 mm of arc) is refused
+            with pytest.raises(R.RTNDomainError):
+                R.states_from_rtn(r_c, v_c, beyond)
+        else:
+            # du is not (decided 2026-11-25): the inverse accepts any along-track angle
+            assert np.all(np.isfinite(R.states_from_rtn(r_c, v_c, beyond)))
 
 
 def test_forward_output_near_the_along_track_limit_always_inverts():
@@ -377,13 +384,15 @@ def test_angle_limits_raise_in_both_directions():
     # truth on the far side of the Earth (du = pi): ambiguous wrap
     with pytest.raises(R.RTNDomainError, match="along-track"):
         R.rtn_from_states(r_c, v_c, -r_c)
-    # just inside the limit is fine, just outside raises (forward and inverse)
+    # just inside the single-state limit is fine, just outside raises in the forward
+    # map; the inverse accepts both (it accepts any du)
     inside = np.column_stack([np.zeros(4), 0.999 * R.MAX_ABS_DU_RAD * rc, np.zeros(4)])
     outside = np.column_stack([np.zeros(4), 1.001 * R.MAX_ABS_DU_RAD * rc, np.zeros(4)])
     r_in = R.states_from_rtn(r_c, v_c, inside)
     np.testing.assert_allclose(R.rtn_from_states(r_c, v_c, r_in), inside, atol=1e-8)
+    r_out = R.states_from_rtn(r_c, v_c, outside)
     with pytest.raises(R.RTNDomainError, match="along-track"):
-        R.states_from_rtn(r_c, v_c, outside)
+        R.rtn_from_states(r_c, v_c, r_out)
     # truth near the cheap orbit's pole
     with pytest.raises(R.RTNDomainError, match="out of the cheap orbit plane"):
         R.rtn_from_states(r_c, v_c, r_c + 2.0 * rc[:, None] * n)
@@ -392,3 +401,95 @@ def test_angle_limits_raise_in_both_directions():
     # inverse with no positive radius
     with pytest.raises(R.RTNDomainError, match="radius"):
         R.states_from_rtn(r_c, v_c, np.column_stack([rc, np.zeros(4), np.zeros(4)]))
+
+
+# ------------------------------------------------------------------ one window, unwrapped
+
+
+def _window(n: int, du_end: float, seed: int, wobble: float = 0.0):
+    """Cheap states and the RTN residuals of a constructed window.
+
+    ``du`` ramps from about 0 to ``du_end`` over ``n`` horizons (plus an optional
+    sinusoidal ``wobble``, rad, so it is not monotone); R and N are a few km. The cheap
+    states are independent random LEO states: the conversion is geometric per row,
+    and only the order of the rows matters for unwrapping.
+    """
+    r_c, v_c = random_leo_states(n, seed=seed)
+    rc = np.linalg.norm(r_c, axis=1)
+    k = np.arange(n)
+    du = du_end * (k + 1) / n + wobble * np.sin(k / 7.0)
+    rng = np.random.default_rng(seed)
+    rtn = np.column_stack([rng.uniform(-5, 5, n), rc * du, rng.uniform(-5, 5, n)])
+    return r_c, v_c, rtn
+
+
+@pytest.mark.parametrize("du_end", [1.0, 2.0, -2.0, 4.0, -4.0, 7.0, 13.0, -13.0])
+def test_window_round_trip_beyond_a_quarter_half_and_whole_turn(du_end):
+    """|du| beyond pi/2 (2 rad), beyond pi (4 rad) and beyond 2 pi (7, 13 rad)."""
+    r_c, v_c, rtn = _window(200, du_end, seed=31, wobble=0.05)
+    r_t = R.states_from_rtn(r_c, v_c, rtn)
+    got = R.rtn_from_window(r_c, v_c, r_t)
+    # T is |r_c| du with |du| up to 13 rad: the absolute tolerance scales with it
+    np.testing.assert_allclose(got[:, [0, 2]], rtn[:, [0, 2]], atol=TOL_KM)
+    np.testing.assert_allclose(got[:, 1], rtn[:, 1], rtol=1e-12, atol=1e-8)
+    back = R.states_from_rtn(r_c, v_c, got)
+    assert np.max(np.linalg.norm(back - r_t, axis=1)) < 1e-8
+    if abs(du_end) > math.pi / 2:
+        assert np.max(np.abs(got[:, 1] / np.linalg.norm(r_c, axis=1))) > math.pi / 2
+        with pytest.raises(R.RTNDomainError, match="along-track"):
+            R.rtn_from_states(r_c, v_c, r_t)  # the single-state path still refuses
+
+
+def test_window_inside_the_single_state_limit_matches_it_bit_for_bit():
+    """The per-row path is unchanged, and the window path agrees with it exactly there."""
+    r_c, v_c, rtn = _window(199, 1.4, seed=32, wobble=0.1)
+    r_t = R.states_from_rtn(r_c, v_c, rtn)
+    per_row = R.rtn_from_states(r_c, v_c, r_t)
+    assert np.array_equal(R.rtn_from_window(r_c, v_c, r_t), per_row)
+    # between pi/2 and pi the window keeps the wrapped value too, bit for bit
+    r_c, v_c, rtn = _window(199, 3.0, seed=33)
+    r_t = R.states_from_rtn(r_c, v_c, rtn)
+    got = R.rtn_from_window(r_c, v_c, r_t)
+    rc, u_r, u_t, n = R.cheap_frame(r_c, v_c)
+    du_w = np.arctan2(-np.einsum("ij,ij->i", r_t, u_t), np.einsum("ij,ij->i", r_t, u_r))
+    assert np.array_equal(got[:, 1], rc * du_w)
+
+
+def test_window_continuity_break_is_refused():
+    r_c, v_c, rtn = _window(50, 0.5, seed=34)
+    rc = np.linalg.norm(r_c, axis=1)
+    jumped = rtn.copy()
+    jumped[30:, 1] += 2.0 * rc[30:]  # du jumps by 2 rad between horizons 29 and 30
+    r_t = R.states_from_rtn(r_c, v_c, jumped)
+    with pytest.raises(R.RTNDomainError, match="continuity break"):
+        R.rtn_from_window(r_c, v_c, r_t)
+    # a step just under the limit is followed
+    ok = rtn.copy()
+    ok[30:, 1] += 0.99 * R.MAX_DU_STEP_RAD * rc[30:]
+    got = R.rtn_from_window(r_c, v_c, R.states_from_rtn(r_c, v_c, ok))
+    np.testing.assert_allclose(got[:, 1], ok[:, 1], rtol=1e-12, atol=1e-8)
+    # a jump by a whole turn is invisible at the horizons (it is a step of 0)
+    turned = rtn.copy()
+    turned[30:, 1] += 2.0 * math.pi * rc[30:]
+    got = R.rtn_from_window(r_c, v_c, R.states_from_rtn(r_c, v_c, turned))
+    np.testing.assert_allclose(got[:, 1], rtn[:, 1], rtol=1e-12, atol=1e-8)
+
+
+def test_window_must_start_near_zero_and_keeps_the_other_limits():
+    r_c, v_c, rtn = _window(20, 1.0, seed=35)
+    rc = np.linalg.norm(r_c, axis=1)
+    late_start = rtn.copy()
+    late_start[:, 1] += 1.6 * rc  # first horizon at du ~ 1.65 rad, beyond pi/2
+    with pytest.raises(R.RTNDomainError, match="along-track"):
+        R.rtn_from_window(r_c, v_c, R.states_from_rtn(r_c, v_c, late_start))
+    _, u_r, _, n = R.cheap_frame(r_c, v_c)
+    off_plane = R.states_from_rtn(r_c, v_c, rtn)
+    off_plane[5] = r_c[5] + 2.0 * rc[5] * n[5]
+    with pytest.raises(R.RTNDomainError, match="out of the cheap orbit plane"):
+        R.rtn_from_window(r_c, v_c, off_plane)
+    with pytest.raises(ValueError, match="one window"):
+        R.rtn_from_window(r_c[0], v_c[0], r_c[0])
+    radial = v_c.copy()
+    radial[3] = r_c[3] / rc[3] * 7.5
+    with pytest.raises(R.RTNDomainError, match="degenerate"):
+        R.rtn_from_window(r_c, radial, R.states_from_rtn(r_c, v_c, rtn))

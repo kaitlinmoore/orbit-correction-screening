@@ -141,7 +141,7 @@ What is implemented here and what is library behaviour:
 - Prediction windows ending after the last fully observed space-weather day are excluded, so the most recent epochs are never used.
 - The space-weather file is a snapshot of final, revised values. The as-of lookup prevents reading values after the prediction start, but cannot reproduce what an operator knew in real time.
 - The test period is 2025 only for now: windows must end within the downloaded history (the 2015-2025 bulk files). 2026 will be added as a test-period extension when Space-Track publishes its 2026 file.
-- Catalog filter values and split parameters are approved (2026-11-23); generation settings (`config/generation.toml`) are pending approval.
+- Catalog filter values and split parameters are approved (2026-11-23); generation settings (`config/generation.toml`) were approved 2026-11-25.
 
 ## AI assistance
 

@@ -137,7 +137,8 @@ def main(argv=None) -> int:
         "horizons": {"n": int(dt_s.size), "first_s": float(dt_s[0]), "last_s": float(dt_s[-1])},
     }
     settings = generation.RunSettings(run_id=args.run_id, label=label, chunk_windows=chunk,
-                                      n_workers=workers, include_observed=args.include_observed)
+                                      n_workers=workers, include_observed=args.include_observed,
+                                      fit_rms_flag_m=gcfg.fit_rms_flag_m)
     start = time.perf_counter()
 
     def progress(m):

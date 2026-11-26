@@ -22,6 +22,7 @@ import math
 
 import numpy as np
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.parquet as pq
 import pytest
 
@@ -69,8 +70,9 @@ def gcfg():
 # ----------------------------------------------------------------- config
 
 
-def test_generation_config_is_pending_and_has_the_decided_stages(gcfg):
-    assert gcfg.status == "pending approval"
+def test_generation_config_is_approved_and_has_the_decided_stages(gcfg):
+    assert gcfg.status == "approved 2026-11-25"
+    assert gcfg.fit_rms_flag_m == 1000.0
     assert gcfg.stage_windows == {"pilot": 5000, "first_batch": 50000, "ceiling": 300000}
     assert gcfg.roles == ("train", "dev")
     assert gcfg.min_start_spacing_days == 7.0
@@ -321,6 +323,91 @@ def test_exact_duplicates_are_removed_and_same_epoch_changes_counted():
     assert out.num_rows == 13 and st.exact_duplicates == 0 and st.same_epoch_different == 2
 
 
+def _reissue(rec, *, dt_s=0.0, number=None, source=None, **changes):
+    """A copy of an element-set record shifted by ``dt_s`` with some fields changed."""
+    out = dict(rec)
+    out["epoch_tt_s"] = rec["epoch_tt_s"] + dt_s
+    if number is not None:
+        out["element_set_no"] = number
+    if source is not None:
+        out["source"] = source
+    out.update(changes)
+    return out
+
+
+def test_reissues_collapse_to_the_highest_element_set_number():
+    h = _history()
+    rows = h.to_pylist()
+    base = rows[0]  # object 90001's first set
+    a = _reissue(base, number=10)
+    b = _reissue(base, dt_s=0.0, number=12, bstar_per_earth_radii=9e-4)   # same epoch, kept
+    c = _reissue(base, dt_s=30.0, number=11, mean_motion_rev_per_day=15.01)  # 30 s later
+    t = pa.Table.from_pylist([a, b, c, *rows[1:]], schema=h.schema)
+    out, st = G.collapse_reissues(t)
+    assert out.num_rows == t.num_rows - 2
+    first = out.filter(pc.and_(
+        pc.equal(out.column("epoch_tt_s"), base["epoch_tt_s"]),
+        pc.equal(out.column("norad_id"), base["norad_id"])))
+    assert first.num_rows == 1 and first.column("element_set_no")[0].as_py() == 12
+    assert st.groups == 1 and st.rows_removed == 2 and st.near_simultaneous_groups == 1
+    assert st.same_epoch_groups == 0 and st.max_group_span_s == 30.0 and st.tie_groups == 0
+    # sets more than 60 s apart are separate element sets, untouched
+    far = _reissue(base, dt_s=61.0, number=1)
+    out, st = G.collapse_reissues(pa.Table.from_pylist([a, far], schema=h.schema))
+    assert out.num_rows == 2 and st.groups == 0 and st.rows_removed == 0
+    # chaining: 50 s steps join into one group spanning 100 s
+    chain = [_reissue(base, dt_s=50.0 * k, number=k + 1) for k in range(3)]
+    out, st = G.collapse_reissues(pa.Table.from_pylist(chain, schema=h.schema))
+    assert out.num_rows == 1 and out.column("element_set_no")[0].as_py() == 3
+    assert st.max_group_span_s == 100.0
+    # other objects never join a group
+    other = _reissue(base, number=99, norad_id=90002)
+    out, st = G.collapse_reissues(pa.Table.from_pylist([a, other], schema=h.schema))
+    assert out.num_rows == 2 and st.groups == 0
+
+
+def test_reissue_ties_go_to_the_set_read_last():
+    h = _history()
+    base = h.to_pylist()[0]
+    a = _reissue(base, number=7, source="first")
+    b = _reissue(base, number=7, source="second", bstar_per_earth_radii=9e-4)
+    out, st = G.collapse_reissues(pa.Table.from_pylist([a, b], schema=h.schema))
+    assert out.column("source").to_pylist() == ["second"]
+    assert st.tie_groups == 1 and st.same_epoch_groups == 1 and st.removed_by_source == {"first": 1}
+    # a missing number counts lowest, and all-missing is a tie settled by read order
+    out, _ = G.collapse_reissues(pa.Table.from_pylist(
+        [_reissue(base, number=3, source="numbered"), {**b, "element_set_no": None}],
+        schema=h.schema))
+    assert out.column("source").to_pylist() == ["numbered"]
+    out, st = G.collapse_reissues(pa.Table.from_pylist(
+        [{**a, "element_set_no": None}, {**b, "element_set_no": None}], schema=h.schema))
+    assert out.column("source").to_pylist() == ["second"] and st.tie_groups == 1
+    # the last-read rule follows input position, not epoch: the later-read set wins
+    # even when its epoch is earlier
+    early_read_late_epoch = _reissue(base, dt_s=20.0, number=5, source="read_first")
+    late_read_early_epoch = _reissue(base, number=5, source="read_second")
+    out, _ = G.collapse_reissues(pa.Table.from_pylist(
+        [early_read_late_epoch, late_read_early_epoch], schema=h.schema))
+    assert out.column("source").to_pylist() == ["read_second"]
+
+
+def test_collapsing_reissues_removes_a_noise_sma_rise(tmp_path, filters):
+    """A same-epoch reissue with a 2 km higher SMA would trip the SMA-rise rule alone."""
+    h = _history()
+    keep_obj = h.filter(pc.equal(h.column("norad_id"), 90001))
+    rows = keep_obj.to_pylist()
+    last = rows[-1]
+    a_km = last["semimajor_axis_km"]
+    noisy = _reissue(last, dt_s=5.0, number=(last["element_set_no"] or 0) - 1,
+                     semimajor_axis_km=a_km + 2.0)
+    t = pa.Table.from_pylist([*rows[:-1], noisy, last], schema=h.schema)
+    sat = _history_satcat(tmp_path)
+    res = G.build_pool(t, sat, filters, "2000-01-01", "2026-01-01")
+    assert res.reissues.rows_removed == 1
+    assert res.objects_dropped_at_rule["no_sma_increase"] == 0
+    assert set(res.table.column("norad_id").to_pylist()) == {90001}
+
+
 def test_pool_applies_filters_and_reports_each_rule(tmp_path, filters):
     h = _history()
     res = G.build_pool(pa.concat_tables([h, h]), _history_satcat(tmp_path), filters,
@@ -458,6 +545,24 @@ def test_rtn_domain_is_a_counted_drop_status(elsets, sw, rcfg):
     assert R.count_windows([res]) == {("rtn_domain", "400-600", ">=150"): 1}
     assert "rtn_domain" in R.DROP_STATUSES and R.DROP_STATUSES[-1] == "rtn_domain"
     assert G.window_result(row, sg, ok, sw, "train", grid, rcfg).status == "ok"
+    # a continuity break mid-window: du jumps by 2 rad between two horizons
+    rc = np.linalg.norm(tr.r_gcrf_km, axis=1)
+    rtn = np.zeros((grid.size, 3))
+    rtn[100:, 1] = 2.0 * rc[100:]
+    res = G.window_result(row, sg, _truth_with(sg, rtn), sw, "train", grid, rcfg)
+    assert res.status == "rtn_domain" and "continuity break" in res.message
+
+
+def test_large_fit_misfit_is_a_flag_not_a_drop():
+    from types import SimpleNamespace as NS
+
+    def truth(rms_m):
+        return NS(start_fit=NS(rms_m=rms_m))
+
+    assert G._flags(truth(999.0), 1000.0) == []
+    assert G._flags(truth(1000.5), 1000.0) == ["fit_rms_above_threshold"]
+    assert G._flags(None, 1000.0) == [] and G._flags(NS(start_fit=None), 1000.0) == []
+    assert G._flags(truth(None), 1000.0) == []
 
 
 def test_start_below_the_floor_gets_its_own_status(elsets, sw, rcfg):
@@ -582,6 +687,15 @@ def test_run_writes_chunks_log_and_manifest(tmp_path, elsets, sw, rcfg, gcfg):
     assert sum(t.num_rows for t in tables) == 5 * dt.size == man["n_rows"]
     assert man["status"] == {"ok": 5, "rtn_domain": 1, "truth_error": 1, "truth_fit_failed": 1}
     assert man["plan"]["start_rule"] == "fit_to_sgp4_before_epoch"
+    assert man["plan"]["rtn_conversion"] == G.RTN_CONVERSION
+    assert man["plan"]["fit_rms_flag_m"] == 1000.0 and man["flags"] == {}
+    # the unwrapped angle's extent is logged for kept windows, None for dropped ones
+    for r in log:
+        if r["status"] == "ok":
+            assert 0 < r["du_max_abs_rad"] < 1e-3 and 0 <= r["du_max_step_rad"] < 1e-4
+        else:
+            assert r["du_max_abs_rad"] is None and r["du_max_step_rad"] is None
+        assert r["flags"] == []
     assert man["worker_pool_crashes"] == 0
     assert sum(man["counts_by_status_band_bin"].values()) == 8
     assert man["n_chunks"] == 3 and man["chunks_written_this_call"] == [0, 1, 2]
@@ -727,8 +841,13 @@ def sw_copy(tmp_path_factory):
 
 @pytest.mark.datagen
 @pytest.mark.skipif(not HAVE_OREKIT, reason="needs `uv sync --group datagen` (Orekit)")
-def test_reachable_along_track_limit_is_counted_as_rtn_domain(elsets, sw, rcfg, sw_copy):
-    """The independent review's case: 350 km perigee, B* 0.01, 2024-06-15, real truth."""
+def test_window_past_the_single_state_limit_is_kept_unwrapped(elsets, sw, rcfg, sw_copy):
+    """The independent review's case: 350 km perigee, B* 0.01, 2024-06-15, real truth.
+
+    Under the single-state limit (before 2026-11-25) this window was ``rtn_domain``:
+    |du| passes pi/2 at about 6.7 days. With du unwrapped along the window it is kept,
+    its targets go past a quarter orbit, and they invert to the truth positions.
+    """
     from orbit_correction import truth_prop as T
 
     MU72, RE72 = 398600.8, 6378.135
@@ -746,7 +865,18 @@ def test_reachable_along_track_limit_is_counted_as_rtn_domain(elsets, sw, rcfg, 
                            fit_samples=fit)
     assert sg.status.ok and tr.status == "ok"
     res = G.window_result(el.to_pylist()[0], sg, tr, sw, "train", grid, rcfg)
-    assert res.status == "rtn_domain" and res.altitude_band == "250-400"
+    assert res.status == "ok" and res.altitude_band == "250-400"
+    cheap = sg.trajectory
+    rc = np.linalg.norm(cheap.r_gcrf_km, axis=1)
+    du = res.table.column("target_t_km").to_numpy() / rc
+    assert np.abs(du).max() > math.pi / 2  # past the single-state limit
+    assert np.abs(np.diff(du)).max() < 0.5  # far from a continuity break
+    rtn = np.column_stack([res.table.column(c).to_numpy()
+                           for c in ("target_r_km", "target_t_km", "target_n_km")])
+    back = R.states_from_rtn(cheap.r_gcrf_km, cheap.v_gcrf_km_s, rtn)
+    assert np.max(np.linalg.norm(back - tr.trajectory.r_gcrf_km, axis=1)) < 1e-6
+    with pytest.raises(R.RTNDomainError, match="along-track"):
+        R.rtn_from_states(cheap.r_gcrf_km, cheap.v_gcrf_km_s, tr.trajectory.r_gcrf_km)
 
 
 @pytest.mark.datagen
