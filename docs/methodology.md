@@ -295,19 +295,24 @@ horizon grid approved 2026-11-24 for the pilot). Contract: `RESIDUAL_SCHEMA` in 
   position from the SGP4 state and (R, T, N); it is how a model's prediction becomes a
   corrected position in screening. Round trip on 20,000 random LEO states (e up to 0.3,
   along-track up to 2,000 km): 8e-12 km.
-- **Domain.** The along-track angle is defined modulo a full turn, so the conversion
-  refuses angles above pi/2 (about 10,500 km of along-track error in LEO) rather than
-  wrap; it also refuses truth positions more than pi/4 out of the SGP4 orbit plane and
-  SGP4 states with (near-)radial velocity (limits approved 2026-11-24). The out-of-plane
-  and radial-velocity limits are far from anything measured. **The pi/2 limit is not:** it
-  is reachable at the low, high-drag edge of the catalog with both propagators still `ok`.
-  With real truth on synthetic element sets at 2024-06-15, 350 km perigee with B* = 0.01
-  /ER passes it at 6.7 days (T = 11,600 km at 7 days, 1.12 x the limit), and neighbouring
-  windows that are kept reach 4,500-8,100 km (43-77% of it). Such a window is refused, not
-  wrapped; generation counts it as its own drop status (`rtn_domain`) by stratum and
-  reports the count beside the lowest band's error statistics, because the windows it
-  removes are that band's largest errors. The inverse accepts one float64 step above the
-  forward limits, so every residual the forward conversion returns can be inverted.
+- **Domain.** At one instant the along-track angle is defined modulo a full turn, so the
+  single-state conversion (`rtn_from_states`) refuses angles above pi/2 (about 10,500 km
+  of along-track error in LEO) rather than wrap. That limit is reachable at the low,
+  high-drag edge of the catalog with both propagators still `ok`: with real truth on
+  synthetic element sets at 2024-06-15, 350 km perigee with B* = 0.01 /ER passes it at
+  6.7 days (T = 11,600 km at 7 days), and on the first pilot it refused 51 of the 448
+  windows in 250-400 km (11%), that band's largest errors. **Targets are therefore built
+  per window with the angle unwrapped (decided 2026-11-25).** `rtn_from_window` follows
+  the angle in time from the start, where it is near 0: the first horizon must be within
+  pi/2, and each step between consecutive horizons (wrapped to (-pi, pi]) must be at most
+  pi/2, otherwise the window is refused as a continuity break (`rtn_domain`). T can then
+  exceed a quarter orbit. Within (-pi, pi] the targets are bit-identical to the
+  single-state conversion. The conversion also refuses truth positions more than pi/4 out
+  of the SGP4 orbit plane and SGP4 states with (near-)radial velocity (limits approved
+  2026-11-24), both far from anything measured. The inverse accepts any along-track angle
+  (cos and sin ignore whole turns) and one float64 step above the pi/4 limit, so every
+  residual a forward conversion returns can be inverted. The single-state conversion keeps
+  its pi/2 limit for states with no history.
 - **Features.** The element set's mean elements, B* and mean-motion derivative; the four
   start-of-prediction space-weather values (see Model inputs). The `obs_*` columns, when
   computed, take each row's UTC day from OBSERVED rows only; a day without an observed row
@@ -367,7 +372,10 @@ Code: `src/orbit_correction/generation.py`; scripts `build_candidate_ids.py`,
   coverage by day is recorded: every year is covered through 31 December (31 December
   2024 at 64% of that year's daily median, since the 2025 file holds 2025 epochs only).
 - **Pool.** Element sets in the span, exact duplicates removed (same object, epoch and
-  elements; same-epoch rows that differ are kept and counted), SATCAT attached, the
+  elements), reissues collapsed (decided 2026-11-25: an object's sets whose epochs are at
+  most 60 s apart, consecutive gaps chained, become the one with the highest element-set
+  number, ties to the set read last; groups, rows removed and ties are counted), SATCAT
+  attached, the
   catalog filters applied with rows and objects removed reported per rule. The pool is
   built per group of NORAD IDs, which changes nothing because every rule is per object.
 - **Split.** Every pool element set is labeled as a window start with
@@ -376,7 +384,7 @@ Code: `src/orbit_correction/generation.py`; scripts `build_candidate_ids.py`,
   2026-11-25): a window of any role ending after the end of the downloaded history
   (2026-01-01 today) is labeled `excluded`, counted by its original label. Only counts per
   label are reported.
-- **Window sampling (proposed).** Starts at element-set epochs, train and dev rows only.
+- **Window sampling (approved 2026-11-25).** Starts at element-set epochs, train and dev rows only.
   Per object, its eligible epochs are tried in a seeded random order and a start is kept
   if it is at least 7 days from the object's other starts, up to a cap. Across objects,
   round k takes every object's k-th start (objects in a seeded order), so every object
@@ -401,7 +409,9 @@ Code: `src/orbit_correction/generation.py`; scripts `build_candidate_ids.py`,
   (`rtn_domain`), or one of three statuses for windows that get no truth job: no SGP4
   state at the epoch (`start_below_floor`, `start_sgp4_error`), or no usable SGP4 samples
   over the fit span (`fit_samples_unavailable`). A window without fit samples is never
-  started some other way. The log also carries each fit's status, passes and misfit. Counts by
+  started some other way. The log also carries each fit's status, passes and misfit (a
+  flag, `fit_rms_above_threshold`, for an RMS misfit above 1 km: kept, not dropped), and
+  each kept window's largest along-track angle and angle step. Counts by
   status, altitude band and solar bin go into the run manifest, with the code commit,
   config hashes, orekit-data commit, the space-weather copy's hash and range, the last
   observed day and the seed.
