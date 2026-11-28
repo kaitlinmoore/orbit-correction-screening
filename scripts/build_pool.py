@@ -161,6 +161,7 @@ def main(argv=None) -> int:
                    if k not in ("split_rows", "split_objects", "history_end_excluded")},
         "history_rules": {
             "exclude_history_spikes": filters.exclude_history_spikes,
+            "spike_leg_thresholds": catalog.SPIKE_LEG_THRESHOLDS,
             "counts_on_objects_alive_at_rule": {r: dict(c) for r, c in history_rules.items()},
         },
         "reissue_rule": {"max_gap_s": generation.REISSUE_MAX_GAP_S,

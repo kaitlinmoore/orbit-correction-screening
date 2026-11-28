@@ -504,6 +504,33 @@ def _pair_change_and_threshold(
     raise ValueError(f"not an element-history rule: {rule!r}")
 
 
+def _spike_rise_threshold(
+    rule: str, threshold: np.ndarray, params: Mapping[str, float]
+) -> np.ndarray | None:
+    """The threshold a rising leg must exceed for the spike rule, or None (same as falls).
+
+    For the SMA-drop rule a rising leg is tested against ``sma_drop_floor_km``
+    alone (approved 2026-11-27): drag never raises the semimajor axis, so the drag
+    allowance belongs only on the falling leg. The other rules use one threshold
+    for both legs.
+    """
+    if rule == "no_sma_unexplained_drop":
+        return np.full(threshold.size, params["sma_drop_floor_km"])
+    return None
+
+
+#: How each rule's spike legs are thresholded (recorded in the pool manifest).
+SPIKE_LEG_THRESHOLDS: dict[str, dict[str, str]] = {
+    "no_sma_increase": {"rise": "sma_increase_max_km", "fall": "sma_increase_max_km"},
+    "no_sma_unexplained_drop": {
+        "rise": "sma_drop_floor_km",
+        "fall": "sma_drop_drag_multiple x drag decay over the gap + sma_drop_floor_km",
+    },
+    "no_inclination_jump": {"rise": "inclination_jump_max_deg",
+                            "fall": "inclination_jump_max_deg"},
+}
+
+
 def _trips(rule: str, change: np.ndarray, threshold: np.ndarray) -> np.ndarray:
     """Pairs the rule flags: a rise, a drop or either, beyond the pair's threshold."""
     if rule == "no_sma_increase":
@@ -513,7 +540,10 @@ def _trips(rule: str, change: np.ndarray, threshold: np.ndarray) -> np.ndarray:
     return np.abs(change) > threshold
 
 
-def isolated_spikes(same: np.ndarray, change: np.ndarray, threshold: np.ndarray) -> np.ndarray:
+def isolated_spikes(
+    same: np.ndarray, change: np.ndarray, threshold: np.ndarray,
+    rise_threshold: np.ndarray | None = None,
+) -> np.ndarray:
     """Element sets that go out past the threshold and come straight back (spikes).
 
     Set ``j`` (an interior set of one object's sorted history) is a spike when its
@@ -525,13 +555,16 @@ def isolated_spikes(same: np.ndarray, change: np.ndarray, threshold: np.ndarray)
     Args:
         same: per pair, True where both sets belong to one object.
         change: per pair, later minus earlier.
-        threshold: per pair, the rule's positive threshold.
+        threshold: per pair, the rule's positive threshold; a falling leg must
+            exceed it, and so must a rising leg unless ``rise_threshold`` is given.
+        rise_threshold: per pair, the positive threshold a rising leg must exceed
+            (default ``threshold``). The SMA-drop rule passes its floor here.
 
     Returns:
         A boolean mask over the sets (``len(same) + 1``).
     """
     n_sets = same.size + 1
-    up = change > threshold
+    up = change > (threshold if rise_threshold is None else rise_threshold)
     down = change < -threshold
     spike = np.zeros(n_sets, dtype=bool)
     if n_sets >= 3:
@@ -565,10 +598,13 @@ def history_rule(
     opposite directions (out and back, see :func:`isolated_spikes`), is left out of
     this rule's comparisons, and its two neighbours are compared with each other
     instead (over the combined gap). The set stays in the pool, and each rule finds
-    its own spikes. A lone out-and-back set is a bad element set, not a maneuver; a
-    maneuver is a step that later sets keep. Limits: a maneuver undone at the very
-    next set looks like a spike and is missed, and a bad first or last set of a
-    history has only one neighbour and still trips the rule.
+    its own spikes. Both legs use the rule's threshold, except that the SMA-drop
+    rule tests a rising leg against ``sma_drop_floor_km`` alone (drag never raises
+    the orbit; see :data:`SPIKE_LEG_THRESHOLDS`). A lone out-and-back set is a bad
+    element set, not a maneuver; a maneuver is a step that later sets keep. Limits:
+    a maneuver undone at the very next set looks like a spike and is missed, and a
+    bad first or last set of a history has only one neighbour and still trips the
+    rule.
 
     Args:
         table: element sets with ``norad_id``, ``epoch_tt_s`` and the rule's columns.
@@ -590,7 +626,8 @@ def history_rule(
     spike_ids = empty
     if exclude_spikes:
         change, thr = _pair_change_and_threshold(rule, t, v, params)
-        spikes = isolated_spikes(ids[1:] == ids[:-1], change, thr)
+        spikes = isolated_spikes(ids[1:] == ids[:-1], change, thr,
+                                 _spike_rise_threshold(rule, thr, params))
         spike_ids = ids[spikes]
         ids, t = ids[~spikes], t[~spikes]
         v = {c: x[~spikes] for c, x in v.items()}
@@ -651,8 +688,8 @@ def sma_drop_flagged_ids(
     ``drag_multiple * allowance + floor_km`` is taken as an orbit-lowering
     maneuver. The floor absorbs fit noise between element sets; the multiple
     absorbs drag that changes faster than the derivative suggests.
-    ``exclude_spikes``: the spike rule of :func:`history_rule`, with this
-    allowance as the threshold of both legs.
+    ``exclude_spikes``: the spike rule of :func:`history_rule`; a falling leg
+    must exceed the allowance plus the floor, a rising leg the floor alone.
 
     Limits: a lowering burn smaller than the floor plus the drag allowance is
     missed, and so is any maneuver hidden inside a long gap between sets.

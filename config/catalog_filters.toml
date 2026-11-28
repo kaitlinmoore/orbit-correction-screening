@@ -70,4 +70,7 @@ inclination_jump_max_deg = 0.05
 #     in the pool. "Single": a set whose neighbour is also a spike is not left out.
 #     A lone out-and-back set is a bad element set; a maneuver is a step later sets
 #     keep. A maneuver undone by the very next set is missed (stated limitation).
+#     Legs: each leg uses its rule's threshold, except that for (b) a rising leg
+#     needs only sma_drop_floor_km (drag never raises the orbit; approved
+#     2026-11-27); its falling leg keeps the drag allowance plus the floor.
 exclude_history_spikes = true

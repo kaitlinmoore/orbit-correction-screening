@@ -382,7 +382,9 @@ Code: `src/orbit_correction/generation.py`; scripts `build_candidate_ids.py`,
   skips a single element set that departs from both of its neighbours by more than that
   rule's threshold, in opposite directions (out and back), and compares the neighbours
   with each other over the combined gap. The set stays in the pool, and each rule finds
-  its own spikes. Only isolated spikes are skipped: two bad sets in a row, or an
+  its own spikes. For the SMA-drop rule the falling leg must exceed the pair's drag
+  allowance plus the floor and the rising leg the floor alone, since drag never raises
+  the orbit (decided 2026-11-27, from the fourth pool on). Only isolated spikes are skipped: two bad sets in a row, or an
   oscillation, still trip the rule. A maneuver is a step that later sets keep; a set
   that comes straight back is a bad element set. The pool manifest gives each rule's
   trips and flagged objects with and without the spike rule.

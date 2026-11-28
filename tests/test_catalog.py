@@ -432,3 +432,39 @@ def test_isolated_spikes_mask():
     osc = C.isolated_spikes(np.ones(3, bool), np.array([2.0, -4.0, 2.0]), np.ones(3))
     assert osc.tolist() == [False, False, False, False]
 
+
+def test_isolated_spikes_rise_threshold_applies_to_rising_legs_only():
+    same = np.ones(2, bool)
+    fall_thr, rise_thr = np.full(2, 4.0), np.full(2, 1.0)
+    # down 5, back up 3: a spike only when rises are tested against 1, not 4
+    low = np.array([-5.0, 3.0])
+    assert C.isolated_spikes(same, low, fall_thr).tolist() == [False, False, False]
+    assert C.isolated_spikes(same, low, fall_thr, rise_thr).tolist() == [False, True, False]
+    # up 3, back down 3: the falling leg still has to beat 4
+    high = np.array([3.0, -3.0])
+    assert not C.isolated_spikes(same, high, fall_thr, rise_thr).any()
+    # up 3, back down 5: a spike with the rise threshold, not without it
+    assert C.isolated_spikes(same, np.array([3.0, -5.0]), fall_thr, rise_thr)[1]
+    assert not C.isolated_spikes(same, np.array([3.0, -5.0]), fall_thr)[1]
+    # a rising leg under the rise threshold is no spike
+    assert not C.isolated_spikes(same, np.array([-5.0, 0.5]), fall_thr, rise_thr).any()
+
+
+def test_sma_drop_spike_rule_tests_the_rising_leg_against_the_floor():
+    # 1 km/day of drag: the drop allowance per daily pair is 3 x 1 + 1 = 4 km. A bad
+    # set 4 km low falls 5 km (beyond the allowance) and comes back 3 km: above the
+    # 1 km floor but not above the allowance, so only the floor-alone rising leg sees
+    # the spike. Day 9 -> 11 then drops 2 km against a 7 km allowance.
+    t = _synthetic_history(decay_km_per_day=1.0, events=[(10, "sma_spike", -4.0)])
+    cfg = C.load_filter_config(REPO / "config" / "catalog_filters.toml")
+    off = C.history_rule(t, "no_sma_unexplained_drop", cfg, exclude_spikes=False)
+    assert off.flagged_ids == {91001} and off.trip_ids.size == 1
+    on = C.history_rule(t, "no_sma_unexplained_drop", cfg, exclude_spikes=True)
+    assert on.spike_ids.tolist() == [91001]
+    assert on.flagged_ids == set() and on.trip_ids.size == 0
+    # the other rules keep one threshold for both legs
+    assert C.SPIKE_LEG_THRESHOLDS["no_sma_unexplained_drop"]["rise"] == "sma_drop_floor_km"
+    for rule in ("no_sma_increase", "no_inclination_jump"):
+        legs = C.SPIKE_LEG_THRESHOLDS[rule]
+        assert legs["rise"] == legs["fall"]
+
