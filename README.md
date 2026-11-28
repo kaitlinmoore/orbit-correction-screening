@@ -94,10 +94,12 @@ uv run python scripts/extract_bulk_tle.py --bulk-dir data/raw/spacetrack/bulk_tl
 uv run python scripts/build_pool.py --extract-dir data/derived/pool/bulk_extract \
     --validation-json 'data/raw/spacetrack/gp_history/*.json.gz' \
     --satcat data/raw/celestrak/satcat.csv --space-weather data/raw/celestrak/SW-All.txt \
-    --start 2015-01-01 --end 2026-01-01 --out-dir data/derived/pool/pool_v2
-uv run python scripts/sample_windows.py --pool-dir data/derived/pool/pool_v2 --stage pilot \
-    --space-weather data/raw/celestrak/SW-All.txt --out data/derived/windows/pilot_v2
-# 4. Generation (spawned Orekit workers; resumable), the daily-Ap sensitivity run, report
+    --start 2015-01-01 --end 2026-01-01 --out-dir data/derived/pool/pool_v3
+uv run python scripts/sample_windows.py --pool-dir data/derived/pool/pool_v3 \
+    --stage first_batch \
+    --space-weather data/raw/celestrak/SW-All.txt --out data/derived/windows/first_batch
+# 4. Generation (spawned Orekit workers; resumable), the daily-Ap sensitivity run, report.
+#    Shown for the second pilot (pool_v2 and its pilot sample, before the spike rule).
 uv run --group datagen python scripts/generate_residuals.py \
     --windows data/derived/windows/pilot_v2/windows.parquet \
     --space-weather data/raw/celestrak/SW-All.txt --out-root data/derived/residuals \
@@ -138,7 +140,8 @@ What is implemented here and what is library behaviour:
   - The status part uses each object's *current* SATCAT status, not its status at each epoch.
   - It misclassifies non-propulsive operational satellites as maneuverable. TIMED is one example (held out anyway as a validation object).
   - The constellation name list covers only the constellations named in `config/catalog_filters.toml`, and is tested on each object's current SATCAT name and on payloads only.
-  - The element-history detector misses small maneuvers: semimajor-axis changes under about 1 km plus the drag allowance, inclination changes under 0.05 deg, and anything hidden in a long gap between element sets.
+  - The element-history detector misses small maneuvers: semimajor-axis changes under about 1 km plus the drag allowance, inclination changes under 0.05 deg, and anything hidden in a long gap between element sets. Its spike rule (a single element set out and back past the threshold is skipped) also misses a maneuver undone at the very next element set.
+  - The same detector also drops objects for noise: its thresholds don't depend on the gap between element sets, so slow natural drift over long gaps can trip the inclination rule, and short gaps leave little room for a clean 1 km rise. Some flagged objects trip just past a threshold. Neither a gap-aware threshold nor a margin for near-threshold trips is applied.
 - Prediction windows ending after the last fully observed space-weather day are excluded, so the most recent epochs are never used.
 - The space-weather file is a snapshot of final, revised values. The as-of lookup prevents reading values after the prediction start, but cannot reproduce what an operator knew in real time.
 - The test period is 2025 only for now: windows must end within the downloaded history (the 2015-2025 bulk files). 2026 will be added as a test-period extension when Space-Track publishes its 2026 file.

@@ -1,9 +1,9 @@
 """Sample window starts from the labeled pool for one stage, and report their coverage.
 
     uv run python scripts/sample_windows.py \\
-        --pool-dir data/derived/pool/pool_v1 --stage pilot \\
+        --pool-dir data/derived/pool/pool_v3 --stage first_batch \\
         --space-weather data/raw/celestrak/SW-All.txt \\
-        --out data/derived/windows/pilot
+        --out data/derived/windows/first_batch
 
 Uses :func:`orbit_correction.generation.sample_windows` with ``config/generation.toml``
 (train and dev rows only; starts at element-set epochs at least 7 days apart per
@@ -18,7 +18,7 @@ Writes into ``--out``:
   ``dailyap_windows`` of them).
 * ``windows_manifest.json``: the pool manifest's hash, config hashes, the seed and the
   coverage of the sample by year, altitude band, solar-activity bin, eccentricity bin
-  and split, plus starts per object. Labels and counts only.
+  and split, plus starts per object and windows per round. Labels and counts only.
 """
 
 from __future__ import annotations
@@ -103,6 +103,8 @@ def main(argv=None) -> int:
         "n_objects": int(len(np.unique(windows.column("norad_id").to_numpy()))),
         "starts_per_object": {str(k): v for k, v in sorted(per_obj.items())},
         "max_start_round": int(windows.column("start_round").to_numpy().max()),
+        "windows_per_round": {str(k): v for k, v in sorted(
+            Counter(windows.column("start_round").to_pylist()).items())},
         "seed": gcfg.seed,
         "generation_status": gcfg.status,
         "pool_manifest_sha256": generation.file_sha256(args.pool_dir / "pool_manifest.json"),

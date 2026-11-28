@@ -378,6 +378,21 @@ Code: `src/orbit_correction/generation.py`; scripts `build_candidate_ids.py`,
   attached, the
   catalog filters applied with rows and objects removed reported per rule. The pool is
   built per group of NORAD IDs, which changes nothing because every rule is per object.
+- **Spike rule in the element-history rules (decided 2026-11-27).** Each history rule
+  skips a single element set that departs from both of its neighbours by more than that
+  rule's threshold, in opposite directions (out and back), and compares the neighbours
+  with each other over the combined gap. The set stays in the pool, and each rule finds
+  its own spikes. Only isolated spikes are skipped: two bad sets in a row, or an
+  oscillation, still trip the rule. A maneuver is a step that later sets keep; a set
+  that comes straight back is a bad element set. The pool manifest gives each rule's
+  trips and flagged objects with and without the spike rule.
+- **Limits of the element-history rules.** Thresholds are fixed per pair, whatever the
+  gap: over long gaps slow natural drift can trip the inclination rule, over short gaps
+  fit noise can trip the SMA rules, and many flagged objects trip once, just past a
+  threshold. A gap-aware threshold or a margin for near-threshold trips would keep more
+  objects, at the cost of missing more small maneuvers; neither is applied. A maneuver
+  undone at the very next element set looks like a spike and is missed, and a bad first
+  or last set of a history still trips its rule.
 - **Split.** Every pool element set is labeled as a window start with
   `splits.assign_split_labels`; the last fully observed space-weather day, the seed and
   the config hashes are recorded with it. Then one rule of the download (decided
@@ -417,7 +432,10 @@ Code: `src/orbit_correction/generation.py`; scripts `build_candidate_ids.py`,
   observed day and the seed.
 - **Daily-Ap sensitivity.** A run option sets NRLMSISE-00 switch 9 to +1 (daily Ap) for a
   subsample of the same windows and labels every output `dailyap`; `config/truth.toml`
-  is not changed.
+  is not changed. The subsample is the 200 windows with the smallest seeded hash of
+  their identity, (NORAD ID, start epoch) (decided 2026-11-27), so a window's draw does
+  not depend on the rest of the sample; the two pilots' subsamples were drawn by
+  position.
 
 **Pilot (exploratory, 2026-11-25; train and dev rows only).**
 - **Pool and split:**

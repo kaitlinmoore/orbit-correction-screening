@@ -114,7 +114,8 @@ def test_config_file_matches_code_defaults():
     for name in ("perigee_min_km", "apogee_max_km", "bstar_min_exclusive", "bstar_max",
                  "ephemeris_types", "object_types", "exclude_ops_status",
                  "sma_increase_max_km", "sma_drop_drag_multiple", "sma_drop_floor_km",
-                 "inclination_jump_max_deg", "name_rule_column", "name_rule_object_types"):
+                 "inclination_jump_max_deg", "name_rule_column", "name_rule_object_types",
+                 "exclude_history_spikes"):
         assert getattr(cfg, name) == getattr(default, name), name
     assert cfg.status == "approved 2026-11-23"
     assert {"STARLINK", "FLOCK", "LEMUR"} <= set(cfg.exclude_name_patterns)
@@ -247,6 +248,8 @@ def _synthetic_history(
     ``events`` are ``(day, kind, size)``: ``("sma", -3.0)`` lowers the orbit by
     3 km from that day on, ``("inc", 0.1)`` changes the inclination by 0.1 deg,
     ``("rate", 3.0)`` multiplies the decay rate from that day on (a storm).
+    ``("sma_spike", 3.0)`` and ``("inc_spike", 0.1)`` change that day's set only
+    (a bad element set: out and back).
     """
     rng = np.random.default_rng(seed)
     recs = []
@@ -261,13 +264,19 @@ def _synthetic_history(
                 elif kind == "rate":
                     rate *= size
         a_fit = a + noise_km * rng.standard_normal()
+        inc_fit = inc
+        for day, kind, size in events:
+            if day == d and kind == "sma_spike":
+                a_fit += size
+            elif day == d and kind == "inc_spike":
+                inc_fit += size
         n = np.sqrt(C.MU_WGS72_KM3_S2 / a_fit**3) * 86400 / (2 * np.pi)
         # da/dt = -(2/3)(a/n) dn/dt  ->  MEAN_MOTION_DOT = dn/dt / 2
         ndot_half = rate * 1.5 * n / a_fit / 2
         recs.append({
             "NORAD_CAT_ID": nid, "OBJECT_NAME": "SYNTH", "OBJECT_ID": "2000-000Z",
             "EPOCH": f"2024-03-{d + 1:02d}T00:00:00", "MEAN_MOTION": n, "ECCENTRICITY": 0.001,
-            "INCLINATION": inc, "RA_OF_ASC_NODE": 10.0, "ARG_OF_PERICENTER": 20.0,
+            "INCLINATION": inc_fit, "RA_OF_ASC_NODE": 10.0, "ARG_OF_PERICENTER": 20.0,
             "MEAN_ANOMALY": 30.0, "BSTAR": 1e-4, "MEAN_MOTION_DOT": ndot_half,
             "MEAN_MOTION_DDOT": 0.0, "EPHEMERIS_TYPE": 0,
         })
@@ -335,3 +344,91 @@ def test_history_rules_keep_objects_apart_and_ignore_order():
     # the jump between the last set of one object and the first of the next is not a pair
     lowered = _synthetic_history(nid=91003, a0_km=6700.0)
     assert C.sma_drop_flagged_ids(pa.concat_tables([clean, lowered]), 3.0, 1.0) == set()
+
+
+# ---------------------------------------------------------------- spike rule
+
+
+def _flags_without_spike_rule(table):
+    cfg = C.load_filter_config(REPO / "config" / "catalog_filters.toml")
+    cfg = C.CatalogFilterConfig(**{**cfg.__dict__, "exclude_history_spikes": False})
+    rules = [r for r in C.DEFAULT_RULES if r.name in C.HISTORY_RULES]
+    return C.apply_filters(table, cfg, rules=rules).rejected_by_rule
+
+
+def test_spike_rule_is_on_in_the_config():
+    assert C.load_filter_config(REPO / "config" / "catalog_filters.toml").exclude_history_spikes
+
+
+@pytest.mark.parametrize("size", [3.0, -3.0])
+def test_single_sma_spike_is_left_out(size):
+    t = _synthetic_history(decay_km_per_day=0.3, events=[(10, "sma_spike", size)])
+    before = _flags_without_spike_rule(t)
+    # out and back trips both SMA rules without the spike rule
+    assert before["no_sma_increase"] == before["no_sma_unexplained_drop"] == t.num_rows
+    assert _history_flags(t) == {"no_sma_increase": 0, "no_sma_unexplained_drop": 0,
+                                 "no_inclination_jump": 0}
+    cfg = C.load_filter_config(REPO / "config" / "catalog_filters.toml")
+    res = C.history_rule(t, "no_sma_increase", cfg, exclude_spikes=True)
+    assert res.spike_ids.tolist() == [91001] and res.trip_ids.size == 0
+    # the set stays in the pool: the rule only skips it
+    rule = [r for r in C.DEFAULT_RULES if r.name == "no_sma_increase"]
+    assert C.apply_filters(t, cfg, rules=rule).kept.num_rows == t.num_rows
+
+
+def test_single_inclination_spike_is_left_out():
+    t = _synthetic_history(events=[(7, "inc_spike", 0.1)])
+    assert _flags_without_spike_rule(t)["no_inclination_jump"] == t.num_rows
+    assert _history_flags(t)["no_inclination_jump"] == 0
+    assert C.inclination_jump_flagged_ids(t, 0.05) == {91001}
+    assert C.inclination_jump_flagged_ids(t, 0.05, exclude_spikes=True) == set()
+
+
+@pytest.mark.parametrize("events", [
+    [(7, "inc", 0.1)],                                   # a plane change: a step
+    [(10, "sma", 3.0)],                                  # a raise: a step
+    [(10, "sma_spike", 3.0), (11, "sma_spike", 3.0)],    # two bad sets in a row
+    [(10, "sma_spike", 3.0), (11, "sma_spike", -3.0)],   # an oscillation
+    [(19, "sma_spike", 3.0)],                            # the last set: one neighbour
+])
+def test_steps_runs_and_end_sets_still_trip(events):
+    t = _synthetic_history(decay_km_per_day=0.3, events=events)
+    flags = _history_flags(t)
+    assert sum(flags.values()) >= t.num_rows, flags
+
+
+def test_neighbours_of_a_spike_are_compared_over_the_combined_gap():
+    # a bad set on day 10, then a 4 km lowering burn on day 11: the spike is left out
+    # and day 9 -> day 11 still shows the burn (4.6 km against a 2.8 km allowance)
+    t = _synthetic_history(decay_km_per_day=0.3,
+                           events=[(10, "sma_spike", 3.0), (11, "sma", -4.0)])
+    cfg = C.load_filter_config(REPO / "config" / "catalog_filters.toml")
+    res = C.history_rule(t, "no_sma_unexplained_drop", cfg, exclude_spikes=True)
+    assert res.spike_ids.tolist() == [91001]
+    assert res.flagged_ids == {91001}
+
+
+def test_spikes_are_found_per_object():
+    # the last set of one object and the first of the next are not neighbours
+    clean = _synthetic_history(nid=91001)
+    high = _synthetic_history(nid=91002, a0_km=6790.0)
+    low = _synthetic_history(nid=91003, a0_km=6770.0)
+    both = pa.concat_tables([clean, high, low])
+    cfg = C.load_filter_config(REPO / "config" / "catalog_filters.toml")
+    for rule in C.HISTORY_RULES:
+        res = C.history_rule(both, rule, cfg, exclude_spikes=True)
+        assert res.spike_ids.size == 0 and res.flagged_ids == set(), rule
+
+
+def test_isolated_spikes_mask():
+    same = np.array([True, True, True, False, True, True])
+    change = np.array([2.0, -2.0, 0.0, 9.0, -2.0, 2.0])
+    thr = np.ones(6)
+    # set 1 is up and back; set 4 is the first set of the second object (no pair before
+    # it within its object); set 5 is down and back
+    assert C.isolated_spikes(same, change, thr).tolist() == [
+        False, True, False, False, False, True, False]
+    # adjacent spikes (an oscillation) are not isolated
+    osc = C.isolated_spikes(np.ones(3, bool), np.array([2.0, -4.0, 2.0]), np.ones(3))
+    assert osc.tolist() == [False, False, False, False]
+

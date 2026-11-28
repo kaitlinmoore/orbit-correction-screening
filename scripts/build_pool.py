@@ -5,8 +5,8 @@
         --validation-json 'data/raw/spacetrack/gp_history/*.json.gz' \\
         --satcat data/raw/celestrak/satcat.csv \\
         --space-weather data/raw/celestrak/SW-All.txt \\
-        --start 2015-01-01 --end 2026-11-24 \\
-        --out-dir data/derived/pool/pool_v1
+        --start 2015-01-01 --end 2026-01-01 \\
+        --out-dir data/derived/pool/pool_v3
 
 Per NORAD-ID bucket (``bulk_extract/bucket_NN``, from ``extract_bulk_tle.py``):
 
@@ -17,7 +17,8 @@ Per NORAD-ID bucket (``bulk_extract/bucket_NN``, from ``extract_bulk_tle.py``):
 2. :func:`orbit_correction.generation.build_pool`: the span, exact duplicates
    removed, reissues (one object's sets at most 60 s apart) collapsed to the highest
    element-set number, SATCAT attached, the approved catalog filters applied (counts per rule,
-   in rows and objects).
+   in rows and objects; for the element-history rules also trips and the sets the spike
+   rule left out, with and without the spike rule).
 3. :func:`orbit_correction.generation.label_pool`: every kept element set labeled as a
    window start with ``splits.assign_split_labels``, using the space-weather file's
    last fully observed day at labeling time; windows ending after ``--end`` (the end
@@ -83,6 +84,7 @@ def main(argv=None) -> int:
         "dropped_at_rule", "rejected_by_rule", "objects_dropped_at_rule", "dedupe", "split_rows",
         "split_objects", "rows", "history_end_excluded", "reissues",
         "reissues_removed_by_source")}
+    history_rules: dict[str, Counter] = {r: Counter() for r in catalog.HISTORY_RULES}
     max_span = 0.0
     outputs = []
     for d in bucket_dirs:
@@ -120,6 +122,8 @@ def main(argv=None) -> int:
         max_span = max(max_span, rs.max_group_span_s)
         for k in ("dropped_at_rule", "rejected_by_rule", "objects_dropped_at_rule"):
             totals[k].update(getattr(res, k))
+        for r, c in res.history_rules.items():
+            history_rules[r].update(c)  # buckets are disjoint by object
         for lab, c in summary.items():
             totals["split_rows"][lab] += c["rows"]
             totals["split_objects"][lab] += c["objects"]  # buckets are disjoint by object
@@ -155,6 +159,10 @@ def main(argv=None) -> int:
         },
         "counts": {k: dict(v) for k, v in totals.items()
                    if k not in ("split_rows", "split_objects", "history_end_excluded")},
+        "history_rules": {
+            "exclude_history_spikes": filters.exclude_history_spikes,
+            "counts_on_objects_alive_at_rule": {r: dict(c) for r, c in history_rules.items()},
+        },
         "reissue_rule": {"max_gap_s": generation.REISSUE_MAX_GAP_S,
                          "keep": "highest element_set_no; tie: last read",
                          "max_group_span_s": max_span},

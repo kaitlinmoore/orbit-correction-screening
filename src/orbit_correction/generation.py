@@ -762,6 +762,12 @@ class PoolResult:
         dropped_at_rule, rejected_by_rule: from :func:`catalog.apply_filters`.
         objects_dropped_at_rule: rule name -> objects whose last remaining element
             sets that rule removed (rules applied in order; sums to the objects lost).
+        history_rules: element-history rule name -> counts on the objects still in
+            the pool when that rule is applied, with the spike rule as configured
+            and without it: ``objects_flagged``, ``trips`` (flagged pairs),
+            ``spike_sets_left_out`` (sets the spike rule skipped; they stay in the
+            pool), ``objects_flagged_without_spike_rule``,
+            ``trips_without_spike_rule``.
         n_objects_in, n_objects_kept: distinct NORAD IDs before and after the filters.
     """
 
@@ -773,6 +779,7 @@ class PoolResult:
     dropped_at_rule: dict[str, int]
     rejected_by_rule: dict[str, int]
     objects_dropped_at_rule: dict[str, int]
+    history_rules: dict[str, dict[str, int]]
     n_objects_in: int
     n_objects_kept: int
 
@@ -809,8 +816,11 @@ def build_pool(elsets, satcat, filters: CatalogFilterConfig, span_start_utc: str
     ids = joined.column("norad_id").to_numpy()
     alive = np.ones(joined.num_rows, dtype=bool)
     objects_at: dict[str, int] = {}
+    history: dict[str, dict[str, int]] = {}
     for rule in catalog.DEFAULT_RULES:
         before = set(np.unique(ids[alive]).tolist())
+        if rule.name in catalog.HISTORY_RULES:
+            history[rule.name] = _history_rule_counts(joined, rule.name, filters, before)
         alive &= np.asarray(rule.keep(joined, filters), dtype=bool)
         objects_at[rule.name] = len(before - set(np.unique(ids[alive]).tolist()))
     if int(alive.sum()) != kept.num_rows:
@@ -826,9 +836,31 @@ def build_pool(elsets, satcat, filters: CatalogFilterConfig, span_start_utc: str
         dropped_at_rule=res.dropped_at_rule,
         rejected_by_rule=res.rejected_by_rule,
         objects_dropped_at_rule=objects_at,
+        history_rules=history,
         n_objects_in=int(len(catalog.unique_ids(joined))) if joined.num_rows else 0,
         n_objects_kept=int(len(catalog.unique_ids(kept))) if kept.num_rows else 0,
     )
+
+
+def _history_rule_counts(joined, rule: str, filters: CatalogFilterConfig,
+                         alive_ids: set[int]) -> dict[str, int]:
+    """Trips and spikes of one history rule, on the objects still in the pool."""
+    from orbit_correction import catalog
+
+    alive = np.array(sorted(alive_ids), dtype=np.int64)
+    on = catalog.history_rule(joined, rule, filters, exclude_spikes=filters.exclude_history_spikes)
+    off = catalog.history_rule(joined, rule, filters, exclude_spikes=False)
+
+    def n_alive(x) -> int:
+        return int(np.isin(x, alive).sum())
+
+    return {
+        "objects_flagged": len(on.flagged_ids & alive_ids),
+        "trips": n_alive(on.trip_ids),
+        "spike_sets_left_out": n_alive(on.spike_ids),
+        "objects_flagged_without_spike_rule": len(off.flagged_ids & alive_ids),
+        "trips_without_spike_rule": n_alive(off.trip_ids),
+    }
 
 
 # --------------------------------------------------------------------------------------
@@ -970,16 +1002,35 @@ def sample_windows(labeled, cfg: GenerationConfig, n_windows: int | None = None)
     return out.append_column("draw", pa.array(draw[chosen], type=pa.float64()))
 
 
+def dailyap_window_keys(windows) -> list[str]:
+    """Identity of each window for the daily-Ap draw: ``"<norad_id>:<epoch_tt_s>"``.
+
+    The start epoch is written with ``repr(float)``, which round-trips exactly, so a
+    window gets the same key in any sample it appears in.
+    """
+    ids = windows.column("norad_id").to_numpy()
+    t = windows.column("epoch_tt_s").to_numpy()
+    return [f"{int(i)}:{float(x)!r}" for i, x in zip(ids, t, strict=True)]
+
+
 def dailyap_subsample(windows, n: int, seed: int):
     """``n`` windows of a sample for the daily-Ap sensitivity run (seeded draw, salt ``dailyap``).
 
-    Returned in ``window_index`` order. The same windows, so the two truth settings
-    can be compared window by window.
+    Each window's draw is a seeded hash of its identity, ``(NORAD ID, start epoch)``
+    (:func:`dailyap_window_keys`; decided 2026-11-27), not of its position in the
+    sample, so a window's draw is the same in every sample. The ``n`` windows with the
+    smallest draws are taken. Consequence: if sample B is part of sample A, every
+    window of A's subsample that is in B is also in B's subsample (its rank can only
+    improve); the count stays fixed at ``n``, so a larger sample's subsample holds
+    only the windows of a smaller one that rank among its own ``n`` smallest.
+
+    Returned in the sample's row order (``window_index`` order for
+    :func:`sample_windows` output). The same windows, so the two truth settings can
+    be compared window by window.
     """
     import pyarrow as pa
 
-    idx = windows.column("window_index").to_numpy()
-    d = _draws(seed, "dailyap", [int(i) for i in idx])
+    d = _draws(seed, "dailyap", dailyap_window_keys(windows))
     pick = np.sort(np.argsort(d, kind="stable")[: int(n)])
     return windows.take(pa.array(pick, type=pa.int64()))
 
@@ -1659,6 +1710,7 @@ __all__ = [
     "code_provenance",
     "coverage",
     "dailyap_subsample",
+    "dailyap_window_keys",
     "collapse_reissues",
     "drop_exact_duplicates",
     "file_sha256",

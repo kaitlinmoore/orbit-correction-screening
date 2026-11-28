@@ -408,6 +408,23 @@ def test_collapsing_reissues_removes_a_noise_sma_rise(tmp_path, filters):
     assert set(res.table.column("norad_id").to_pylist()) == {90001}
 
 
+def test_pool_keeps_an_object_with_one_spike_and_counts_it(tmp_path, filters):
+    """A single set 2 km above both neighbours is left out of the history rules only."""
+    h = _history()
+    rows = h.filter(pc.equal(h.column("norad_id"), 90001)).to_pylist()
+    rows[2] = {**rows[2], "semimajor_axis_km": rows[2]["semimajor_axis_km"] + 2.0}
+    t = pa.Table.from_pylist(rows, schema=h.schema)
+    sat = _history_satcat(tmp_path)
+    res = G.build_pool(t, sat, filters, "2000-01-01", "2026-01-01")
+    assert res.table.num_rows == len(rows)  # the spike set stays in the pool
+    rise = res.history_rules["no_sma_increase"]
+    assert rise == {"objects_flagged": 0, "trips": 0, "spike_sets_left_out": 1,
+                    "objects_flagged_without_spike_rule": 1, "trips_without_spike_rule": 1}
+    assert set(res.history_rules) == set(catalog.HISTORY_RULES)
+    off = dataclasses.replace(filters, exclude_history_spikes=False)
+    assert G.build_pool(t, sat, off, "2000-01-01", "2026-01-01").table.num_rows == 0
+
+
 def test_pool_applies_filters_and_reports_each_rule(tmp_path, filters):
     h = _history()
     res = G.build_pool(pa.concat_tables([h, h]), _history_satcat(tmp_path), filters,
@@ -510,6 +527,30 @@ def test_dailyap_subsample_is_seeded_subset(gcfg):
     assert a.num_rows == 10 and set(a.column("window_index").to_pylist()) <= set(range(100))
     assert np.all(np.diff(a.column("window_index").to_numpy()) > 0)
     assert a.equals(G.dailyap_subsample(w, 10, gcfg.seed))
+
+
+def test_dailyap_draw_follows_window_identity_not_position(gcfg):
+    w = G.sample_windows(_labeled_pool(), gcfg, 100)
+    a = G.dailyap_subsample(w, 10, gcfg.seed)
+    chosen = set(G.dailyap_window_keys(a))
+    # reorder the sample and renumber window_index: the same windows are chosen
+    perm = np.random.default_rng(7).permutation(w.num_rows)
+    shuffled = w.take(pa.array(perm)).set_column(
+        w.column_names.index("window_index"), "window_index",
+        pa.array(np.arange(w.num_rows), type=pa.int64()))
+    assert set(G.dailyap_window_keys(G.dailyap_subsample(shuffled, 10, gcfg.seed))) == chosen
+    # drop half of the other windows: every chosen window still in the sample stays chosen
+    keep = [k in chosen or i % 2 == 0 for i, k in enumerate(G.dailyap_window_keys(w))]
+    part = w.filter(pa.array(keep))
+    assert chosen <= set(G.dailyap_window_keys(G.dailyap_subsample(part, 10, gcfg.seed)))
+    sub = w.slice(0, 40)  # a smaller stage is a prefix of a larger one
+    in_sub = chosen & set(G.dailyap_window_keys(sub))
+    assert in_sub <= set(G.dailyap_window_keys(G.dailyap_subsample(sub, 10, gcfg.seed)))
+    # the key is the object and the start epoch
+    row = w.slice(0, 1).to_pylist()[0]
+    assert G.dailyap_window_keys(w)[0] == f"{row['norad_id']}:{float(row['epoch_tt_s'])!r}"
+    other = G.dailyap_subsample(w, 10, gcfg.seed + 1)
+    assert set(G.dailyap_window_keys(other)) != chosen
 
 
 # ----------------------------------------------------------------- drop statuses
