@@ -441,7 +441,7 @@ Code: `src/orbit_correction/generation.py`; scripts `build_candidate_ids.py`,
 - **250-400 km, median (p95) |T| at 7 days:** 2,780 km (17,380 km) with every kept window; 2,217 km (8,528 km) without the 51 windows the first pilot refused; 16,657 km (42,465 km) for those 51 alone. The other bands are unchanged.
 - **Fit misfit (RMS, m), median / p99 / max by band:** 275 / 3,062 / 3,716 (250-400 km), 60 / 558 / 829 (400-600), 28 / 302 / 623 (600-800), 22 / 197 / 524 (800-1,200), 17 / 123 / 270 (1,200-2,000). The 49 windows above 1 km (flagged, not dropped) are all at 250-400 km; 34 of them are kept windows with |du| above pi/2.
 - **Daily-Ap minus 3-hour ap truth** on 200 windows (all `ok`; a new draw, 11 shared with the first subsample): median (p95) |T| at 7 days 9.9 km (59 km) at 250-400 km, 0.84 km (8.1 km) at 400-600 km, 6 m (0.81 km) at 600-800 km.
-- **Cost:** 5.5 windows/s on 22 workers; truth job 3.75 s median; 5,664 bytes per window. Memory in use on the machine rose from 1.5 GB idle to about 25 GB during the run (22 JVM workers and the parent; the parent alone peaked at 1.4 GB).
+- **Cost:** 5.5 windows/s on 22 workers; truth job 3.75 s median; 5,664 bytes per window. Memory in use on the machine rose from 1.5 GB idle to about 25 GB during the run (22 JVM workers and the parent; the largest single process peaked at 1.4 GB).
 
 ## Models
 
