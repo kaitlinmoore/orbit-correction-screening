@@ -658,6 +658,10 @@ Implemented here vs library: the k-d tree is `scipy.spatial.cKDTree` and tables 
 pyarrow. Interpolation, search bound, minimum finding, element conversions, filters and
 metrics are this project's code, written with AI assistance and checked by the tests above.
 
+**Third pool and first-batch sample (exploratory, 2026-11-27; counts only, no generation run)**, with the spike rule (`pool_v3`, sample `first_batch`):
+- **Pool:** the spike rule skips 894 sets for the SMA-rise rule, 360 for the SMA-drop rule and 319 for the inclination rule (all stay in the pool). Objects dropped: SMA rise 770 (1,357 in `pool_v2`), SMA drop 426 (319), inclination jump 264 (397). The SMA-drop count rises because 107 objects the SMA-rise rule used to drop now reach it and trip it. The filters keep 56.6 M sets of 18,486 objects (`pool_v2`: 54.7 M, 17,873); no object kept in `pool_v2` is dropped.
+- **Sample:** 50,000 train and dev windows on 14,636 objects (every eligible object), in rounds 1-4 (14,636 / 14,397 / 14,242 / 6,725 windows). It contains all 5,000 `pilot_v2` windows, every one in round 1.
+
 ## Limitations
 
 _To be written._
