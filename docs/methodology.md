@@ -664,6 +664,10 @@ metrics are this project's code, written with AI assistance and checked by the t
 - **Pool:** the spike rule skips 894 sets for the SMA-rise rule, 360 for the SMA-drop rule and 319 for the inclination rule (all stay in the pool). Objects dropped: SMA rise 770 (1,357 in `pool_v2`), SMA drop 426 (319), inclination jump 264 (397). The SMA-drop count rises because 107 objects the SMA-rise rule used to drop now reach it and trip it. The filters keep 56.6 M sets of 18,486 objects (`pool_v2`: 54.7 M, 17,873); no object kept in `pool_v2` is dropped.
 - **Sample:** 50,000 train and dev windows on 14,636 objects (every eligible object), in rounds 1-4 (14,636 / 14,397 / 14,242 / 6,725 windows). It contains all 5,000 `pilot_v2` windows, every one in round 1.
 
+**Fourth pool and first-batch sample (exploratory, 2026-11-27; counts only, no generation run)**, with the SMA-drop spike rule's rising leg tested against the floor alone (`pool_v4`, sample `first_batch_v4`):
+- **Pool:** objects dropped: SMA rise 770 (unchanged), SMA drop 352 (426 in `pool_v3`), inclination jump 266 (264). The filters keep 57.0 M sets of 18,558 objects (`pool_v3`: 56.6 M, 18,486): 72 objects more (38 PAY, 17 R/B, 17 DEB), none lost.
+- **Sample:** 50,000 train and dev windows on 14,690 objects (every eligible object), in rounds 1-4 (14,690 / 14,451 / 14,295 / 6,564 windows). It shares 49,808 windows with `first_batch` and contains all 5,000 `pilot_v2` windows, every one in round 1. Its daily-Ap subsample is the same 200 windows as `first_batch`'s.
+
 ## Limitations
 
 _To be written._

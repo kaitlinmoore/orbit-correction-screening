@@ -94,10 +94,10 @@ uv run python scripts/extract_bulk_tle.py --bulk-dir data/raw/spacetrack/bulk_tl
 uv run python scripts/build_pool.py --extract-dir data/derived/pool/bulk_extract \
     --validation-json 'data/raw/spacetrack/gp_history/*.json.gz' \
     --satcat data/raw/celestrak/satcat.csv --space-weather data/raw/celestrak/SW-All.txt \
-    --start 2015-01-01 --end 2026-01-01 --out-dir data/derived/pool/pool_v3
-uv run python scripts/sample_windows.py --pool-dir data/derived/pool/pool_v3 \
+    --start 2015-01-01 --end 2026-01-01 --out-dir data/derived/pool/pool_v4
+uv run python scripts/sample_windows.py --pool-dir data/derived/pool/pool_v4 \
     --stage first_batch \
-    --space-weather data/raw/celestrak/SW-All.txt --out data/derived/windows/first_batch
+    --space-weather data/raw/celestrak/SW-All.txt --out data/derived/windows/first_batch_v4
 # 4. Generation (spawned Orekit workers; resumable), the daily-Ap sensitivity run, report.
 #    Shown for the second pilot (pool_v2 and its pilot sample, before the spike rule).
 uv run --group datagen python scripts/generate_residuals.py \
