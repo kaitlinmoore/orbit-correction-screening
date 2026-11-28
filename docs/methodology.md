@@ -434,6 +434,15 @@ Code: `src/orbit_correction/generation.py`; scripts `build_candidate_ids.py`,
 - **Daily-Ap (switch 9 = +1) minus 3-hour ap truth** on 198 windows: median |T| at 7 days 3 m overall; 5.8 km median (p95 42 km) at 250-400 km; 0.38 km (p95 19 km) at 400-600 km.
 - **Cost and size:** 5,602 bytes per window on disk; 4.9 windows/s on 22 workers. A truth job (fit included) takes 4.1 s median.
 
+**Second pilot (exploratory, 2026-11-27; train and dev rows only)**, with reissues collapsed and the along-track angle unwrapped per window (`pool_v2`, run `pilot_v2`):
+- **Pool:** collapsing reissues removes 445,436 element sets in 435,703 groups (widest 173 s, since gaps chain); the filters keep 54.7 M sets of 17,873 objects. The history rules drop fewer objects: SMA rise 1,357 (was 1,594), SMA drop 319 (380), inclination jump 397 (409). No remaining trip is between sets 60 s or less apart.
+- **Sample:** 5,000 windows on 5,000 objects; 4,909 of them are in the first pilot, including all 51 it refused as `rtn_domain`.
+- **Window fates:** 4,986 `ok`, 0 `rtn_domain`, 9 `truth_reentry`, 5 `sgp4_floor` (the same 14 windows as in the first pilot). 53 kept windows have |du| above pi/2, all at 250-400 km, up to 9.4 rad; the largest step between horizons is 0.28 rad.
+- **250-400 km, median (p95) |T| at 7 days:** 2,780 km (17,380 km) with every kept window; 2,217 km (8,528 km) without the 51 windows the first pilot refused; 16,657 km (42,465 km) for those 51 alone. The other bands are unchanged.
+- **Fit misfit (RMS, m), median / p99 / max by band:** 275 / 3,062 / 3,716 (250-400 km), 60 / 558 / 829 (400-600), 28 / 302 / 623 (600-800), 22 / 197 / 524 (800-1,200), 17 / 123 / 270 (1,200-2,000). The 49 windows above 1 km (flagged, not dropped) are all at 250-400 km; 34 of them are kept windows with |du| above pi/2.
+- **Daily-Ap minus 3-hour ap truth** on 200 windows (all `ok`; a new draw, 11 shared with the first subsample): median (p95) |T| at 7 days 9.9 km (59 km) at 250-400 km, 0.84 km (8.1 km) at 400-600 km, 6 m (0.81 km) at 600-800 km.
+- **Cost:** 5.5 windows/s on 22 workers; truth job 3.75 s median; 5,664 bytes per window. Memory in use on the machine rose from 1.5 GB idle to about 25 GB during the run (22 JVM workers and the parent; the parent alone peaked at 1.4 GB).
+
 ## Models
 
 _To be written (build steps 4 and 7)._

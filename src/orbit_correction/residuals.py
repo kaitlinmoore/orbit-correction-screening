@@ -58,8 +58,9 @@ Where the contract leaves a choice (limits approved 2026-11-24, along-track angl
   350 km perigee with B* = 0.01 /ER passes pi/2 at 6.7 days and reaches
   T = 11,600 km at 7 days. On the first pilot (5,000 windows) the per-state limit
   refused 51 of 448 windows in the 250-400 km band, its largest errors, so that
-  band's statistics and training rows were biased low. The fastest change measured
-  there was about 0.1 rad per step on the 199-horizon grid, far inside pi/2.
+  band's statistics and training rows were biased low. With the angle unwrapped, the
+  second pilot (5,000 windows) kept all of them; its largest step between consecutive
+  horizons was 0.28 rad (250-400 km), far inside pi/2, and its largest |du| 9.4 rad.
 
   A refused window is counted as its own drop status (``rtn_domain``, in
   :data:`DROP_STATUSES`) by stratum, never dropped silently.
@@ -141,7 +142,7 @@ MAX_ABS_DU_RAD = math.pi / 2
 #: Largest change of the along-track angle between consecutive horizons of a window
 #: that :func:`rtn_from_window` accepts, rad (decided 2026-11-25). The unwrapped angle
 #: is unambiguous only while a step stays below pi; pi/2 leaves a factor of two. The
-#: fastest change measured on the pilot was about 0.1 rad per step.
+#: largest step measured on the second pilot was 0.28 rad (250-400 km band).
 MAX_DU_STEP_RAD = math.pi / 2
 #: Largest out-of-plane angle |phi| accepted, rad. Approved 2026-11-24.
 MAX_ABS_PHI_RAD = math.pi / 4

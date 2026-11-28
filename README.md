@@ -94,21 +94,22 @@ uv run python scripts/extract_bulk_tle.py --bulk-dir data/raw/spacetrack/bulk_tl
 uv run python scripts/build_pool.py --extract-dir data/derived/pool/bulk_extract \
     --validation-json 'data/raw/spacetrack/gp_history/*.json.gz' \
     --satcat data/raw/celestrak/satcat.csv --space-weather data/raw/celestrak/SW-All.txt \
-    --start 2015-01-01 --end 2026-01-01 --out-dir data/derived/pool/pool_v1
-uv run python scripts/sample_windows.py --pool-dir data/derived/pool/pool_v1 --stage pilot \
-    --space-weather data/raw/celestrak/SW-All.txt --out data/derived/windows/pilot
+    --start 2015-01-01 --end 2026-01-01 --out-dir data/derived/pool/pool_v2
+uv run python scripts/sample_windows.py --pool-dir data/derived/pool/pool_v2 --stage pilot \
+    --space-weather data/raw/celestrak/SW-All.txt --out data/derived/windows/pilot_v2
 # 4. Generation (spawned Orekit workers; resumable), the daily-Ap sensitivity run, report
 uv run --group datagen python scripts/generate_residuals.py \
-    --windows data/derived/windows/pilot/windows.parquet \
+    --windows data/derived/windows/pilot_v2/windows.parquet \
     --space-weather data/raw/celestrak/SW-All.txt --out-root data/derived/residuals \
-    --run-id pilot_baseline
+    --run-id pilot_v2
 uv run --group datagen python scripts/generate_residuals.py --daily-ap \
-    --windows data/derived/windows/pilot/windows_dailyap.parquet \
+    --windows data/derived/windows/pilot_v2/windows_dailyap.parquet \
     --space-weather data/raw/celestrak/SW-All.txt --out-root data/derived/residuals \
-    --run-id pilot_dailyap
-uv run python scripts/pilot_report.py --run data/derived/residuals/pilot_baseline \
-    --dailyap-run data/derived/residuals/pilot_dailyap \
-    --out data/derived/residuals/pilot_baseline/report
+    --run-id pilot_v2_dailyap
+uv run python scripts/pilot_report.py --run data/derived/residuals/pilot_v2 \
+    --dailyap-run data/derived/residuals/pilot_v2_dailyap \
+    --compare-run data/derived/residuals/pilot_baseline \
+    --out data/derived/residuals/pilot_v2/report
 ```
 
 ## Results
