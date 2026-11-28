@@ -143,8 +143,14 @@ class CatalogFormatError(ValueError):
     """A record could not be read as an OMM element set."""
 
 
-def _records_to_table(records: Iterable[Mapping[str, Any]], source: str) -> pa.Table:
+def records_to_table(records: Iterable[Mapping[str, Any]], source: str) -> pa.Table:
     """Convert OMM-keyword records to :data:`ELEMENT_SET_SCHEMA`.
+
+    The one conversion every loader goes through (CelesTrak OMM, Space-Track
+    ``gp_history``, single records built by scripts and tests), so an element set
+    gives the same row whichever way it arrives. ``source`` fills the ``source``
+    column. Records are mappings from OMM keywords (``NORAD_CAT_ID``, ``EPOCH``,
+    ``MEAN_MOTION``...) to values, as strings or numbers; extra keywords are ignored.
 
     Any record missing a required element raises (with its position): an
     element set that cannot be read is an error to look at, not a row to drop.
@@ -202,7 +208,7 @@ def load_celestrak_omm(path: str | Path) -> pa.Table:
             records: list[dict[str, Any]] = list(csv.DictReader(f))
     else:
         records = _read_json_records(path)
-    return _records_to_table(records, "celestrak_omm")
+    return records_to_table(records, "celestrak_omm")
 
 
 def load_spacetrack_gp_history(paths: str | Path | Iterable[str | Path]) -> pa.Table:
@@ -215,7 +221,7 @@ def load_spacetrack_gp_history(paths: str | Path | Iterable[str | Path]) -> pa.T
     if isinstance(paths, (str, Path)):
         paths = [paths]
     tables = [
-        _records_to_table(_read_json_records(Path(p)), "spacetrack_gp_history") for p in paths
+        records_to_table(_read_json_records(Path(p)), "spacetrack_gp_history") for p in paths
     ]
     if not tables:
         return ELEMENT_SET_SCHEMA.empty_table()
@@ -302,6 +308,15 @@ class CatalogFilterConfig:
             treated as able to maneuver and removed.
         exclude_name_patterns: regular expressions (case-insensitive, matched at
             the start of the name) for constellations known to maneuver.
+        name_rule_column: the name the pattern rule reads: ``"satcat_name"`` (the
+            object's current CelesTrak SATCAT name, from :func:`attach_satcat`;
+            decided 2026-11-24) or ``"object_name"`` (the element set's own name,
+            the earlier behaviour). Bulk TLE histories carry no names, and an
+            element set's name can differ from the object's later name, so the
+            SATCAT name gives one name per object across its whole history.
+        name_rule_object_types: object types the name rule applies to (decided
+            2026-11-24: payloads only). Debris and rocket bodies named after a
+            constellation (``IRIDIUM 33 DEB``) cannot maneuver and are kept.
         sma_increase_max_km: across an object's element history, a rise in mean
             semimajor axis larger than this between consecutive element sets
             flags a maneuver (drag only lowers it); the whole object is dropped.
@@ -312,6 +327,10 @@ class CatalogFilterConfig:
             ``sma_drop_floor_km`` (see :func:`sma_drop_flagged_ids`).
         inclination_jump_max_deg: a change in mean inclination larger than this
             between consecutive element sets flags a plane change.
+        exclude_history_spikes: the spike rule (approved 2026-11-27): each
+            history rule leaves out of its comparisons a single element set that
+            departs from both neighbours by more than that rule's threshold, in
+            opposite directions (see :func:`history_rule`). Thresholds unchanged.
         status: ``"pending approval"`` until the values are approved, then
             ``"approved <date>"``.
     """
@@ -324,10 +343,13 @@ class CatalogFilterConfig:
     object_types: tuple[str, ...] = ("PAY", "R/B", "DEB")
     exclude_ops_status: tuple[str, ...] = ("+", "P", "B", "S", "X")
     exclude_name_patterns: tuple[str, ...] = ()
+    name_rule_column: str = "satcat_name"
+    name_rule_object_types: tuple[str, ...] = ("PAY",)
     sma_increase_max_km: float = 1.0
     sma_drop_drag_multiple: float = 3.0
     sma_drop_floor_km: float = 1.0
     inclination_jump_max_deg: float = 0.05
+    exclude_history_spikes: bool = True
     status: str = "pending approval"
 
 
@@ -364,12 +386,36 @@ def _col(table: pa.Table, name: str) -> np.ndarray:
     return table.column(name).to_numpy(zero_copy_only=False)
 
 
-def _keep_constellation(table: pa.Table, cfg: CatalogFilterConfig) -> np.ndarray:
+def name_rule_matches(
+    names: Iterable[str | None],
+    object_types: Iterable[str | None],
+    cfg: CatalogFilterConfig,
+) -> np.ndarray:
+    """True where the constellation name rule removes a row (or SATCAT entry).
+
+    A row is removed when its object type is in ``cfg.name_rule_object_types`` and
+    its name starts with one of ``cfg.exclude_name_patterns`` (case-insensitive).
+    Shared by the catalog filter and the download's candidate rule, so both apply
+    exactly the same test.
+    """
+    names, types = list(names), list(object_types)
     if not cfg.exclude_name_patterns:
-        return np.ones(table.num_rows, dtype=bool)
+        return np.zeros(len(names), dtype=bool)
     pattern = re.compile("|".join(f"(?:{p})" for p in cfg.exclude_name_patterns), re.IGNORECASE)
-    names = table.column("object_name").to_pylist()
-    return np.array([not (n and pattern.match(n)) for n in names], dtype=bool)
+    applies = set(cfg.name_rule_object_types)
+    return np.array(
+        [bool(t in applies and n and pattern.match(n)) for n, t in zip(names, types, strict=True)],
+        dtype=bool,
+    )
+
+
+def _keep_constellation(table: pa.Table, cfg: CatalogFilterConfig) -> np.ndarray:
+    if cfg.name_rule_column not in ("satcat_name", "object_name"):
+        raise ValueError(
+            f"name_rule_column must be 'satcat_name' or 'object_name', got {cfg.name_rule_column!r}"
+        )
+    names = table.column(cfg.name_rule_column).to_pylist()
+    return ~name_rule_matches(names, table.column("object_type").to_pylist(), cfg)
 
 
 def _keep_not_operational_payload(table: pa.Table, cfg: CatalogFilterConfig) -> np.ndarray:
@@ -400,7 +446,202 @@ def _consecutive_pairs(table: pa.Table, *columns: str) -> tuple[np.ndarray, ...]
     return tuple(out)
 
 
-def maneuver_flagged_ids(table: pa.Table, sma_increase_max_km: float) -> set[int]:
+#: The element-history rules, in :data:`DEFAULT_RULES` order. Each flags an object
+#: from pairs of consecutive element sets; the spike rule applies to all three.
+HISTORY_RULES: tuple[str, ...] = (
+    "no_sma_increase", "no_sma_unexplained_drop", "no_inclination_jump",
+)
+
+_HISTORY_COLUMNS: dict[str, tuple[str, ...]] = {
+    "no_sma_increase": ("semimajor_axis_km",),
+    "no_sma_unexplained_drop": ("semimajor_axis_km", "mean_motion_rev_per_day",
+                                "mean_motion_dot"),
+    "no_inclination_jump": ("inclination_deg",),
+}
+
+
+@dataclass(frozen=True)
+class HistoryRuleResult:
+    """One element-history rule evaluated on a table (see :func:`history_rule`).
+
+    Attributes:
+        rule: the rule's name (one of :data:`HISTORY_RULES`).
+        flagged_ids: NORAD IDs with at least one trip; the rule drops these objects.
+        trip_ids: the NORAD ID of each tripped pair, one entry per trip.
+        spike_ids: the NORAD ID of each element set the spike rule left out of the
+            rule's comparisons, one entry per set (empty without the spike rule).
+    """
+
+    rule: str
+    flagged_ids: set[int]
+    trip_ids: np.ndarray
+    spike_ids: np.ndarray
+
+
+def _pair_change_and_threshold(
+    rule: str, t: np.ndarray, v: dict[str, np.ndarray], params: Mapping[str, float]
+) -> tuple[np.ndarray, np.ndarray]:
+    """The quantity's change (later minus earlier) and the rule's threshold, per pair.
+
+    Pairs are consecutive entries of the sorted arrays (object boundaries are masked
+    by the caller). The threshold is a positive magnitude: a fixed value for the
+    SMA-rise and inclination rules, the drag allowance plus the floor for the
+    SMA-drop rule.
+    """
+    if rule == "no_sma_increase":
+        a = v["semimajor_axis_km"]
+        return a[1:] - a[:-1], np.full(a.size - 1, params["sma_increase_max_km"])
+    if rule == "no_sma_unexplained_drop":
+        a, n, nd = (v[c] for c in _HISTORY_COLUMNS[rule])
+        rate = np.maximum(drag_decay_rate_km_per_day(a[:-1], n[:-1], nd[:-1]),
+                          drag_decay_rate_km_per_day(a[1:], n[1:], nd[1:]))
+        dt_days = (t[1:] - t[:-1]) / 86400.0
+        allowance = params["sma_drop_drag_multiple"] * rate * dt_days + params["sma_drop_floor_km"]
+        return a[1:] - a[:-1], allowance
+    if rule == "no_inclination_jump":
+        i = v["inclination_deg"]
+        return i[1:] - i[:-1], np.full(i.size - 1, params["inclination_jump_max_deg"])
+    raise ValueError(f"not an element-history rule: {rule!r}")
+
+
+def _spike_rise_threshold(
+    rule: str, threshold: np.ndarray, params: Mapping[str, float]
+) -> np.ndarray | None:
+    """The threshold a rising leg must exceed for the spike rule, or None (same as falls).
+
+    For the SMA-drop rule a rising leg is tested against ``sma_drop_floor_km``
+    alone (approved 2026-11-27): drag never raises the semimajor axis, so the drag
+    allowance belongs only on the falling leg. The other rules use one threshold
+    for both legs.
+    """
+    if rule == "no_sma_unexplained_drop":
+        return np.full(threshold.size, params["sma_drop_floor_km"])
+    return None
+
+
+#: How each rule's spike legs are thresholded (recorded in the pool manifest).
+SPIKE_LEG_THRESHOLDS: dict[str, dict[str, str]] = {
+    "no_sma_increase": {"rise": "sma_increase_max_km", "fall": "sma_increase_max_km"},
+    "no_sma_unexplained_drop": {
+        "rise": "sma_drop_floor_km",
+        "fall": "sma_drop_drag_multiple x drag decay over the gap + sma_drop_floor_km",
+    },
+    "no_inclination_jump": {"rise": "inclination_jump_max_deg",
+                            "fall": "inclination_jump_max_deg"},
+}
+
+
+def _trips(rule: str, change: np.ndarray, threshold: np.ndarray) -> np.ndarray:
+    """Pairs the rule flags: a rise, a drop or either, beyond the pair's threshold."""
+    if rule == "no_sma_increase":
+        return change > threshold
+    if rule == "no_sma_unexplained_drop":
+        return -change > threshold
+    return np.abs(change) > threshold
+
+
+def isolated_spikes(
+    same: np.ndarray, change: np.ndarray, threshold: np.ndarray,
+    rise_threshold: np.ndarray | None = None,
+) -> np.ndarray:
+    """Element sets that go out past the threshold and come straight back (spikes).
+
+    Set ``j`` (an interior set of one object's sorted history) is a spike when its
+    change from the previous set and its change to the next set both exceed the
+    pair's threshold, in opposite directions: above both neighbours, or below both,
+    by more than the threshold. A spike is *isolated* when neither neighbour is a
+    spike, so two or more bad sets in a row, or an oscillation, are never left out.
+
+    Args:
+        same: per pair, True where both sets belong to one object.
+        change: per pair, later minus earlier.
+        threshold: per pair, the rule's positive threshold; a falling leg must
+            exceed it, and so must a rising leg unless ``rise_threshold`` is given.
+        rise_threshold: per pair, the positive threshold a rising leg must exceed
+            (default ``threshold``). The SMA-drop rule passes its floor here.
+
+    Returns:
+        A boolean mask over the sets (``len(same) + 1``).
+    """
+    n_sets = same.size + 1
+    up = change > (threshold if rise_threshold is None else rise_threshold)
+    down = change < -threshold
+    spike = np.zeros(n_sets, dtype=bool)
+    if n_sets >= 3:
+        out_up, out_down, back_up, back_down = up[:-1], down[:-1], up[1:], down[1:]
+        both = same[:-1] & same[1:]
+        spike[1:-1] = both & ((out_up & back_down) | (out_down & back_up))
+    isolated = spike.copy()
+    isolated[1:] &= ~spike[:-1]
+    isolated[:-1] &= ~spike[1:]
+    return isolated
+
+
+def history_rule(
+    table: pa.Table, rule: str, params: Mapping[str, float] | CatalogFilterConfig,
+    exclude_spikes: bool = False,
+) -> HistoryRuleResult:
+    """Evaluate one element-history rule on every object of ``table``.
+
+    Element sets are ordered by epoch per object and compared pairwise:
+
+    * ``no_sma_increase``: a mean semimajor-axis rise above ``sma_increase_max_km``
+      (drag only lowers it);
+    * ``no_sma_unexplained_drop``: a fall larger than ``sma_drop_drag_multiple`` x the
+      drag decay implied by the sets' ``MEAN_MOTION_DOT`` over the gap +
+      ``sma_drop_floor_km``;
+    * ``no_inclination_jump``: a mean-inclination change above
+      ``inclination_jump_max_deg``.
+
+    **Spike rule** (``exclude_spikes``; approved 2026-11-27): an isolated element set
+    that departs from both of its neighbours by more than this rule's threshold, in
+    opposite directions (out and back, see :func:`isolated_spikes`), is left out of
+    this rule's comparisons, and its two neighbours are compared with each other
+    instead (over the combined gap). The set stays in the pool, and each rule finds
+    its own spikes. Both legs use the rule's threshold, except that the SMA-drop
+    rule tests a rising leg against ``sma_drop_floor_km`` alone (drag never raises
+    the orbit; see :data:`SPIKE_LEG_THRESHOLDS`). A lone out-and-back set is a bad
+    element set, not a maneuver; a maneuver is a step that later sets keep. Limits:
+    a maneuver undone at the very next set looks like a spike and is missed, and a
+    bad first or last set of a history has only one neighbour and still trips the
+    rule.
+
+    Args:
+        table: element sets with ``norad_id``, ``epoch_tt_s`` and the rule's columns.
+        rule: one of :data:`HISTORY_RULES`.
+        params: a :class:`CatalogFilterConfig` or a mapping with the rule's thresholds.
+        exclude_spikes: apply the spike rule.
+    """
+    if isinstance(params, CatalogFilterConfig):
+        params = {f.name: getattr(params, f.name) for f in fields(params)}
+    empty = np.zeros(0, dtype=np.int64)
+    if table.num_rows == 0:
+        return HistoryRuleResult(rule, set(), empty, empty)
+    ids = _col(table, "norad_id")
+    t = _col(table, "epoch_tt_s").astype(np.float64)
+    order = np.lexsort((t, ids))
+    ids, t = ids[order], t[order]
+    v = {c: table.column(c).to_numpy(zero_copy_only=False).astype(np.float64)[order]
+         for c in _HISTORY_COLUMNS[rule]}
+    spike_ids = empty
+    if exclude_spikes:
+        change, thr = _pair_change_and_threshold(rule, t, v, params)
+        spikes = isolated_spikes(ids[1:] == ids[:-1], change, thr,
+                                 _spike_rise_threshold(rule, thr, params))
+        spike_ids = ids[spikes]
+        ids, t = ids[~spikes], t[~spikes]
+        v = {c: x[~spikes] for c, x in v.items()}
+    if ids.size < 2:
+        return HistoryRuleResult(rule, set(), empty, spike_ids)
+    change, thr = _pair_change_and_threshold(rule, t, v, params)
+    trip = (ids[1:] == ids[:-1]) & _trips(rule, change, thr)
+    trip_ids = ids[1:][trip]
+    return HistoryRuleResult(rule, {int(x) for x in trip_ids}, trip_ids, spike_ids)
+
+
+def maneuver_flagged_ids(
+    table: pa.Table, sma_increase_max_km: float, exclude_spikes: bool = False
+) -> set[int]:
     """NORAD IDs whose mean semimajor axis rises by more than the threshold.
 
     Element sets are ordered by epoch per object; a rise between consecutive
@@ -409,12 +650,10 @@ def maneuver_flagged_ids(table: pa.Table, sma_increase_max_km: float) -> set[int
     :func:`sma_drop_flagged_ids` and plane changes by
     :func:`inclination_jump_flagged_ids`. Fit noise can trip any of the three
     at small thresholds; small maneuvers slip under all of them.
+    ``exclude_spikes``: the spike rule of :func:`history_rule`.
     """
-    if table.num_rows == 0:
-        return set()
-    ids, same, _, (a0, a1) = _consecutive_pairs(table, "semimajor_axis_km")
-    jump = (a1 - a0) > sma_increase_max_km
-    return {int(x) for x in ids[same & jump]}
+    params = {"sma_increase_max_km": sma_increase_max_km}
+    return history_rule(table, "no_sma_increase", params, exclude_spikes).flagged_ids
 
 
 def drag_decay_rate_km_per_day(
@@ -437,7 +676,7 @@ def drag_decay_rate_km_per_day(
 
 
 def sma_drop_flagged_ids(
-    table: pa.Table, drag_multiple: float, floor_km: float
+    table: pa.Table, drag_multiple: float, floor_km: float, exclude_spikes: bool = False
 ) -> set[int]:
     """NORAD IDs whose mean semimajor axis falls faster than drag can explain.
 
@@ -449,54 +688,40 @@ def sma_drop_flagged_ids(
     ``drag_multiple * allowance + floor_km`` is taken as an orbit-lowering
     maneuver. The floor absorbs fit noise between element sets; the multiple
     absorbs drag that changes faster than the derivative suggests.
+    ``exclude_spikes``: the spike rule of :func:`history_rule`; a falling leg
+    must exceed the allowance plus the floor, a rising leg the floor alone.
 
     Limits: a lowering burn smaller than the floor plus the drag allowance is
     missed, and so is any maneuver hidden inside a long gap between sets.
     """
-    if table.num_rows == 0:
-        return set()
-    ids, same, dt, (a0, a1), (n0, n1), (nd0, nd1) = _consecutive_pairs(
-        table, "semimajor_axis_km", "mean_motion_rev_per_day", "mean_motion_dot"
-    )
-    rate = np.maximum(
-        drag_decay_rate_km_per_day(a0, n0, nd0), drag_decay_rate_km_per_day(a1, n1, nd1)
-    )
-    drop = a0 - a1
-    flagged = drop > drag_multiple * rate * dt + floor_km
-    return {int(x) for x in ids[same & flagged]}
+    params = {"sma_drop_drag_multiple": drag_multiple, "sma_drop_floor_km": floor_km}
+    return history_rule(table, "no_sma_unexplained_drop", params, exclude_spikes).flagged_ids
 
 
-def inclination_jump_flagged_ids(table: pa.Table, max_deg: float) -> set[int]:
+def inclination_jump_flagged_ids(
+    table: pa.Table, max_deg: float, exclude_spikes: bool = False
+) -> set[int]:
     """NORAD IDs whose mean inclination changes by more than ``max_deg`` between sets.
 
     Drag barely changes inclination, and natural changes in SGP4 mean
     inclination over days to weeks are small, so a step is taken as a plane
     change. Over very long gaps slow natural drift adds up; the threshold is
     applied per pair regardless of the gap.
+    ``exclude_spikes``: the spike rule of :func:`history_rule`.
     """
-    if table.num_rows == 0:
-        return set()
-    ids, same, _, (i0, i1) = _consecutive_pairs(table, "inclination_deg")
-    jump = np.abs(i1 - i0) > max_deg
-    return {int(x) for x in ids[same & jump]}
+    params = {"inclination_jump_max_deg": max_deg}
+    return history_rule(table, "no_inclination_jump", params, exclude_spikes).flagged_ids
 
 
 def _keep_not_flagged(flagged: set[int], table: pa.Table) -> np.ndarray:
     return ~np.isin(_col(table, "norad_id"), list(flagged))
 
 
-def _keep_no_sma_increase(table: pa.Table, cfg: CatalogFilterConfig) -> np.ndarray:
-    return _keep_not_flagged(maneuver_flagged_ids(table, cfg.sma_increase_max_km), table)
-
-
-def _keep_no_sma_drop(table: pa.Table, cfg: CatalogFilterConfig) -> np.ndarray:
-    flagged = sma_drop_flagged_ids(table, cfg.sma_drop_drag_multiple, cfg.sma_drop_floor_km)
-    return _keep_not_flagged(flagged, table)
-
-
-def _keep_no_inclination_jump(table: pa.Table, cfg: CatalogFilterConfig) -> np.ndarray:
-    flagged = inclination_jump_flagged_ids(table, cfg.inclination_jump_max_deg)
-    return _keep_not_flagged(flagged, table)
+def _keep_history(rule: str) -> Callable[[pa.Table, CatalogFilterConfig], np.ndarray]:
+    def keep(table: pa.Table, cfg: CatalogFilterConfig) -> np.ndarray:
+        res = history_rule(table, rule, cfg, exclude_spikes=cfg.exclude_history_spikes)
+        return _keep_not_flagged(res.flagged_ids, table)
+    return keep
 
 
 #: The default rules, applied in this order.
@@ -536,26 +761,32 @@ DEFAULT_RULES: tuple[FilterRule, ...] = (
         _keep_not_operational_payload, ("object_type", "ops_status"),
     ),
     FilterRule(
-        "not_maneuvering_constellation", "name matches none of exclude_name_patterns",
-        _keep_constellation, ("object_name",),
+        "not_maneuvering_constellation",
+        "not an object of a type in name_rule_object_types whose name (name_rule_column) "
+        "starts with one of exclude_name_patterns",
+        # needs both name columns so a config switch can't hit a missing column late
+        _keep_constellation, ("object_name", "satcat_name", "object_type"),
     ),
     FilterRule(
         "no_sma_increase",
-        "object's element history has no mean-SMA rise > sma_increase_max_km",
-        _keep_no_sma_increase, ("norad_id", "epoch_tt_s", "semimajor_axis_km"),
+        "object's element history has no mean-SMA rise > sma_increase_max_km "
+        "(isolated out-and-back sets left out when exclude_history_spikes)",
+        _keep_history("no_sma_increase"), ("norad_id", "epoch_tt_s", "semimajor_axis_km"),
     ),
     FilterRule(
         "no_sma_unexplained_drop",
         "object's element history has no mean-SMA drop > sma_drop_drag_multiple x the "
-        "drag decay implied by mean_motion_dot over the gap + sma_drop_floor_km",
-        _keep_no_sma_drop,
+        "drag decay implied by mean_motion_dot over the gap + sma_drop_floor_km "
+        "(isolated out-and-back sets left out when exclude_history_spikes)",
+        _keep_history("no_sma_unexplained_drop"),
         ("norad_id", "epoch_tt_s", "semimajor_axis_km", "mean_motion_rev_per_day",
          "mean_motion_dot"),
     ),
     FilterRule(
         "no_inclination_jump",
-        "object's element history has no mean-inclination change > inclination_jump_max_deg",
-        _keep_no_inclination_jump, ("norad_id", "epoch_tt_s", "inclination_deg"),
+        "object's element history has no mean-inclination change > inclination_jump_max_deg "
+        "(isolated out-and-back sets left out when exclude_history_spikes)",
+        _keep_history("no_inclination_jump"), ("norad_id", "epoch_tt_s", "inclination_deg"),
     ),
 )
 

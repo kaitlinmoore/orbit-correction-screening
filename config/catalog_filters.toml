@@ -3,7 +3,8 @@
 #
 # Status: approved 2026-11-23 (LEO bounds, B* range, object types including
 # debris, ephemeris type, non-maneuvering rule). The element-history thresholds
-# in part 3 were chosen when the rule was approved; see docs/changelog.md.
+# in part 3 were chosen when the rule was approved; see docs/changelog.md. The
+# spike rule in part 3 was approved 2026-11-27.
 
 [catalog_filters]
 status = "approved 2026-11-23"
@@ -42,6 +43,14 @@ exclude_name_patterns = [
     "STARLINK", "ONEWEB", "KUIPER", "IRIDIUM", "GLOBALSTAR", "ORBCOMM",
     "QIANFAN", "GUOWANG", "FLOCK", "LEMUR",
 ]
+# Which name the patterns are tested on (decided 2026-11-24): "satcat_name", the
+# object's current CelesTrak SATCAT name, one name per object over its whole history.
+# Bulk TLE histories carry no names, and an element set's own name ("object_name")
+# can differ from the name the object got later.
+name_rule_column = "satcat_name"
+# Object types the name rule applies to (decided 2026-11-24): payloads only. Debris and
+# rocket bodies named after a constellation (for example IRIDIUM 33 DEB) can't maneuver.
+name_rule_object_types = ["PAY"]
 
 # Part 3 (element histories). Consecutive element sets of one object, by epoch;
 # any flag drops the whole object.
@@ -54,3 +63,14 @@ sma_drop_drag_multiple = 3.0
 sma_drop_floor_km = 1.0
 # (c) Plane change: a mean-inclination change above this.
 inclination_jump_max_deg = 0.05
+# (d) Spike rule (approved 2026-11-27; thresholds above unchanged): each of (a)-(c)
+#     leaves out of its comparisons a single element set that departs from both of
+#     its neighbours by more than that rule's threshold, in opposite directions (out
+#     and back), and compares the neighbours with each other instead. The set stays
+#     in the pool. "Single": a set whose neighbour is also a spike is not left out.
+#     A lone out-and-back set is a bad element set; a maneuver is a step later sets
+#     keep. A maneuver undone by the very next set is missed (stated limitation).
+#     Legs: each leg uses its rule's threshold, except that for (b) a rising leg
+#     needs only sma_drop_floor_km (drag never raises the orbit; approved
+#     2026-11-27); its falling leg keeps the drag allowance plus the floor.
+exclude_history_spikes = true

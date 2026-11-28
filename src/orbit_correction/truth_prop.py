@@ -318,7 +318,7 @@ def _omm_record_elset(record: dict, epoch_utc: str | None = None):
     rec = dict(record)
     if epoch_utc is not None:
         rec["EPOCH"] = epoch_utc
-    return catalog._records_to_table([rec], "omm_record")
+    return catalog.records_to_table([rec], "omm_record")
 
 
 def initial_state_from_omm(record: dict, epoch_utc: str | None = None) -> tuple[Trajectory, float]:

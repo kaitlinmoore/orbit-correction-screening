@@ -416,10 +416,15 @@ def test_sgp4_floor_drops_the_window(elsets, sw, cfg, grid):
 def test_drop_priority_with_two_causes(elsets, sw, cfg, grid):
     """Which status a window gets when two causes apply; every cause stays in ``causes``.
 
-    The order is ``DROP_STATUSES``: truth_error, sgp4_error, truth_reentry, sgp4_floor.
-    Each pair below is one a real batch can produce.
+    The order is ``DROP_STATUSES``: truth_error, truth_fit_failed, sgp4_error,
+    truth_reentry, sgp4_floor, rtn_domain (the last is recorded by generation when the
+    builder raises; see
+    ``tests/test_generation.py``). Each pair below is one a real batch can produce.
     """
-    assert R.DROP_STATUSES == ("truth_error", "sgp4_error", "truth_reentry", "sgp4_floor")
+    assert R.DROP_STATUSES == (
+        "truth_error", "truth_fit_failed", "sgp4_error", "truth_reentry", "sgp4_floor",
+        "rtn_domain",
+    )
     el = one(elsets, 25544, bstar_per_earth_radii=0.1)
     floored = C.propagate_sgp4_from_epoch(el, grid)[0]
     coded = C.propagate_sgp4_from_epoch(el, grid, floor_km=None)[0]
@@ -448,6 +453,20 @@ def test_drop_priority_with_two_causes(elsets, sw, cfg, grid):
 
     # counted under the status that won, in the window's stratum
     assert R.count_windows([res]) == {("truth_error", "400-600", ">=150"): 1}
+
+
+def test_truth_fit_failed_drops_the_window(elsets, sw, cfg, grid):
+    """A fitted start that did not converge: no rows, its own status, never a fallback."""
+    el, sgp4 = window(elsets, 25544, grid)
+    failed = TruthResult(norad_id=25544, status="fit_failed", message="not_converged")
+    res = R.build_window_rows(el, sgp4, failed, sw, "train", grid, cfg)
+    assert res.status == "truth_fit_failed" and res.causes == ("truth_fit_failed",)
+    assert res.table is None and res.truth_status == "fit_failed"
+    # with SGP4 also cut at the floor, the fit failure names the window
+    el2 = one(elsets, 25544, bstar_per_earth_radii=0.1)
+    floored = C.propagate_sgp4_from_epoch(el2, grid)[0]
+    res = R.build_window_rows(el2, floored, failed, sw, "train", grid, cfg)
+    assert res.causes == ("truth_fit_failed", "sgp4_floor")
 
 
 def test_truth_error_drops_and_counts_by_stratum(elsets, sw, cfg, grid):

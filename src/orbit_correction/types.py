@@ -42,8 +42,14 @@ Angles of the truth position in that frame:
   from the cheap orbit plane, positive on the ``+n`` side.
 * ``r_p = r_t - (r_t . n) n``: truth position projected onto the cheap plane.
 * ``du = atan2((r_p x r_c) . n, r_p . r_c)``: in-plane angle **from** ``r_p``
-  **to** ``r_c``, measured about ``n``, in (-pi, pi]. Positive when the cheap
-  position is *ahead* of the truth position in the direction of motion.
+  **to** ``r_c``, measured about ``n``, in (-pi, pi] at one instant. Positive when
+  the cheap position is *ahead* of the truth position in the direction of motion.
+  In the residual dataset, ``du`` is the along-track angle **unwrapped
+  continuously in time from the prediction start** ``t0`` (decided 2026-11-25):
+  cheap and truth start together, so ``du`` starts near 0, and each horizon's
+  value is the previous one plus the change between them. It equals the
+  atan2 value modulo a full turn, and the two agree exactly while the angle
+  stays in (-pi, pi].
 
 Components (all km, all cheap minus truth):
 
@@ -51,7 +57,7 @@ Components (all km, all cheap minus truth):
 * **T (along-track)** ``= |r_c| * du``. Positive when the cheap position is ahead
   of truth along the direction of motion. Arc length at the cheap radius, so a
   large along-track error does not leak into R the way it does in rectilinear
-  RTN.
+  RTN. With ``du`` unwrapped, T can exceed a quarter orbit (or a whole one).
 * **N (cross-track)** ``= |r_c| * (0 - phi_t) = -|r_c| * phi_t``. The cheap
   position has out-of-plane angle 0 by construction, so cheap minus truth is
   ``-phi_t``. N is positive when the cheap position lies on the ``+n`` side of
@@ -65,10 +71,34 @@ Inverse (how a correction is applied). Given ``r_c``, ``v_c`` and (R, T, N):
 3. ``r_t = rho * (cos(phi) d + sin(phi) n)``.
 
 The inverse is exact (it is a spherical coordinate system attached to the cheap
-state) provided ``|du| < pi`` and the cheap angular momentum is non-zero. A model
+state) for any ``du``, wrapped or unwrapped (``cos`` and ``sin`` ignore whole
+turns), provided the cheap angular momentum is non-zero. A model
 that predicts (R, T, N) from features is turned into a corrected position with
 this inverse, using nothing but the cheap state. Velocity residuals are not part
 of the target. Total miss distance in screening stays Cartesian.
+
+Domain limits of the implementation (approved 2026-11-24, along-track angle revised
+2026-11-25; documentation only, no schema, column or unit changes).
+``orbit_correction.residuals`` refuses, with ``RTNDomainError``, rather than wrap or
+extrapolate:
+
+* Along a window (``rtn_from_window``, which builds the dataset's targets): a first
+  horizon with ``|du| > pi/2``, or a change of ``du`` between consecutive horizons
+  of more than ``pi/2`` (``MAX_DU_STEP_RAD``), a continuity break where the
+  unwrapped angle would be ambiguous. Generation counts such windows as their own
+  drop status (``rtn_domain``).
+* For a single state with no history (``rtn_from_states``): ``|du| > pi/2``
+  (``MAX_ABS_DU_RAD``), an along-track separation of more than a quarter orbit,
+  about 10,500 km at LEO radii. At one instant ``du`` is defined modulo a full turn
+  and jumps sign near ``pi``, so larger values are ambiguous.
+* ``|phi_t| > pi/4`` (``MAX_ABS_PHI_RAD``): truth far out of the cheap plane; ``du``
+  is undefined at ``phi_t = +-pi/2`` and badly conditioned near it.
+* ``|r_c x v_c| < 1e-6 |r_c| |v_c|`` (``H_REL_MIN``, a velocity within about 6e-5
+  degrees of radial), or zero or non-finite inputs: the orbit normal ``n`` is
+  undefined.
+
+The inverse accepts any ``du`` and one float64 step more than the ``phi`` limit,
+so every residual a forward map returns can be inverted.
 """
 
 from __future__ import annotations

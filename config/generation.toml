@@ -1,0 +1,56 @@
+# Residual-dataset generation: window sampling, stage sizes and run settings
+# (read by orbit_correction.generation.load_generation_config).
+# Every value here is an instrument: log changes in docs/changelog.md.
+#
+# Status: approved 2026-11-25 (proposed 2026-11-24). The stage sizes and the
+# start-spacing rule come from decision 3(c) (approved 2026-11-24); the sampling rule
+# (uniform over an object's eligible element sets, in rounds), the cap, the run
+# settings and the eccentricity bins were approved 2026-11-25, and the fit-misfit flag
+# added then.
+
+[generation]
+status = "approved 2026-11-25"
+
+[generation.sampling]
+# Seed of every draw: the order in which an object's eligible epochs are tried, the
+# order of objects within a round, and the daily-Ap subsample.
+seed = 20261124
+# Split labels windows are drawn from. Test-role and reserved rows are never drawn.
+roles = ["train", "dev"]
+# An object's starts are at least this far apart (decision 3(c): at least a week), so
+# one object's 7-day windows never overlap.
+min_start_spacing_days = 7.0
+# Starts per object, over all stages. Rounds give every object one start before any
+# gets a second, so the cap matters only near the ceiling.
+max_starts_per_object = 50
+
+# Target window counts (decision 3(c)): pilot, first batch, then extend toward the
+# ceiling only while dev error is still clearly falling. A smaller stage is the first
+# part of a larger one (same seed), so pilot windows are reused in the first batch.
+[generation.stages]
+pilot = 5000
+first_batch = 50000
+ceiling = 300000
+
+[generation.run]
+# Windows per chunk: one Parquet file and one log file each; memory is bounded by a
+# chunk (about 41 kB of rows per window in memory).
+chunk_windows = 500
+# Truth worker processes, one JVM each (capped at 2 processors per JVM in
+# config/truth.toml). 22 of 24 logical CPUs leaves the parent process and the system
+# two.
+n_workers = 22
+# Windows in the daily-Ap (msis_ap_switch = +1) sensitivity subsample of a stage.
+dailyap_windows = 200
+
+[generation.coverage]
+# Reporting bins of the element set's eccentricity (labels as in config/residuals.toml:
+# "<0.001", "0.001-0.005", "0.005-0.02", ">=0.02"). Not a model input; coverage and
+# error reports only.
+eccentricity_edges = [0.001, 0.005, 0.02]
+
+[generation.flags]
+# A window whose fitted truth start misfits SGP4 by more than this RMS over the fit
+# span gets the log flag "fit_rms_above_threshold" (decided 2026-11-25: a flag, not a
+# drop; the window is kept). The first pilot's fits: 34 m median RMS, 3.7 km maximum.
+fit_rms_flag_m = 1000.0

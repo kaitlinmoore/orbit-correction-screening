@@ -114,7 +114,8 @@ def test_config_file_matches_code_defaults():
     for name in ("perigee_min_km", "apogee_max_km", "bstar_min_exclusive", "bstar_max",
                  "ephemeris_types", "object_types", "exclude_ops_status",
                  "sma_increase_max_km", "sma_drop_drag_multiple", "sma_drop_floor_km",
-                 "inclination_jump_max_deg"):
+                 "inclination_jump_max_deg", "name_rule_column", "name_rule_object_types",
+                 "exclude_history_spikes"):
         assert getattr(cfg, name) == getattr(default, name), name
     assert cfg.status == "approved 2026-11-23"
     assert {"STARLINK", "FLOCK", "LEMUR"} <= set(cfg.exclude_name_patterns)
@@ -127,14 +128,44 @@ def test_approved_values():
     assert cfg.object_types == ("PAY", "R/B", "DEB") and cfg.ephemeris_types == (0,)
 
 
+def _with(t, **cols):
+    for name, values in cols.items():
+        t = t.set_column(t.column_names.index(name), name, pa.array(values))
+    return t
+
+
 def test_name_rule_catches_flock_and_lemur(gp_sat):
     cfg = C.load_filter_config(REPO / "config" / "catalog_filters.toml")
     names = ["FLOCK 4P-1", "LEMUR-2-JOHANLORAN", "Lemur-2-x", "SYNTH FLOCKISH"]
-    t = gp_sat.slice(0, 4)
-    i = t.column_names.index("object_name")
-    t = t.set_column(i, "object_name", pa.array(names))
+    t = _with(gp_sat.slice(0, 4), satcat_name=names, object_type=["PAY"] * 4)
     rule = next(r for r in C.DEFAULT_RULES if r.name == "not_maneuvering_constellation")
     assert rule.keep(t, cfg).tolist() == [False, False, False, True]
+
+
+def test_name_rule_reads_satcat_names_of_payloads_only(gp_sat):
+    """Decided 2026-11-24: SATCAT names, payloads only; constellation debris is kept."""
+    cfg = C.load_filter_config(REPO / "config" / "catalog_filters.toml")
+    assert cfg.name_rule_column == "satcat_name" and cfg.name_rule_object_types == ("PAY",)
+    rule = next(r for r in C.DEFAULT_RULES if r.name == "not_maneuvering_constellation")
+    t = _with(
+        gp_sat.slice(0, 5),
+        satcat_name=["IRIDIUM 33 DEB", "STARLINK-1008", "ORBCOMM FM5 R/B", "OBJECT A",
+                     "STARLINK-30000"],
+        object_name=["IRIDIUM 33 DEB", "STARLINK-1008", "ORBCOMM FM5 R/B", "OBJECT A",
+                     "TBA - TO BE ASSIGNED"],
+        object_type=["DEB", "PAY", "R/B", "PAY", "PAY"],
+    )
+    # debris and rocket bodies kept; payloads go by their SATCAT name, so an early
+    # element set still named "TBA" goes when the object is now STARLINK-30000
+    assert rule.keep(t, cfg).tolist() == [True, False, True, True, False]
+    # the element set's own name and every type: the earlier behaviour
+    old = C.CatalogFilterConfig(
+        exclude_name_patterns=cfg.exclude_name_patterns, name_rule_column="object_name",
+        name_rule_object_types=("PAY", "R/B", "DEB"),
+    )
+    assert rule.keep(t, old).tolist() == [False, False, False, True, True]
+    with pytest.raises(ValueError, match="name_rule_column"):
+        rule.keep(t, C.CatalogFilterConfig(exclude_name_patterns=("X",), name_rule_column="x"))
 
 
 def test_default_filters_on_fixture(gp_sat):
@@ -217,6 +248,8 @@ def _synthetic_history(
     ``events`` are ``(day, kind, size)``: ``("sma", -3.0)`` lowers the orbit by
     3 km from that day on, ``("inc", 0.1)`` changes the inclination by 0.1 deg,
     ``("rate", 3.0)`` multiplies the decay rate from that day on (a storm).
+    ``("sma_spike", 3.0)`` and ``("inc_spike", 0.1)`` change that day's set only
+    (a bad element set: out and back).
     """
     rng = np.random.default_rng(seed)
     recs = []
@@ -231,18 +264,24 @@ def _synthetic_history(
                 elif kind == "rate":
                     rate *= size
         a_fit = a + noise_km * rng.standard_normal()
+        inc_fit = inc
+        for day, kind, size in events:
+            if day == d and kind == "sma_spike":
+                a_fit += size
+            elif day == d and kind == "inc_spike":
+                inc_fit += size
         n = np.sqrt(C.MU_WGS72_KM3_S2 / a_fit**3) * 86400 / (2 * np.pi)
         # da/dt = -(2/3)(a/n) dn/dt  ->  MEAN_MOTION_DOT = dn/dt / 2
         ndot_half = rate * 1.5 * n / a_fit / 2
         recs.append({
             "NORAD_CAT_ID": nid, "OBJECT_NAME": "SYNTH", "OBJECT_ID": "2000-000Z",
             "EPOCH": f"2024-03-{d + 1:02d}T00:00:00", "MEAN_MOTION": n, "ECCENTRICITY": 0.001,
-            "INCLINATION": inc, "RA_OF_ASC_NODE": 10.0, "ARG_OF_PERICENTER": 20.0,
+            "INCLINATION": inc_fit, "RA_OF_ASC_NODE": 10.0, "ARG_OF_PERICENTER": 20.0,
             "MEAN_ANOMALY": 30.0, "BSTAR": 1e-4, "MEAN_MOTION_DOT": ndot_half,
             "MEAN_MOTION_DDOT": 0.0, "EPHEMERIS_TYPE": 0,
         })
         a -= rate
-    return C._records_to_table(recs, "synthetic")
+    return C.records_to_table(recs, "synthetic")
 
 
 def _history_flags(table):
@@ -305,3 +344,127 @@ def test_history_rules_keep_objects_apart_and_ignore_order():
     # the jump between the last set of one object and the first of the next is not a pair
     lowered = _synthetic_history(nid=91003, a0_km=6700.0)
     assert C.sma_drop_flagged_ids(pa.concat_tables([clean, lowered]), 3.0, 1.0) == set()
+
+
+# ---------------------------------------------------------------- spike rule
+
+
+def _flags_without_spike_rule(table):
+    cfg = C.load_filter_config(REPO / "config" / "catalog_filters.toml")
+    cfg = C.CatalogFilterConfig(**{**cfg.__dict__, "exclude_history_spikes": False})
+    rules = [r for r in C.DEFAULT_RULES if r.name in C.HISTORY_RULES]
+    return C.apply_filters(table, cfg, rules=rules).rejected_by_rule
+
+
+def test_spike_rule_is_on_in_the_config():
+    assert C.load_filter_config(REPO / "config" / "catalog_filters.toml").exclude_history_spikes
+
+
+@pytest.mark.parametrize("size", [3.0, -3.0])
+def test_single_sma_spike_is_left_out(size):
+    t = _synthetic_history(decay_km_per_day=0.3, events=[(10, "sma_spike", size)])
+    before = _flags_without_spike_rule(t)
+    # out and back trips both SMA rules without the spike rule
+    assert before["no_sma_increase"] == before["no_sma_unexplained_drop"] == t.num_rows
+    assert _history_flags(t) == {"no_sma_increase": 0, "no_sma_unexplained_drop": 0,
+                                 "no_inclination_jump": 0}
+    cfg = C.load_filter_config(REPO / "config" / "catalog_filters.toml")
+    res = C.history_rule(t, "no_sma_increase", cfg, exclude_spikes=True)
+    assert res.spike_ids.tolist() == [91001] and res.trip_ids.size == 0
+    # the set stays in the pool: the rule only skips it
+    rule = [r for r in C.DEFAULT_RULES if r.name == "no_sma_increase"]
+    assert C.apply_filters(t, cfg, rules=rule).kept.num_rows == t.num_rows
+
+
+def test_single_inclination_spike_is_left_out():
+    t = _synthetic_history(events=[(7, "inc_spike", 0.1)])
+    assert _flags_without_spike_rule(t)["no_inclination_jump"] == t.num_rows
+    assert _history_flags(t)["no_inclination_jump"] == 0
+    assert C.inclination_jump_flagged_ids(t, 0.05) == {91001}
+    assert C.inclination_jump_flagged_ids(t, 0.05, exclude_spikes=True) == set()
+
+
+@pytest.mark.parametrize("events", [
+    [(7, "inc", 0.1)],                                   # a plane change: a step
+    [(10, "sma", 3.0)],                                  # a raise: a step
+    [(10, "sma_spike", 3.0), (11, "sma_spike", 3.0)],    # two bad sets in a row
+    [(10, "sma_spike", 3.0), (11, "sma_spike", -3.0)],   # an oscillation
+    [(19, "sma_spike", 3.0)],                            # the last set: one neighbour
+])
+def test_steps_runs_and_end_sets_still_trip(events):
+    t = _synthetic_history(decay_km_per_day=0.3, events=events)
+    flags = _history_flags(t)
+    assert sum(flags.values()) >= t.num_rows, flags
+
+
+def test_neighbours_of_a_spike_are_compared_over_the_combined_gap():
+    # a bad set on day 10, then a 4 km lowering burn on day 11: the spike is left out
+    # and day 9 -> day 11 still shows the burn (4.6 km against a 2.8 km allowance)
+    t = _synthetic_history(decay_km_per_day=0.3,
+                           events=[(10, "sma_spike", 3.0), (11, "sma", -4.0)])
+    cfg = C.load_filter_config(REPO / "config" / "catalog_filters.toml")
+    res = C.history_rule(t, "no_sma_unexplained_drop", cfg, exclude_spikes=True)
+    assert res.spike_ids.tolist() == [91001]
+    assert res.flagged_ids == {91001}
+
+
+def test_spikes_are_found_per_object():
+    # the last set of one object and the first of the next are not neighbours
+    clean = _synthetic_history(nid=91001)
+    high = _synthetic_history(nid=91002, a0_km=6790.0)
+    low = _synthetic_history(nid=91003, a0_km=6770.0)
+    both = pa.concat_tables([clean, high, low])
+    cfg = C.load_filter_config(REPO / "config" / "catalog_filters.toml")
+    for rule in C.HISTORY_RULES:
+        res = C.history_rule(both, rule, cfg, exclude_spikes=True)
+        assert res.spike_ids.size == 0 and res.flagged_ids == set(), rule
+
+
+def test_isolated_spikes_mask():
+    same = np.array([True, True, True, False, True, True])
+    change = np.array([2.0, -2.0, 0.0, 9.0, -2.0, 2.0])
+    thr = np.ones(6)
+    # set 1 is up and back; set 4 is the first set of the second object (no pair before
+    # it within its object); set 5 is down and back
+    assert C.isolated_spikes(same, change, thr).tolist() == [
+        False, True, False, False, False, True, False]
+    # adjacent spikes (an oscillation) are not isolated
+    osc = C.isolated_spikes(np.ones(3, bool), np.array([2.0, -4.0, 2.0]), np.ones(3))
+    assert osc.tolist() == [False, False, False, False]
+
+
+def test_isolated_spikes_rise_threshold_applies_to_rising_legs_only():
+    same = np.ones(2, bool)
+    fall_thr, rise_thr = np.full(2, 4.0), np.full(2, 1.0)
+    # down 5, back up 3: a spike only when rises are tested against 1, not 4
+    low = np.array([-5.0, 3.0])
+    assert C.isolated_spikes(same, low, fall_thr).tolist() == [False, False, False]
+    assert C.isolated_spikes(same, low, fall_thr, rise_thr).tolist() == [False, True, False]
+    # up 3, back down 3: the falling leg still has to beat 4
+    high = np.array([3.0, -3.0])
+    assert not C.isolated_spikes(same, high, fall_thr, rise_thr).any()
+    # up 3, back down 5: a spike with the rise threshold, not without it
+    assert C.isolated_spikes(same, np.array([3.0, -5.0]), fall_thr, rise_thr)[1]
+    assert not C.isolated_spikes(same, np.array([3.0, -5.0]), fall_thr)[1]
+    # a rising leg under the rise threshold is no spike
+    assert not C.isolated_spikes(same, np.array([-5.0, 0.5]), fall_thr, rise_thr).any()
+
+
+def test_sma_drop_spike_rule_tests_the_rising_leg_against_the_floor():
+    # 1 km/day of drag: the drop allowance per daily pair is 3 x 1 + 1 = 4 km. A bad
+    # set 4 km low falls 5 km (beyond the allowance) and comes back 3 km: above the
+    # 1 km floor but not above the allowance, so only the floor-alone rising leg sees
+    # the spike. Day 9 -> 11 then drops 2 km against a 7 km allowance.
+    t = _synthetic_history(decay_km_per_day=1.0, events=[(10, "sma_spike", -4.0)])
+    cfg = C.load_filter_config(REPO / "config" / "catalog_filters.toml")
+    off = C.history_rule(t, "no_sma_unexplained_drop", cfg, exclude_spikes=False)
+    assert off.flagged_ids == {91001} and off.trip_ids.size == 1
+    on = C.history_rule(t, "no_sma_unexplained_drop", cfg, exclude_spikes=True)
+    assert on.spike_ids.tolist() == [91001]
+    assert on.flagged_ids == set() and on.trip_ids.size == 0
+    # the other rules keep one threshold for both legs
+    assert C.SPIKE_LEG_THRESHOLDS["no_sma_unexplained_drop"]["rise"] == "sma_drop_floor_km"
+    for rule in ("no_sma_increase", "no_inclination_jump"):
+        legs = C.SPIKE_LEG_THRESHOLDS[rule]
+        assert legs["rise"] == legs["fall"]
+

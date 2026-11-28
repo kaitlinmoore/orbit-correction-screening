@@ -12,13 +12,25 @@ not tracked positions.
 
 ## Data
 
-- Element sets: CelesTrak GP (development, tests) and Space-Track `gp_history` (training and
-  test epochs; validation cases). Loading and filtering: `src/orbit_correction/catalog.py`.
+- Element sets: CelesTrak GP (development, tests); Space-Track's yearly bulk TLE files for
+  training and test epochs (decided 2026-11-24, following Space-Track's guidance to use the
+  bulk files for many objects or long date ranges): the 2015 to 2025 files, element sets
+  kept by epoch from 2015-01-01 to 2026-01-01 (the files are grouped by publication date,
+  not epoch); and Space-Track `gp_history` from 2004-01-01 to 2026-11-23 for the ten
+  validation-case objects only (one download, 148,602 element sets). **The test period is
+  2025 for now**: windows of any role must end within the downloaded history (before
+  2026-01-01). 2026 will be added when Space-Track publishes its 2026 file, as a
+  test-period extension only (training epochs end at the 2025-01-01 cutoff either way).
+  Loading and filtering: `src/orbit_correction/catalog.py`; the bulk TLE reader and the
+  download list: `src/orbit_correction/generation.py`.
 - Space weather: CelesTrak `SW-All.txt`, read by `src/orbit_correction/spaceweather.py`.
 - Filters and their values: `config/catalog_filters.toml` (approved 2026-11-23). LEO
   (perigee >= 250 km, apogee <= 2000 km), 0 < B* <= 0.01 /ER, SGP4 element sets only,
   payloads, rocket bodies and debris. Non-maneuvering: operational payloads (current SATCAT
-  status) and maneuvering constellations by name are dropped, and so is any object whose
+  status) and payloads of maneuvering constellations by their current SATCAT name are
+  dropped (decided 2026-11-24: the name rule reads SATCAT names, since bulk TLEs carry
+  none and an element set's own name can predate the object's naming, and it applies to
+  payloads only, so constellation debris such as Iridium 33's is kept), and so is any object whose
   element history shows a mean semimajor-axis rise, a drop larger than drag explains, or an
   inclination step. Each rule's rejections are reported by name.
 
@@ -283,19 +295,24 @@ horizon grid approved 2026-11-24 for the pilot). Contract: `RESIDUAL_SCHEMA` in 
   position from the SGP4 state and (R, T, N); it is how a model's prediction becomes a
   corrected position in screening. Round trip on 20,000 random LEO states (e up to 0.3,
   along-track up to 2,000 km): 8e-12 km.
-- **Domain.** The along-track angle is defined modulo a full turn, so the conversion
-  refuses angles above pi/2 (about 10,500 km of along-track error in LEO) rather than
-  wrap; it also refuses truth positions more than pi/4 out of the SGP4 orbit plane and
-  SGP4 states with (near-)radial velocity (limits approved 2026-11-24). The out-of-plane
-  and radial-velocity limits are far from anything measured. **The pi/2 limit is not:** it
-  is reachable at the low, high-drag edge of the catalog with both propagators still `ok`.
-  With real truth on synthetic element sets at 2024-06-15, 350 km perigee with B* = 0.01
-  /ER passes it at 6.7 days (T = 11,600 km at 7 days, 1.12 x the limit), and neighbouring
-  windows that are kept reach 4,500-8,100 km (43-77% of it). Such a window is refused, not
-  wrapped; generation is to count it as its own drop status (`rtn_domain`) by stratum and
-  report the count beside the lowest band's error statistics, because the windows it
-  removes are that band's largest errors. The inverse accepts one float64 step above the
-  forward limits, so every residual the forward conversion returns can be inverted.
+- **Domain.** At one instant the along-track angle is defined modulo a full turn, so the
+  single-state conversion (`rtn_from_states`) refuses angles above pi/2 (about 10,500 km
+  of along-track error in LEO) rather than wrap. That limit is reachable at the low,
+  high-drag edge of the catalog with both propagators still `ok`: with real truth on
+  synthetic element sets at 2024-06-15, 350 km perigee with B* = 0.01 /ER passes it at
+  6.7 days (T = 11,600 km at 7 days), and on the first pilot it refused 51 of the 448
+  windows in 250-400 km (11%), that band's largest errors. **Targets are therefore built
+  per window with the angle unwrapped (decided 2026-11-25).** `rtn_from_window` follows
+  the angle in time from the start, where it is near 0: the first horizon must be within
+  pi/2, and each step between consecutive horizons (wrapped to (-pi, pi]) must be at most
+  pi/2, otherwise the window is refused as a continuity break (`rtn_domain`). T can then
+  exceed a quarter orbit. Within (-pi, pi] the targets are bit-identical to the
+  single-state conversion. The conversion also refuses truth positions more than pi/4 out
+  of the SGP4 orbit plane and SGP4 states with (near-)radial velocity (limits approved
+  2026-11-24), both far from anything measured. The inverse accepts any along-track angle
+  (cos and sin ignore whole turns) and one float64 step above the pi/4 limit, so every
+  residual a forward conversion returns can be inverted. The single-state conversion keeps
+  its pi/2 limit for states with no history.
 - **Features.** The element set's mean elements, B* and mean-motion derivative; the four
   start-of-prediction space-weather values (see Model inputs). The `obs_*` columns, when
   computed, take each row's UTC day from OBSERVED rows only; a day without an observed row
@@ -325,6 +342,126 @@ Measured on six fixture objects moved to 2024-06-15 (solar maximum), with truth 
 epoch-state start rule (before the fitted start became the default): the residual at 60 s
 is 1.8-2.8 m (that rule's start offset), and the 7-day along-track residual runs from 9.7 km
 (770 km altitude) to 963 km (355 km), with R and N within a few km.
+
+## Residual generation
+
+Code: `src/orbit_correction/generation.py`; scripts `build_candidate_ids.py`,
+`extract_bulk_tle.py`, `build_pool.py`, `sample_windows.py`, `generate_residuals.py`,
+`pilot_report.py`; settings in `config/generation.toml` (approved 2026-11-25).
+
+- **Download list.** A superset of the objects the filters can keep, from SATCAT alone:
+  allowed object types and not an operational payload (both exact, the filter reads the
+  same columns), not launched after the span, not decayed more than 30 days before it,
+  SATCAT apogee at most 2,100 km (the LEO bound plus 100 km: apogee only falls under drag,
+  so the one assumption is that no object raised its orbit after the span; the margin also
+  covers SATCAT apogees 39 km below to 97 km above the loader's values), and the name rule
+  (exact, since the filter reads the same SATCAT names). No perigee test: perigee falls
+  under drag, so an object low now may have been above 250 km earlier. The validation-case
+  objects are always added.
+- **Bulk TLE reading.** TLE fields are read with the `sgp4` package's column layout and
+  arithmetic, so each element set gives the same `Satrec` as the library's reader except
+  for the epoch, which is converted to an ISO string rounded to the microsecond (the TLE
+  resolves 0.864 ms). Bad pairs (checksum, layout) and stray lines are counted per file.
+  File quirks: the 2015 file ends every line 1 with a backslash (removed and counted) and
+  carries macOS `__MACOSX` members (skipped). Most of the 2015-2020 files' element sets are
+  68-character lines with no checksum column (19.3 M of the 32.6 M kept from those files;
+  none from 2021 on): they are read when they pass the library reader's column-separator
+  checks and tagged `source = "spacetrack_bulk_tle_nochecksum"` (decided 2026-11-25),
+  since they are not duplicates and sit on the same orbit histories as the checksummed
+  sets. Pairs with a wrong checksum or layout are counted and left out. Each file's epoch
+  coverage by day is recorded: every year is covered through 31 December (31 December
+  2024 at 64% of that year's daily median, since the 2025 file holds 2025 epochs only).
+- **Pool.** Element sets in the span, exact duplicates removed (same object, epoch and
+  elements), reissues collapsed (decided 2026-11-25: an object's sets whose epochs are at
+  most 60 s apart, consecutive gaps chained, become the one with the highest element-set
+  number, ties to the set read last; groups, rows removed and ties are counted), SATCAT
+  attached, the
+  catalog filters applied with rows and objects removed reported per rule. The pool is
+  built per group of NORAD IDs, which changes nothing because every rule is per object.
+- **Spike rule in the element-history rules (decided 2026-11-27).** Each history rule
+  skips a single element set that departs from both of its neighbours by more than that
+  rule's threshold, in opposite directions (out and back), and compares the neighbours
+  with each other over the combined gap. The set stays in the pool, and each rule finds
+  its own spikes. For the SMA-drop rule the falling leg must exceed the pair's drag
+  allowance plus the floor and the rising leg the floor alone, since drag never raises
+  the orbit (decided 2026-11-27, from the fourth pool on). Only isolated spikes are skipped: two bad sets in a row, or an
+  oscillation, still trip the rule. A maneuver is a step that later sets keep; a set
+  that comes straight back is a bad element set. The pool manifest gives each rule's
+  trips and flagged objects with and without the spike rule.
+- **Limits of the element-history rules.** Thresholds are fixed per pair, whatever the
+  gap: over long gaps slow natural drift can trip the inclination rule, over short gaps
+  fit noise can trip the SMA rules, and many flagged objects trip once, just past a
+  threshold. A gap-aware threshold or a margin for near-threshold trips would keep more
+  objects, at the cost of missing more small maneuvers; neither is applied. A maneuver
+  undone at the very next element set looks like a spike and is missed, and a bad first
+  or last set of a history still trips its rule.
+- **Split.** Every pool element set is labeled as a window start with
+  `splits.assign_split_labels`; the last fully observed space-weather day, the seed and
+  the config hashes are recorded with it. Then one rule of the download (decided
+  2026-11-25): a window of any role ending after the end of the downloaded history
+  (2026-01-01 today) is labeled `excluded`, counted by its original label. Only counts per
+  label are reported.
+- **Window sampling (approved 2026-11-25).** Starts at element-set epochs, train and dev rows only.
+  Per object, its eligible epochs are tried in a seeded random order and a start is kept
+  if it is at least 7 days from the object's other starts, up to a cap. Across objects,
+  round k takes every object's k-th start (objects in a seeded order), so every object
+  has one start before any has two, and a smaller stage is the first part of a larger one.
+  Uniform over element sets means better-tracked periods get more starts; coverage is
+  reported by year, altitude band, solar bin, eccentricity bin and split.
+- **Runs.** Chunks of windows: SGP4, its epoch states and, under the fitted start, the SGP4
+  samples over the 0.25 days before each epoch (`truth_prop.fit_samples_from_elsets`) in
+  the parent process (no JVM), passed to each truth job; truth in spawned workers that
+  keep their JVM for the whole run, rows from
+  `build_window_rows`, one zstd Parquet file per chunk. A chunk is done when its marker,
+  written last, names the same windows and both of its files still hash to what the
+  marker recorded; a rerun skips done chunks and redoes the rest. One space-weather copy
+  covers the run from the earliest epoch minus the fit span to the latest window end,
+  checked by the existing range and 41-day margin guards (from each job's first fit
+  sample). A worker that dies breaks the pool (`BrokenProcessPool`): nothing of that chunk
+  has been written, the chunk is retried on a fresh pool up to three attempts, and every
+  crash is recorded (`crashes.jsonl`, counted in the manifest).
+- **Window fates.** Every sampled window gets one log record and one status: `ok`, the
+  row builder's drops (`truth_error`, `truth_fit_failed` for a fitted start that did not
+  converge, `sgp4_error`, `truth_reentry`, `sgp4_floor`), the conversion's refusal
+  (`rtn_domain`), or one of three statuses for windows that get no truth job: no SGP4
+  state at the epoch (`start_below_floor`, `start_sgp4_error`), or no usable SGP4 samples
+  over the fit span (`fit_samples_unavailable`). A window without fit samples is never
+  started some other way. The log also carries each fit's status, passes and misfit (a
+  flag, `fit_rms_above_threshold`, for an RMS misfit above 1 km: kept, not dropped), and
+  each kept window's largest along-track angle and angle step. Counts by
+  status, altitude band and solar bin go into the run manifest, with the code commit,
+  config hashes, orekit-data commit, the space-weather copy's hash and range, the last
+  observed day and the seed.
+- **Daily-Ap sensitivity.** A run option sets NRLMSISE-00 switch 9 to +1 (daily Ap) for a
+  subsample of the same windows and labels every output `dailyap`; `config/truth.toml`
+  is not changed. The subsample is the 200 windows with the smallest seeded hash of
+  their identity, (NORAD ID, start epoch) (decided 2026-11-27), so a window's draw does
+  not depend on the rest of the sample; the two pilots' subsamples were drawn by
+  position.
+
+**Pilot (exploratory, 2026-11-25; train and dev rows only).**
+- **Pool and split:**
+  - 75.3 M element sets of the candidate objects in the span, 8.05 M exact duplicates removed; the filters keep 54.4 M sets of 17,565 objects.
+  - The SMA-rise rule removes the most objects (1,594), often on a single rise of a few km between sets seconds apart.
+  - Train has 32.8 M rows on 11,821 objects; dev 5.8 M rows on 2,099 objects.
+- **Sample:** 5,000 windows, one each on 5,000 objects, from 2015 to 2024.
+- **Window fates:**
+  - 4,934 `ok`;
+  - 51 `rtn_domain`, all in the 250-400 km band: 11% of that band's windows, its largest errors;
+  - 10 `truth_reentry` and 5 `sgp4_floor`;
+  - every fitted start converged.
+- **SGP4 minus truth, median |T| at 7 days by band:** 2,216 km (250-400 km, p95 8,313 km), 264 km (400-600), 28 km (600-800), 8.8 km (800-1,200) and 0.82 km (1,200-2,000). |R| and |N| stay within a few km.
+- **Daily-Ap (switch 9 = +1) minus 3-hour ap truth** on 198 windows: median |T| at 7 days 3 m overall; 5.8 km median (p95 42 km) at 250-400 km; 0.38 km (p95 19 km) at 400-600 km.
+- **Cost and size:** 5,602 bytes per window on disk; 4.9 windows/s on 22 workers. A truth job (fit included) takes 4.1 s median.
+
+**Second pilot (exploratory, 2026-11-27; train and dev rows only)**, with reissues collapsed and the along-track angle unwrapped per window (`pool_v2`, run `pilot_v2`):
+- **Pool:** collapsing reissues removes 445,436 element sets in 435,703 groups (widest 173 s, since gaps chain); the filters keep 54.7 M sets of 17,873 objects. The history rules drop fewer objects: SMA rise 1,357 (was 1,594), SMA drop 319 (380), inclination jump 397 (409). No remaining trip is between sets 60 s or less apart.
+- **Sample:** 5,000 windows on 5,000 objects; 4,909 of them are in the first pilot, including all 51 it refused as `rtn_domain`.
+- **Window fates:** 4,986 `ok`, 0 `rtn_domain`, 9 `truth_reentry`, 5 `sgp4_floor` (the same 14 windows as in the first pilot). 53 kept windows have |du| above pi/2, all at 250-400 km, up to 9.4 rad; the largest step between horizons is 0.28 rad.
+- **250-400 km, median (p95) |T| at 7 days:** 2,780 km (17,380 km) with every kept window; 2,217 km (8,528 km) without the 51 windows the first pilot refused; 16,657 km (42,465 km) for those 51 alone. The other bands are unchanged.
+- **Fit misfit (RMS, m), median / p99 / max by band:** 275 / 3,062 / 3,716 (250-400 km), 60 / 558 / 829 (400-600), 28 / 302 / 623 (600-800), 22 / 197 / 524 (800-1,200), 17 / 123 / 270 (1,200-2,000). The 49 windows above 1 km (flagged, not dropped) are all at 250-400 km; 34 of them are kept windows with |du| above pi/2.
+- **Daily-Ap minus 3-hour ap truth** on 200 windows (all `ok`; a new draw, 11 shared with the first subsample): median (p95) |T| at 7 days 9.9 km (59 km) at 250-400 km, 0.84 km (8.1 km) at 400-600 km, 6 m (0.81 km) at 600-800 km.
+- **Cost:** 5.5 windows/s on 22 workers; truth job 3.75 s median; 5,664 bytes per window. Memory in use on the machine rose from 1.5 GB idle to about 25 GB during the run (22 JVM workers and the parent; the largest single process peaked at 1.4 GB).
 
 ## Models
 
@@ -522,6 +659,14 @@ this project's propagators, so this checks the engine alone.
 Implemented here vs library: the k-d tree is `scipy.spatial.cKDTree` and tables are
 pyarrow. Interpolation, search bound, minimum finding, element conversions, filters and
 metrics are this project's code, written with AI assistance and checked by the tests above.
+
+**Third pool and first-batch sample (exploratory, 2026-11-27; counts only, no generation run)**, with the spike rule (`pool_v3`, sample `first_batch`):
+- **Pool:** the spike rule skips 894 sets for the SMA-rise rule, 360 for the SMA-drop rule and 319 for the inclination rule (all stay in the pool). Objects dropped: SMA rise 770 (1,357 in `pool_v2`), SMA drop 426 (319), inclination jump 264 (397). The SMA-drop count rises because 107 objects the SMA-rise rule used to drop now reach it and trip it. The filters keep 56.6 M sets of 18,486 objects (`pool_v2`: 54.7 M, 17,873); no object kept in `pool_v2` is dropped.
+- **Sample:** 50,000 train and dev windows on 14,636 objects (every eligible object), in rounds 1-4 (14,636 / 14,397 / 14,242 / 6,725 windows). It contains all 5,000 `pilot_v2` windows, every one in round 1.
+
+**Fourth pool and first-batch sample (exploratory, 2026-11-27; counts only, no generation run)**, with the SMA-drop spike rule's rising leg tested against the floor alone (`pool_v4`, sample `first_batch_v4`):
+- **Pool:** objects dropped: SMA rise 770 (unchanged), SMA drop 352 (426 in `pool_v3`), inclination jump 266 (264). The filters keep 57.0 M sets of 18,558 objects (`pool_v3`: 56.6 M, 18,486): 72 objects more (38 PAY, 17 R/B, 17 DEB), none lost.
+- **Sample:** 50,000 train and dev windows on 14,690 objects (every eligible object), in rounds 1-4 (14,690 / 14,451 / 14,295 / 6,564 windows). It shares 49,808 windows with `first_batch` and contains all 5,000 `pilot_v2` windows, every one in round 1. Its daily-Ap subsample is the same 200 windows as `first_batch`'s.
 
 ## Limitations
 
